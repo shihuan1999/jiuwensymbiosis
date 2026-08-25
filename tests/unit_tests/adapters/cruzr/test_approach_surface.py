@@ -2,6 +2,7 @@
 """approach_for_place: drive the base to place range only when the surface is out of reach
 (no-op when in range); shares _drive_base with approach_for_grasp."""
 import math
+
 from jiuwensymbiosis.adapters.cruzr.api import CruzrApi
 from jiuwensymbiosis.adapters.cruzr.config import CruzrConfig
 
@@ -22,7 +23,7 @@ def _api(senses):
     api.locate_for_place = lambda object_name="table", reference=None, relation="on": next(it)  # type: ignore[method-assign]
     # approach_* now folds the search-and-face pass in front of the drive loop. These tests
     # exercise the DRIVE geometry, so mark a surface as already sensed — the same thing a
-    # real face pass would leave behind — and the search is skipped (see _ApproachBody).
+    # real face pass would leave behind — and the search is skipped (see Approach).
     api._last_surface = {"ok": True}
     return api, env
 

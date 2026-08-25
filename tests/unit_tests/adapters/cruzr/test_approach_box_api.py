@@ -16,6 +16,7 @@ import math
 from types import SimpleNamespace
 
 from jiuwensymbiosis.adapters.cruzr.api import CruzrApi
+from jiuwensymbiosis.motion import approach
 from jiuwensymbiosis.motion.approach import Footprint
 
 
@@ -72,7 +73,7 @@ def _script(api, dets):
 # Radial converge loop (plain _det → no footprint → square-up is a no-op; behaviour unchanged)
 # --------------------------------------------------------------------------------------------------
 
-def test_no_detection_searches_instead_of_failing_immediately():
+def test_no_detection_searches_instead_of_failing_immediately(monkeypatch):
     """With nothing cached, approach_for_grasp SEARCHES — it no longer errors out on the spot.
 
     That is the point of folding the face pass in: "I don't know where it is" is a
@@ -80,17 +81,23 @@ def test_no_detection_searches_instead_of_failing_immediately():
     and it fails with ``object_not_found`` rather than ``no_detection``.
     """
     api = CruzrApi(_Env()); api._last_detection = None
-    api._nav._face_object = lambda name="box", reference=None, relation="on": {"ok": False, "reason": "object_not_found"}  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        approach, "_face_object",
+        lambda _api, name="box", reference=None, relation="on": {"ok": False, "reason": "object_not_found"},
+    )
     out = api.approach_for_grasp()
     assert out == {"ok": False, "reason": "object_not_found"}
     assert api.env.low_level.calls == []
 
 
-def test_cached_detection_skips_the_search_pass():
+def test_cached_detection_skips_the_search_pass(monkeypatch):
     """A detection already in hand means no sweep: the drive loop runs straight away."""
     api = CruzrApi(_Env()); api._last_detection = _det(400.0)
     searched = []
-    api._nav._face_object = lambda name="box", reference=None, relation="on": searched.append(name) or {"ok": True}  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        approach, "_face_object",
+        lambda _api, name="box", reference=None, relation="on": searched.append(name) or {"ok": True},
+    )
     out = api.approach_for_grasp()
     assert out["ok"] and searched == []
 
@@ -191,7 +198,7 @@ def test_forward_advance_reserves_final_decel_segment():
     assert math.isclose(dxs[-1], 0.25, abs_tol=1e-9)          # near: whole remainder as the gentle landing
 
 
-def test_grounded_redetect_degrades_to_plain_while_far_then_regrounds():
+def test_grounded_redetect_degrades_to_plain_while_far_then_regrounds(monkeypatch):
     """After an EARLY plain coarse handoff the grounded 'on surface' re-detect still misses while
     far — approach_for_grasp must NOT abort. It degrades to a plain re-detect (carrying the reference)
     and keeps converging; once near the band the grounded relation resolves again. This restores the
@@ -219,7 +226,7 @@ def test_grounded_redetect_degrades_to_plain_while_far_then_regrounds():
         return {"ok": True}
 
     api.locate_for_grasp = _detect   # type: ignore[method-assign]
-    api._nav.drive_base = _drive         # type: ignore[method-assign]
+    monkeypatch.setattr(approach, "drive_base", lambda api, *a, **k: _drive(*a, **k))
     out = api.approach_for_grasp()
     assert out["ok"] and out["status"] == "in_band"
     assert (None, 600) in calls                          # degraded to plain while far (grounded missed)

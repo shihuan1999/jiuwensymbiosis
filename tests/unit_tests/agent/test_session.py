@@ -22,8 +22,8 @@ class _ApiWithJointMotion(MockApi):
     """
 
     @implements(MOVE_JOINT)
-    def move_joint(self, q: list[float]) -> None:
-        return defaults.move_joint(self, q)
+    def move_joint(self, targets: dict[str, float]) -> None:
+        return defaults.move_joint(self, targets)
 
 
 class TestRobotSessionConstruction:

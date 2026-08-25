@@ -41,6 +41,11 @@ KNOWN_CAPABILITIES: frozenset[str] = frozenset(
         "motion.servo",  # non-blocking streaming pose commands (real-time servo loop)
         "grasp.suction",  # suction on/off
         "grasp.parallel",  # parallel gripper open/close
+        # Two flat plates that clamp a face on each side. An END-EFFECTOR capability, like
+        # the two above: it says what the body can HOLD, not which action to call. Splitting
+        # it out of the old "grasp.dual_arm" is what lets a dual-arm body carry grippers or a
+        # hand instead — the topology is motion.dual_arm either way.
+        "grasp.paddle",
         "vision.camera",  # raw image stream available
         "vision.depth",  # depth stream available
         "vision.detection",  # high-level object detection
@@ -57,7 +62,10 @@ KNOWN_CAPABILITIES: frozenset[str] = frozenset(
         "motion.lift",  # vertical torso/lifter position control
         "motion.waist",  # torso yaw (waist) rotation
         "motion.goal",  # autonomous drive to a goal/grasp-band via a nav stack
-        "grasp.dual_arm",  # coordinated two-arm (paddle) grasp/release
+        # Two ARMS acting in coordination. A TOPOLOGY capability — what the body can move —
+        # so it lives beside motion.base / .lift / .waist and decides WHICH ACTION to call
+        # (dual_arm_grasp / dual_arm_place). What the arms hold is the separate grasp.* axis.
+        "motion.dual_arm",
         "planning.reachability",  # URDF-based reachability / workspace prior for planning
     }
 )
@@ -150,7 +158,22 @@ class BaseRobotEnv(ABC):
 
     def has(self, capability: str) -> bool:
         """Check whether the env supports a given capability string."""
-        return capability in self.capabilities
+        return capability in self.effective_capabilities
+
+    @property
+    def effective_capabilities(self) -> frozenset[str]:
+        """Declared capabilities plus the ones that follow from what the body SHIPS.
+
+        ``planning.reachability`` is derived, never declared: it is true exactly when the
+        body ships a URDF and names its arm chains, because that is what the reach judge
+        reads. Declaring it by hand let a body claim it while shipping no model — the judge
+        then answered "unknown" forever and nothing noticed. A fact about the body should
+        be read off the body.
+        """
+        derived: set[str] = set()
+        if getattr(self, "urdf_path", None) and getattr(self, "arm_chains", None):
+            derived.add("planning.reachability")
+        return frozenset(self.capabilities) | derived
 
     # --- optional hardware contract (default None; adapters set or override) ---
     # Assign in connect() (e.g. ``self.low_level = XxxDriver()``) or override as a
@@ -174,6 +197,16 @@ class BaseRobotEnv(ABC):
     # key order = q index order. ``None`` → SafetyRail skips the range check
     # (only q-presence / type / finite checks run).
     _joint_limits: dict[str, tuple[float, float]] | None = None
+    # The unit those limits, ``move_joint``'s ``q`` and the observed joints are in — ``"deg"``,
+    # ``"rad"``, or ``None`` for "this body has not said". See the ``joint_units`` property.
+    _joint_units: str | None = None
+    # Which joints each arm actuates — see the arm_joints property.
+    _arm_joints: dict[str, list[str]] | None = None
+    # Joint names in chain order, for converting the named action onto an indexed driver.
+    # None → fall back to joint_limits' key order. See the joint_names property.
+    _joint_names: list[str] | None = None
+    # ``goto_xyzr``'s orientation_policy when the caller omits it. See the property.
+    _default_orientation_policy: str | None = None
     # Mobile-base / torso envelope, same ``None`` → "SafetyRail skips the range check"
     # contract as ``joint_limits``. Relative verbs (``navigate_relative`` / ``rotate_base`` /
     # ``drive_arc`` / ``turn_waist``) get a PER-COMMAND cap — there is no absolute frame to
@@ -222,6 +255,91 @@ class BaseRobotEnv(ABC):
     @joint_limits.setter
     def joint_limits(self, value: dict[str, tuple[float, float]] | None) -> None:
         self._joint_limits = value
+
+    @property
+    def joint_names(self) -> list[str] | None:
+        """The body's joint names in chain order, or ``None`` when it has not stated them.
+
+        Needed only to serve an INDEXED driver: the action speaks names, ``move_joint_blocking``
+        wants a vector, and this is the ordering that converts between them. A body whose driver
+        speaks ``NamedJointDriver`` never needs it. Defaults to ``joint_limits``' key order,
+        which every adapter already keys by name.
+        """
+        if self._joint_names is not None:
+            return self._joint_names
+        limits = self.joint_limits
+        return list(limits) if limits else None
+
+    @joint_names.setter
+    def joint_names(self, value: list[str] | None) -> None:
+        self._joint_names = list(value) if value is not None else None
+
+    @property
+    def arm_joints(self) -> dict[str, list[str]] | None:
+        """``{arm: [joint names it actuates]}`` — which joints a two-arm solve may move.
+
+        Not derivable from ``arm_chains``: a chain rooted at the base runs through whatever
+        carries the shoulders (a lifter, a waist), and solving those here would let a grasp
+        quietly re-pose the body. ``None`` = the body has not said, and a dual-arm action
+        refuses rather than guessing.
+        """
+        return self._arm_joints
+
+    @arm_joints.setter
+    def arm_joints(self, value: dict[str, list[str]] | None) -> None:
+        self._arm_joints = value
+
+    @property
+    def torso_joints(self) -> list[str]:
+        """Joints held FIXED while the arms solve — whatever carries the shoulders.
+
+        Derived from the capabilities the body actually declares: a lifter contributes
+        ``lift_limits``' keys, a waist contributes ``waist_joint``. A fixed-base two-arm body
+        declares neither and gets an empty list, which is the right answer rather than a
+        special case — the same way ``motion/approach.py`` asks whether the body can turn
+        before turning it.
+        """
+        out: list[str] = []
+        if "motion.lift" in self.capabilities:
+            out += list(self.lift_limits or ())
+        if "motion.waist" in self.capabilities and getattr(self, "waist_joint", None):
+            out.append(str(self.waist_joint))
+        return out
+
+    @property
+    def joint_units(self) -> str | None:
+        """``"deg"`` or ``"rad"`` — the unit of ``move_joint``'s ``q``, ``joint_limits`` and the
+        joint values in ``get_observation()``. ``None`` means the body has not stated it.
+
+        This exists because the numbers alone are ambiguous and the ambiguity reaches the
+        planner: ``1.5`` is a small nudge in degrees and 86 degrees in radians. Nothing can
+        infer it — piper and so101 are degrees, cruzr is radians — so an unstated unit is
+        rendered as unknown rather than guessed. ``move_named_joint`` is exempt: its parameter
+        is named ``position_rad``, so that action carries its unit in the contract.
+        """
+        return self._joint_units
+
+    @joint_units.setter
+    def joint_units(self, value: str | None) -> None:
+        if value is not None and value not in ("deg", "rad"):
+            raise ValueError(f"joint_units must be 'deg', 'rad' or None, got {value!r}")
+        self._joint_units = value
+
+    @property
+    def default_orientation_policy(self) -> str | None:
+        """Which ``orientation_policy`` ``goto_xyzr`` applies when the caller omits it.
+
+        The action's schema can only say ``default: null`` — ``implements()`` runs at class
+        definition time, before any config exists — so without this the planner can see THAT
+        there is a default but not WHICH, and on a body defaulting to ``preserve`` that is the
+        difference between approaching top-down and approaching sideways. ``None`` means the
+        body has no Cartesian default to state (no ``motion.cartesian``, or it has not said).
+        """
+        return self._default_orientation_policy
+
+    @default_orientation_policy.setter
+    def default_orientation_policy(self, value: str | None) -> None:
+        self._default_orientation_policy = value
 
     @property
     def base_step_limits(self) -> tuple[float, float] | None:
@@ -299,9 +417,17 @@ class BaseRobotEnv(ABC):
         """Return the driver typed as its Cartesian surface (``motion.cartesian``-gated)."""
         return cast(CartesianDriver, self._require_driver())
 
+    @abstractmethod
     def home(self) -> None:
-        """Move to the home pose (blocking)."""
-        self._require_cartesian().home()
+        """Return the body to its safe home posture (blocking).
+
+        Abstract because HOME is the one unconditional action (``capability=None``), so a
+        Cartesian default here would leak ``motion.cartesian`` into bodies the capability
+        gate cannot stop. A Cartesian arm implements it as ``self._require_cartesian().home()``;
+        a body whose safe posture is composite (lifter + waist + arms) either writes that
+        sequence here, or — when the sequence needs planning the Api owns — raises and names
+        the ``@implements(HOME)`` method that does own it.
+        """
 
     def get_flange_pose(self) -> Any:
         """Return the current flange-frame pose (vendor Pose object)."""
@@ -311,10 +437,73 @@ class BaseRobotEnv(ABC):
         """Move to a FLANGE-frame target pose (blocking)."""
         self._require_cartesian().move_to_pose_blocking(pose)
 
-    def move_joint(self, q: list[float]) -> None:
-        """Move to a joint-space configuration (blocking)."""
-        # JointDriver sibling protocol; motion.joint-capability-gated
-        self._require_driver().move_joint_blocking(q)  # type: ignore[attr-defined]
+    def move_joint(self, targets: dict[str, float]) -> Any:
+        """Move the joints named in ``targets`` to their absolute positions (blocking).
+
+        One Env verb for both driver encodings, because ``move_joint`` is one action:
+
+        * a ``NamedJointDriver`` gets ``targets`` straight through, and the joints the caller
+          left out are held by the HARDWARE;
+        * an indexed ``JointDriver`` needs the whole vector, so this reads the current
+          configuration and overwrites the named entries before dispatching. That read-modify-
+          write is a property of the indexed driver — anything that moves the arm between the
+          read and the command makes the untouched entries stale — and is exactly why a body
+          that can speak names should.
+
+        Units are the body's own (``joint_units``); names come from ``joint_names``.
+        """
+        driver = self._require_driver()
+        if hasattr(driver, "move_joints_blocking"):
+            return driver.move_joints_blocking(targets)  # type: ignore[attr-defined]
+
+        names = self.joint_names
+        if not names:
+            raise RuntimeError(
+                f"{self.name}: move_joint needs joint names to address an indexed driver — "
+                "the body states neither joint_names nor joint_limits."
+            )
+        unknown = sorted(set(targets) - set(names))
+        if unknown:
+            raise ValueError(f"{self.name}: unknown joint(s) {unknown}; this body has {names}.")
+        current = self._require_driver_angles(names)
+        q = [float(targets.get(name, current[i])) for i, name in enumerate(names)]
+        return driver.move_joint_blocking(q)  # type: ignore[attr-defined]
+
+    def _require_driver_angles(self, names: list[str]) -> list[float]:
+        """Current joint vector for the read-modify-write above; zeros if unreadable."""
+        try:
+            angles = self._require_driver().get_angles()  # type: ignore[attr-defined]
+        except Exception as exc:  # a body that cannot read back still commands
+            logger.warning("%s: get_angles() failed, holding joints at 0.0: %s", self.name, exc)
+            return [0.0] * len(names)
+        values = list(getattr(angles, "as_tuple", lambda: angles)())
+        if len(values) != len(names):
+            logger.warning(
+                "%s: get_angles() returned %d values for %d joint names; holding at 0.0",
+                self.name, len(values), len(names),
+            )
+            return [0.0] * len(names)
+        return [float(v) for v in values]
+
+    def move_named_joints(self, targets: dict[str, float], **kwargs: Any) -> Any:
+        """Move the NAMED joints in ``targets``, holding the rest (blocking).
+
+        The Env counterpart of the indexed ``move_joint`` above, for bodies whose driver
+        speaks ``NamedJointDriver``. It exists so a named-joint body reaches its hardware
+        through the SAME Env seam as everyone else: without it an Api had to call
+        ``env.low_level`` directly, and everything the framework hangs on this layer —
+        logging, rate limiting, recording, any future interception — could not see that
+        motion on that body. SafetyRail is unaffected either way (it sits at the tool
+        layer, above the Api), so this is a consistency and observability seam, not a
+        safety one.
+
+        Vendor tuning (cruzr's ``ramp_duration_s``) rides in ``kwargs``, the same way
+        ``CartesianDriver.move_to_pose_blocking`` already carries per-vendor extras — so
+        every call site can use this seam without a body-specific concept appearing in the
+        base signature.
+        """
+        # NamedJointDriver sibling protocol; motion.joint-capability-gated
+        return self._require_driver().move_joints_blocking(targets, **kwargs)  # type: ignore[attr-defined]
 
     def servo_to_flange(self, pose: Any) -> bool | None:
         """Issue a NON-BLOCKING FLANGE-frame pose command (returns immediately).
@@ -350,7 +539,10 @@ class BaseRobotEnv(ABC):
             driver.set_suction(engaged)  # type: ignore[attr-defined]
         else:
             raise NotImplementedError(
-                f"{self.name}: no grasp capability declared (need 'grasp.parallel' or 'grasp.suction')"
+                f"{self.name}: set_end_effector needs 'grasp.parallel' or 'grasp.suction'. A body "
+                "whose end effector is not a one-actuator open/close — paddles carried by two arms, "
+                "for instance — holds things through its own action (dual_arm_grasp) and is not "
+                "expected to implement this verb."
             )
 
     # --- mobile-base / torso verbs (default: raise; implement when the capability is declared) ---

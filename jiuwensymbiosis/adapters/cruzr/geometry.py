@@ -16,52 +16,27 @@ only the skeleton files (config/env/session/lowlevel/api/geometry/_calibration).
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
 from jiuwensymbiosis.kinematics.fk import fk_chain
-from jiuwensymbiosis.kinematics.ik import IKResult, ik_solve_pose
+from jiuwensymbiosis.kinematics.ik import IKResult
 from jiuwensymbiosis.kinematics.urdf_chain import Chain
+from jiuwensymbiosis.motion.dual_arm import (
+    ArmTarget,
+    GraspPlan,
+    both,
+    solve_planned_grasp,
+)
+from jiuwensymbiosis.motion.dual_arm import (
+    solve_arm_ik as _solve_arm_ik_generic,
+)
 from jiuwensymbiosis.perception.object_geometry import ObjectGeometry3D
 
 logger = logging.getLogger(__name__)
 
 
-
-
-@dataclass
-class ArmTarget:
-    arm: str
-    pos_m: tuple[float, float, float]          # paddle TCP contact target (base, m)
-    approach: tuple[float, float, float]       # base dir the tool approach axis aligns to
-    paddle: tuple[float, float, float]         # base dir the tool paddle-face axis aligns to
-    tcp_offset_local: tuple[float, float, float]  # paddle offset from leaf in tool frame (m)
-
-
-@dataclass
-class GraspPlan:
-    ok: bool
-    reason: str
-    lifter_center_z_mm: float
-    approach: dict[str, ArmTarget]   # above the box sides (raise clear of the table)
-    descend: dict[str, ArmTarget]    # straight down to clamp height, still outside faces
-    clamp: dict[str, ArmTarget]      # inward onto the side faces
-    ik: dict[str, IKResult]          # clamp IK
-
-
-ARMS: tuple[str, str] = ("left", "right")
-
-
-def both(*maps):
-    """Yield ``(arm, *values)`` for both arms, reading each mapping once.
-
-    The single place that assumes a two-arm mapping is keyed by exactly left/right: a
-    missing arm raises KeyError HERE, with the mapping in hand, instead of letting a
-    ``.get()`` ``None`` reach IK and become an undefined arm motion.
-    """
-    for arm in ARMS:
-        yield (arm, *(m[arm] for m in maps))
 
 
 ARM_JOINTS = {
@@ -147,39 +122,19 @@ def plan_clamp_targets(
     return approach, descend, clamp
 
 
-def solve_arm_ik(
-    chain: Chain, q_fixed: dict, arm: str, tgt: ArmTarget, *,
-    pos_tol_m: float = 0.016, q_init: dict | None = None, max_iters: int = 1500,
-    n_restarts: int = 4, check_collision: bool = False, package_dir: str | None = None,
-) -> IKResult:
-    """Solve full-orientation IK for one arm's paddle target.
+def solve_arm_ik(chain: Chain, q_fixed: dict, arm: str, tgt: ArmTarget, **kw) -> IKResult:
+    """Cruzr-flavoured wrapper over the shared two-arm IK.
 
-    Dispatches to the pinocchio solver (analytic Jacobian + random restarts) when
-    pinocchio is importable and the chain carries its URDF path/leaf; otherwise
-    falls back to the retained legacy DLS. ``q_init`` warm-starts either solver.
+    The generic solver takes the joint names explicitly, because which joints an arm actuates
+    cannot be read off the chain: this body's chains are rooted at ``base_link`` and run through
+    the lifter and waist, which the IK must hold fixed. ``ARM_JOINTS`` is that answer for cruzr.
+
+    Also fills the tool-frame axes when the caller built an ``ArmTarget`` without them (this
+    body's paddle convention), so hand-made targets in bring-up and tests keep working.
     """
-    from jiuwensymbiosis.kinematics import ik_pinocchio as _pik
-
-    init = q_init if q_init is not None else {j: q_fixed.get(j, 0.0) for j in ARM_JOINTS[arm]}
-    if _pik.pin_available() and getattr(chain, "urdf_path", "") and getattr(chain, "leaf_link", ""):
-        try:
-            return _pik.solve_pose_ik_pin(
-                chain.urdf_path, ARM_JOINTS[arm], chain.leaf_link, chain.limits(),
-                tgt.pos_m, approach_target=tgt.approach, paddle_target=tgt.paddle,
-                tool_approach_local=TOOL_APPROACH_LOCAL, tool_paddle_local=TOOL_PADDLE_LOCAL,
-                tcp_offset_local=tgt.tcp_offset_local, q_fixed=q_fixed, q_init=init,
-                pos_tol_m=pos_tol_m, max_iters=min(max_iters, 200), n_restarts=n_restarts,
-                check_collision=check_collision, package_dir=package_dir,
-            )
-        except Exception as exc:  # noqa: BLE001  # never let IK-backend errors abort a grasp; fall back
-            logger.warning("[cruzr] pinocchio IK failed (%s); falling back to legacy DLS", exc)
-
-    return ik_solve_pose(
-        chain, q_fixed, ARM_JOINTS[arm], tgt.pos_m,
-        approach_target=tgt.approach, paddle_target=tgt.paddle,
-        tool_approach_local=TOOL_APPROACH_LOCAL, tool_paddle_local=TOOL_PADDLE_LOCAL,
-        tcp_offset_local=tgt.tcp_offset_local, q_init=init, pos_tol_m=pos_tol_m, max_iters=max_iters,
-    )
+    if tgt.approach_local != TOOL_APPROACH_LOCAL or tgt.paddle_local != TOOL_PADDLE_LOCAL:
+        tgt = replace(tgt, approach_local=TOOL_APPROACH_LOCAL, paddle_local=TOOL_PADDLE_LOCAL)
+    return _solve_arm_ik_generic(chain, q_fixed, ARM_JOINTS[arm], tgt, **kw)
 
 
 def solve_grasp(
@@ -205,12 +160,11 @@ def solve_grasp(
         return GraspPlan(False, f"box:{box.reason}", 0.0, {}, {}, {}, {})
     approach, descend, clamp = plan_clamp_targets(
         box, inset_mm=inset_mm, pre_clear_mm=pre_clear_mm, tcp_offset_m=tcp_offset_m)
-    chains = {"left": left_chain, "right": right_chain}
-    ik = {arm: solve_arm_ik(chain, q_fixed, arm, tgt, pos_tol_m=pos_tol_m,
-                            max_iters=ik_max_iters, check_collision=check_collision, package_dir=package_dir)
-          for arm, chain, tgt in both(chains, clamp)}
-    ok = all(r.converged for r in ik.values())
-    return GraspPlan(ok, "" if ok else "ik_no_converge", box.center_mm[2], approach, descend, clamp, ik)
+    return solve_planned_grasp(
+        box.center_mm[2], {"left": left_chain, "right": right_chain}, ARM_JOINTS, q_fixed,
+        approach=approach, descend=descend, clamp=clamp,
+        pos_tol_m=pos_tol_m, ik_max_iters=ik_max_iters,
+        check_collision=check_collision, package_dir=package_dir)
 
 
 # Comfortable fraction of an arm's max straight-line reach to aim the clamp

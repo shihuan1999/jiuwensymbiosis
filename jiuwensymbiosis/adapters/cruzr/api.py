@@ -24,6 +24,7 @@ from jiuwensymbiosis.api.actions import (
     LIFT_TO_CLEARANCE,
     LOCATE_FOR_GRASP,
     LOCATE_FOR_PLACE,
+    MOVE_JOINT,
     MOVE_NAMED_JOINT,
     NAVIGATE_RELATIVE,
     PIXEL_TO_BASE_XYZ,
@@ -34,9 +35,7 @@ from jiuwensymbiosis.api.actions import (
     implements,
 )
 from jiuwensymbiosis.api.base import BaseRobotApi
-from jiuwensymbiosis.api.components import Approach, Scene3D
-from jiuwensymbiosis.api.decorators import robot_tool
-from jiuwensymbiosis.motion import approach
+from jiuwensymbiosis.motion import approach, dual_arm, lift
 from jiuwensymbiosis.perception import scene3d
 from jiuwensymbiosis.perception.detector_client import init_detector
 from jiuwensymbiosis.perception.frame import project_to_base
@@ -78,7 +77,7 @@ class CruzrApi(BaseRobotApi):
     """Cruzr mobile dual-arm: base + lifter + waist + paddle grasp + waist RGBD vision.
 
     Every action this body offers is declared in this file, so it IS the capability
-    list. The three remaining base classes are not action bundles: Scene3D and Approach
+    list. The remaining held object is not an action bundle: Scene3D
     are stateful components with body hooks, and Reachability answers a planning
     question rather than exposing an action.
     """
@@ -86,12 +85,16 @@ class CruzrApi(BaseRobotApi):
     # Scene 3-D sensing runs off the waist RGBD camera (the head camera is wide-FOV 2-D only).
     scene_camera = "waist"
 
-    # Marker capabilities: real things this body can do that no ACTION advertises, so the
-    # class attr is the only way to declare them (see BaseRobotApi.capabilities).
-    #   planning.reachability — check_reachable below weighs both arms plus an adaptive
-    #                           lifter, so this body brings its own judge rather than the
-    #                           generic single-arm one.
-    capability = {"planning.reachability"}
+    # Marker capability: what the end effector IS, which no ACTION advertises — the dual-arm
+    # actions gate on the TOPOLOGY (motion.dual_arm), so nothing would derive this. Two plates
+    # that clamp a face each side; a dual-arm body carrying grippers would say grasp.parallel
+    # here instead and call the same actions.
+    #
+    # planning.reachability is NOT here: it is DERIVED — this body holds its own judge
+    # (``check_reachable`` below weighs both arms plus an adaptive lifter, rather than the
+    # generic single-arm one) and its Env ships the URDF that judge reads, so the api ∩ env
+    # intersection says so without anyone writing it down.
+    capability = {"grasp.paddle"}
 
     def __init__(
         self,
@@ -104,8 +107,6 @@ class CruzrApi(BaseRobotApi):
         super().__init__(env)
         # Held, not inherited: this body declares each sensing action below and forwards to
         # the component, so api.py stays the complete list of what Cruzr offers.
-        self._scene = Scene3D(self)
-        self._nav = Approach(self)
         self._detector_service_url = detector_service_url
         self._camera_calib_path = camera_calib_path
         self._seg_fn = None
@@ -119,82 +120,35 @@ class CruzrApi(BaseRobotApi):
         # uses (current_waist - this) to rotate its paddle targets, so a box moved
         # by turn_waist between grasp and place is released at its NEW location.
         self._last_grasp_waist_yaw: Optional[float] = None
-        # Last successful locate_for_grasp result. dual_arm_grasp() consumes this so
-        # detection is an explicit, separate step (not embedded in the grasp) and
-        # the LLM need not echo the geometry dict back as a tool argument.
-        self._last_detection: Optional[dict] = None
-        # Last successful locate_for_place result. dual_arm_place() consumes this when
-        # called without a surface, so an LLM can call locate_for_place() then
-        # dual_arm_place() without echoing the (nested) table-footprint dict back.
-        self._last_surface: Optional[dict] = None
+        # _last_detection / _last_surface are NOT initialised here: BaseRobotApi owns them
+        # (super().__init__ above) together with the invalidation that keeps them in step
+        # with memory.locations. dual_arm_grasp / dual_arm_place consume them so detection
+        # stays an explicit separate step and the LLM need not echo the nested geometry
+        # dict back as a tool argument. Re-declaring them here would read as a second cache.
         # Lazily-created debug detection window (waist+head panes). None until the first
         # detection; stays a no-op unless cfg.viz_detections / $JIUWEN_CRUZR_VIZ=1.
         self._viz = None
 
-    @robot_tool(
-        desc="Raise Cruzr's left arm once and return it to the home position.",
-        tags=["motion"],
-        invalidates=["body.home"],
-    )
-    def raise_left_arm(self) -> dict:
-        """Raise the left arm and lower it back home."""
-        logger.info("[CruzrApi] raise_left_arm")
-        return self._ll().raise_arm_blocking(arm="left", return_home=True)
+    # No raise_/lower_arm tools: "raise the left arm" is one named joint driven to a
+    # configured angle, which ``move_named_joint`` already says — and says on any body
+    # with ``motion.joint``, where a cruzr-only tool said it nowhere else.
 
-    @robot_tool(
-        desc="Raise Cruzr's right arm once and return it to the home position. "
-             "Uses the configured mirrored right-arm target.",
-        tags=["motion"],
-        invalidates=["body.home"],
-    )
-    def raise_right_arm(self) -> dict:
-        """Raise the right arm and lower it back home."""
-        logger.info("[CruzrApi] raise_right_arm")
-        return self._ll().raise_arm_blocking(arm="right", return_home=True)
+    @implements(MOVE_JOINT)
+    def move_joint(self, targets: dict[str, float]) -> dict:
+        """Move the named joints to absolute radians, holding the rest.
 
-    @robot_tool(
-        desc="Lower Cruzr's left arm to the configured home position.",
-        tags=["motion"],
-        invalidates=["body.home"],
-    )
-    def lower_left_arm(self) -> dict:
-        """Lower the left arm to home."""
-        logger.info("[CruzrApi] lower_left_arm")
-        return self._ll().home(arm="left")
-
-    @robot_tool(
-        desc="Lower Cruzr's right arm to the configured home position.",
-        tags=["motion"],
-        invalidates=["body.home"],
-    )
-    def lower_right_arm(self) -> dict:
-        """Lower the right arm to home."""
-        logger.info("[CruzrApi] lower_right_arm")
-        return self._ll().home(arm="right")
-
-    @robot_tool(
-        desc=(
-            "Raise one Cruzr arm. arm can be 'left' or 'right'. "
-            "If target_rad is omitted, uses the configured per-arm target: left=+1.0, right=-1.0 by default."
-        ),
-        tags=["motion"],
-        invalidates=["body.home"],
-    )
-    def raise_arm(
-        self,
-        arm: str = "left",
-        return_home: bool = True,
-        target_rad: Optional[float] = None,
-    ) -> dict:
-        """Raise the selected arm."""
-        logger.info("[CruzrApi] raise_arm arm=%s return_home=%s target=%s", arm, return_home, target_rad)
-        return self._ll().raise_arm_blocking(arm=arm, return_home=return_home, target_rad=target_rad)
+        A bare joint VECTOR has no meaning on this body — two arms plus a waist and a lifter
+        have no single chain order — which is why the shared action speaks names. Names come
+        from ``get_joint_positions`` / the URDF.
+        """
+        logger.info("[CruzrApi] move_joint %s", {k: round(float(v), 3) for k, v in targets.items()})
+        return self.env.move_named_joints({k: float(v) for k, v in targets.items()})
 
     @implements(MOVE_NAMED_JOINT)
     def move_named_joint(self, joint_name: str, position_rad: float) -> dict:
         """Move a named joint to a target position."""
         logger.info("[CruzrApi] move_named_joint %s -> %.3f", joint_name, position_rad)
-        return self._ll().move_joint_blocking({joint_name: float(position_rad)})
+        return self.env.move_named_joints({joint_name: float(position_rad)})
 
     @implements(TURN_WAIST)
     def turn_waist(self, delta_rad: float) -> dict:
@@ -231,12 +185,14 @@ class CruzrApi(BaseRobotApi):
                 "delta_rad": target - frm, "clamped": clamped, "readback": res.get("readback")}
 
     def look_for(self, object_name: str, on: str | None = None, *, camera: str | None = None) -> dict:
-        """One look through ``camera`` → a bearing dict; delegates to the held Approach component.
+        """One look through ``camera`` → a bearing dict.
 
-        NOT a @robot_tool: the head-search helpers in this module need it, and reaching through
-        ``api._nav`` for it would make them depend on which component this body happens to hold.
+        NOT an action: the head-search helpers in this module need it. Camera-pinned on
+        purpose — a bearing is measured relative to wherever that camera was pointing, so a
+        caller that aimed one (panning the head to yaw θ, then adding θ) must be answered by
+        that same camera, not by whichever one happens to see the thing.
         """
-        return self._nav.look_for(object_name, on, camera)
+        return approach.look_once(self, object_name, on, camera=camera)
 
     def set_head(self, yaw_rad: float, pitch_rad: float) -> dict:
         """Move the head yaw+pitch via the CONTINUOUS SDK path (move_joints ramp).
@@ -248,7 +204,7 @@ class CruzrApi(BaseRobotApi):
         """
         cfg = self.env.cfg
         logger.info("[CruzrApi] set_head yaw=%.3f pitch=%.3f", yaw_rad, pitch_rad)
-        return self._ll().move_joints_blocking(
+        return self.env.move_named_joints(
             {
                 cfg.head_yaw_joint: float(yaw_rad),
                 cfg.head_pitch_joint: float(pitch_rad),
@@ -281,21 +237,9 @@ class CruzrApi(BaseRobotApi):
         return defaults.set_lift_pose(self, q_lifter)
 
     # ============================================================  Vision
-    # Body-specific 2-D debug view of the detector; the plannable answer is
-    # ``locate_for_grasp``. Capability stated explicitly now that the class no longer
-    # carries a blanket ``capability`` attribute.
-    @robot_tool(
-        desc="Debug view of the detector: 2-D box, score, centre depth and base-frame point "
-             "for object_name in the waist RGBD camera.",
-        capability="vision.detection",
-        tags=["vision"],
-        produces_location=True,
-        returns={"type": "object", "properties": {
-            "ok": {"type": "boolean"}, "reason": {"type": "string"}, "object": {"type": "string"},
-            "score": {"type": "number"}, "bbox": {"type": "array"},
-            "depth_m": {"type": "number"}, "position": {"type": "array"},
-        }},
-    )
+    # NOT an action: a 2-D debug view of the detector, for eyeballing what it saw.
+    # The plannable answer is ``locate_for_grasp``. Called from
+    # ``scripts/cruzr/debug_detect.py``; never emitted as a tool.
     def detect(self, object_name: str = "box", camera_name: str = "waist_rgbd") -> dict:
         """Detect an object in the waist camera and project its centroid to base XYZ."""
         frames = self._ll().grab_frames(camera="waist")
@@ -394,658 +338,108 @@ class CruzrApi(BaseRobotApi):
     @implements(LOCATE_FOR_GRASP)
     def locate_for_grasp(self, object_name: str = "box", reference: Optional[str] = None,
                          relation: str = "on") -> dict:
-        return self._scene.locate_for_grasp(object_name, reference, relation)
+        return defaults.locate_for_grasp(self, object_name, reference, relation)
 
     @implements(LOCATE_FOR_PLACE)
     def locate_for_place(self, object_name: str = "table", reference: Optional[str] = None,
                          relation: str = "on") -> dict:
-        return self._scene.locate_for_place(object_name, reference, relation)
+        return defaults.locate_for_place(self, object_name, reference, relation)
 
     @implements(ANALYZE_SCENE)
     def analyze_scene(self, object_name: str = "box") -> dict:
-        return self._scene.analyze_scene(object_name)
+        return defaults.analyze_scene(self, object_name)
 
     # ------------------------------------------------------------ search + approach
     @implements(SEARCH_TARGET)
     def search_target(self, object_name: str = "box", reference: Optional[str] = None,
                       relation: str = "on") -> dict:
-        return self._nav.search_target(object_name, reference, relation)
+        return defaults.search_target(self, object_name, reference, relation)
 
     @implements(APPROACH_FOR_GRASP)
     def approach_for_grasp(self, object_name: str = "box", reference: Optional[str] = None,
                            relation: str = "on") -> dict:
-        return self._nav.approach_for_grasp(object_name, reference, relation)
+        return defaults.approach_for_grasp(self, object_name, reference, relation)
 
     @implements(APPROACH_FOR_PLACE)
     def approach_for_place(self, object_name: str = "table", reference: Optional[str] = None,
                            relation: str = "on") -> dict:
-        return self._nav.approach_for_place(object_name, reference, relation)
+        return defaults.approach_for_place(self, object_name, reference, relation)
 
-    # ------------------------------------------------------ Approach body hooks
-    def base_driver(self) -> Any:
-        """Drive the servo worker through the driver directly (the SDK handle is its own)."""
-        return self._ll()
+    # ------------------------------------------------- end-effector hook (grasp.paddle)
+    def grasp_plan(self, box: Any, *, inset_mm: float | None = None,
+                   pre_clear_mm: float = 60.0) -> tuple[dict, dict, dict]:
+        """Where the two contact points go — THIS BODY'S end effector decides.
 
-    def nav_relative(self, dx_m: float, dy_m: float, dyaw_rad: float, **gains: Any) -> dict:
-        """Relative base move that forwards the gentle approach-only steering gains."""
-        return self._ll().navigate_relative(float(dx_m), float(dy_m), float(dyaw_rad), **gains)
+        Paddle geometry: two flat plates that clamp a face each side, TCP 9 cm along the
+        tool-x axis, overshooting the faces by ``grasp_inset_mm`` so they press in. Returns
+        ``(approach, descend, clamp)`` waypoint sets, one ArmTarget per arm.
 
-    def search_frames(self, camera: Optional[str] = None) -> Any:
-        """One raw frame tuple from ``camera``. The head is a stereo pair read as its RIGHT eye
-        alone — no depth on that path, which costs nothing here: looking around wants a bearing.
+        This is the seam between the two axes. A dual-arm body carrying grippers or a hand
+        overrides this with its own contact planning; everything that consumes it — two-arm
+        IK, the approach→descend→contact sequence, the force confirmation — is the same job
+        whatever is on the end, and is shared.
         """
-        return self._ll().grab_frames(camera=camera or "waist")
+        from jiuwensymbiosis.adapters.cruzr.geometry import plan_clamp_targets
 
-    def sweep_for_bearing(self, object_name: str, on: Optional[str] = None) -> dict:
-        """Pan the HEAD left + right over the current facing — cruzr can aim a camera without
-        moving the base, so it looks around with the neck before anything else turns.
+        cfg = self.env.cfg
+        return plan_clamp_targets(
+            box,
+            inset_mm=float(cfg.grasp_inset_mm) if inset_mm is None else float(inset_mm),
+            pre_clear_mm=pre_clear_mm,
+        )
+
+    def ready_plan(self) -> dict:
+        """Transit pose: both paddles in front of the chest, facing inward, spread WIDE and
+        held high — clear of a table in front. An END-EFFECTOR fact (where two plates wait is
+        not where two grippers wait), so it sits beside ``grasp_plan``.
         """
-        return _acquire_with_head(self, object_name, self.env.cfg, on=on)
+        from jiuwensymbiosis.adapters.cruzr.geometry import ready_targets
 
-    def reset_search_sensor(self) -> None:
-        """Re-centre the head to its forward pose."""
-        _reset_head(self, self.env.cfg)
+        return ready_targets()
 
-    @implements(NAVIGATE_RELATIVE)
-    def navigate_relative(self, dx_m: float, dy_m: float = 0.0, dyaw_rad: float = 0.0) -> dict:
-        """Move the base by a relative offset via SDK wheel-velocity + odom closed loop."""
-        logger.info("[CruzrApi] navigate_relative dx=%.3f dy=%.3f dyaw=%.3f", dx_m, dy_m, dyaw_rad)
-        return self._ll().navigate_relative(float(dx_m), float(dy_m), float(dyaw_rad))
-
-    @implements(ROTATE_BASE)
-    def rotate_base(self, dyaw_rad: float) -> dict:
-        """Rotate the base in place by ``dyaw_rad`` (dx=dy=0). Does NOT touch the arms."""
-        logger.info("[CruzrApi] rotate_base dyaw=%.3f", dyaw_rad)
-        return self._ll().navigate_relative(0.0, 0.0, float(dyaw_rad))
-
-    @implements(DRIVE_ARC)
-    def drive_arc(self, radius_m: float, dyaw_rad: float) -> dict:
-        """Drive ONE constant-curvature arc (``radius_m``, signed ``dyaw_rad``) via the low-level ``--arc``
-        mode. Bring-up / calibration tool: no perception — use it in open space to measure the realized
-        radius vs commanded and tune ``arc_curv_gain``/``arc_k_fwd`` before ever enabling
-        ``grasp_arc_enabled``. Does NOT touch the arms.
-        """
-        logger.info("[CruzrApi] drive_arc radius=%.3f dyaw=%.3f", radius_m, dyaw_rad)
-        return self._ll().navigate_arc(float(radius_m), float(dyaw_rad))
-
-
-    def check_reachable(self, target: dict) -> bool:
-        """Override of ``Reachability.check_reachable`` with cruzr's exact DUAL-ARM + lifter judge:
-        当前底盘/关节姿态下，双臂能否抓到该 base 系目标(允许自适应 lifter，不含底盘移动)。纯离线只读，
-        复用 dual_arm_grasp 的 IK 可达搜索，无运动/无硬件副作用。供 fast 规划器判断"要不要先编长距离移动"。
-        保守快筛：不确定/无关节状态/出错一律判不可达(保留 approach_for_grasp 兜底，对误判鲁棒)。target 为
-        analyze_scene 形状的目标 dict(含 center_mm)。
-        """
+    def lifter_for_object(self, box: Any, q_fixed: dict, waist_yaw: float) -> Any:
+        """Which torso pose best reaches ``box`` — this body leans, so it searches."""
         from jiuwensymbiosis.adapters.cruzr.geometry import LIFTER_JOINTS, search_lifter_for_box
         from jiuwensymbiosis.kinematics.urdf_chain import parse_chain
-
-        try:
-            c = target.get("center_mm")
-            if not (isinstance(c, (list, tuple)) and len(c) == 3):
-                return False
-            fixed_names = ("lifter_pitch_1_joint", "lifter_pitch_2_joint",
-                           "lifter_pitch_3_joint", "waist_yaw_joint")
-            q = self._ll().get_joint_positions()
-            if not q or any(n not in q for n in fixed_names):
-                return False   # 无关节状态 → 保守判不可达
-            cfg = self.env.cfg
-            # scene 只有 center/宽/高/forward，缺 front_x/top_z/back_x → 近似构造(depth≈width)。
-            # 保守快筛，不追求精确；真正的精解仍由执行期 dual_arm_grasp 负责。
-            forward = float(target.get("forward_mm", c[0]))
-            width = float(target.get("width_mm", 0.0))
-            height = float(target.get("height_mm", 0.0))
-            box = ObjectGeometry3D(
-                ok=True, reason="", center_mm=(float(c[0]), float(c[1]), float(c[2])),
-                width_mm=width, height_mm=height,
-                front_x_mm=forward - width / 2.0, top_z_mm=float(c[2]) + height / 2.0,
-                n_points=500, back_x_mm=forward + width / 2.0,
-            )
-            left = parse_chain(cfg.urdf_path, "base_link", cfg.left_arm_leaf)
-            right = parse_chain(cfg.urdf_path, "base_link", cfg.right_arm_leaf)
-            current_lifter = {j: q[j] for j in LIFTER_JOINTS}
-            lp = search_lifter_for_box(box, left, right, current_lifter,
-                                       q["waist_yaw_joint"], ik_max_iters=300)
-            return bool(lp.found)
-        except Exception as exc:  # noqa: BLE001 — best-effort precheck; any failure → not reachable
-            logger.debug("[CruzrApi] reachability precheck skipped: %s", exc)
-            return False
-
-    @implements(DUAL_ARM_GRASP)
-    def dual_arm_grasp(self, target: Optional[dict] = None, object_name: str = "box") -> dict:
-        """Plan dual-arm grasp IK for an ALREADY-DETECTED box, clamp, and verify
-        FT contact. The pick-up/clearance lift is delegated to
-        ``lift_to_clearance`` — this method does not lift.
-
-        Detection is NOT performed here — call ``locate_for_grasp`` first. ``box`` is
-        the geometry dict it returns; when omitted, the most recent cached
-        ``locate_for_grasp`` result is used (so the LLM need not echo the dict back).
-        Returns ``{"ok": False, "reason": "no_detection"}`` if neither is available.
-
-        Sequence: resolve box → parse URDF chains → read q_fixed → adaptive lifter
-        → solve_grasp; abort if plan not ok. Move pre-grasp (open) then clamp
-        (inward). Read FT on both hands — return
-        ``{"ok": False, "reason": "no_contact"}`` if either hand reports
-        fmag < contact_force_threshold_n.
-        """
-        from jiuwensymbiosis.adapters.cruzr.geometry import (
-            LIFTER_JOINTS,
-            search_lifter_for_box,
-            solve_arm_ik,
-            solve_grasp,
-        )
-        from jiuwensymbiosis.kinematics.urdf_chain import parse_chain
-
-        # Invalidate any prior grasp up front: only a successful grasp below
-        # re-populates it, so dual_arm_place() (which falls back to this) no-ops after
-        # a failed grasp instead of placing a box we are not holding.
-        self._last_grasped_box = None
-        self._last_grasp_waist_yaw = None
-        self._last_surface = None   # a new grasp invalidates any previously sensed surface
-        self.env.holding_payload = False
 
         cfg = self.env.cfg
         left = parse_chain(cfg.urdf_path, "base_link", cfg.left_arm_leaf)
         right = parse_chain(cfg.urdf_path, "base_link", cfg.right_arm_leaf)
-        chains = {"left": left, "right": right}
-        fixed_names = ("lifter_pitch_1_joint", "lifter_pitch_2_joint",
-                       "lifter_pitch_3_joint", "waist_yaw_joint")
+        current = {j: q_fixed[j] for j in LIFTER_JOINTS}
+        return search_lifter_for_box(box, left, right, current, waist_yaw)
 
-        def _box_of(dd: dict) -> ObjectGeometry3D:
-            return ObjectGeometry3D(
-                True, "", tuple(dd["center_mm"]), dd["width_mm"], dd["height_mm"],
-                dd["front_x_mm"], dd["top_z_mm"], dd["n_points"],
-                back_x_mm=dd.get("back_x_mm", 0.0),
-            )
-
-        def _read_fixed() -> dict | None:
-            q = self._ll().get_joint_positions()
-            if not q or any(n not in q for n in fixed_names):
-                return None
-            return {k: q[k] for k in fixed_names}
-
-        det = target if isinstance(target, dict) else self._last_detection
-        if not det or not det.get("ok"):
-            return {"ok": False, "reason": "no_detection"}
-        box = _box_of(det)
-        q_fixed = _read_fixed()
-        if q_fixed is None:
-            return {"ok": False, "reason": "no_joint_state"}
-
-        # Adaptive lifter: pick the body pose that best reaches this box. If the
-        # current pose can't grasp it, search the level-torso manifold.
-        current_lifter = {j: q_fixed[j] for j in LIFTER_JOINTS}
-        lp = search_lifter_for_box(box, left, right, current_lifter, q_fixed["waist_yaw_joint"])
-        if not lp.found:
-            return {"ok": False, "reason": lp.reason or "unreachable_any_lifter"}
-
-        # Raise to the "ready" posture (hands up in front) BEFORE moving the
-        # lifter: the arms stay clear of the table while the body leans, and the
-        # home->grasp transition does not sweep up into the table from below.
-        # Non-contact transit moves (ready, descend-outside-faces) run on the fast transit ramp; the
-        # clamp below runs on the dedicated (faster-than-global) contact ramp — kept separate so its
-        # closing speed can be tuned against deform / contact-force accuracy on its own.
-        transit_ramp = getattr(cfg, "arm_transit_ramp_duration_s", None)
-        contact_ramp = getattr(cfg, "arm_contact_ramp_duration_s", None)
-        ready = self._ready_arm_q(chains, q_fixed)
-        self._move_arms_sync(ready, ramp_duration_s=transit_ramp)
-        if lp.improves:
-            self._ll().set_lifter(lp.q_lifter)
-            # Do NOT re-detect: the box's base_link coordinate is invariant to the
-            # lifter move (base_link is fixed below the lifter), and leaning the
-            # body often moves the box out of the camera FOV — a re-detect would
-            # then return wrong/partial geometry. Reuse the original box; only
-            # refresh q_fixed to reflect the new lifter angles.
-            q_fixed = _read_fixed()
-            if q_fixed is None:
-                return {"ok": False, "reason": "no_joint_state"}
-
-        # The self-collision model was warmed in a background thread at connect
-        # (CruzrEnv._warm_self_collision_async). Join it before solve_grasp's collision
-        # check so we neither rebuild it here — doubling the multi-second build right in
-        # the base-arrived→arms-close gap the user sees — nor race-disable the guard.
-        warm = getattr(self.env, "_warm_thread", None)
-        if warm is not None and warm.is_alive():
-            warm.join()
-        plan = solve_grasp(box, left, right, q_fixed, inset_mm=float(cfg.grasp_inset_mm),
-                           check_collision=True, package_dir=cfg.urdf_package_dir)
-        if not plan.ok:
-            return {"ok": False, "reason": plan.reason,
-                    "ik": {a: plan.ik[a].pos_err_m for a in plan.ik}}
-
-        # TOP-DOWN grasp (avoid sweeping up into the table from below):
-        # 1) descend straight down to clamp height (still outside the faces),
-        # 2) clamp inward. Descend warm-starts from the ready pose.
-        de_ik = {a: solve_arm_ik(chains[a], q_fixed, a, plan.descend[a], q_init=ready.get(a))
-                 for a in ("left", "right")}
-        self._move_arms_sync({a: r.q for a, r in de_ik.items() if r.converged},
-                             ramp_duration_s=transit_ramp)
-        # clamp: both arms inward onto the side faces (paddle TCP at face - inset) — contact ramp
-        self._move_arms_sync({a: plan.ik[a].q for a in ("left", "right")},
-                             ramp_duration_s=contact_ramp)
-
-        # FT contact verification — CRITICAL SAFETY: abort lift if no contact
-        thr = float(cfg.contact_force_threshold_n)
+    def contact_confirmed(self) -> tuple[bool, Any]:
+        """Both hands' force/torque above the configured threshold. SAFETY: no lift without it."""
+        thr = float(self.env.cfg.contact_force_threshold_n)
         ft = {arm: self._ll().read_hand_ft(arm) for arm in ("left", "right")}
-        contacted = all(
-            ft[a].get("ok") and ft[a].get("fmag", 0.0) >= thr
-            for a in ("left", "right")
-        )
-        if not contacted:
-            return {"ok": False, "reason": "no_contact", "ft": ft}
+        held = all(ft[a].get("ok") and ft[a].get("fmag", 0.0) >= thr for a in ("left", "right"))
+        return held, ft
 
-        # Remember what we just grasped so dual_arm_place() can be called with no
-        # arguments (the LLM cannot reliably echo this dict back as a tool arg).
-        self._last_grasped_box = det
-        # FT-confirmed clamp: tell RecoveryRail a payload is held, so a later motion
-        # failure retreats without opening the paddles (i.e. without dropping the box).
-        self.env.holding_payload = True
-        # Record the waist angle now: if turn_waist rotates the torso before
-        # dual_arm_place, the latter rotates its paddle targets by (waist_then - now).
-        self._last_grasp_waist_yaw = float(q_fixed["waist_yaw_joint"])
-        return {"ok": True, "object": object_name, "box": det, "ft": ft}
+    def place_plan(self, box: Any, landing: tuple, held: dict, *, inset_mm: float = 6.5,
+                   place_squeeze_mm: float | None = None, **_: Any) -> tuple[dict, dict, dict]:
+        """Paddle waypoints for setting the box down at ``landing``.
 
-    def _move_arms_sync(self, q_by_arm: dict, *, ramp_duration_s: Optional[float] = None) -> None:
-        """Command BOTH arms in ONE message so they move simultaneously. ``ramp_duration_s``
-        overrides the global ramp for this move only — non-contact transit moves in grasp/place
-        (ready / descend-outside-faces / raise-clear) pass the shorter
-        ``cfg.arm_transit_ramp_duration_s``; the clamp and place-lower keep the careful default.
-        """
-        combined: dict = {}
-        for arm_q in q_by_arm.values():
-            combined.update(arm_q)
-        if combined:
-            self._ll().move_joints_blocking(combined, ramp_duration_s=ramp_duration_s)
-
-    def _ready_arm_q(self, chains: dict, q_fixed: dict) -> dict:
-        """'Ready' (pre-grasp embrace) joint poses: both paddles in front of the
-        chest, facing inward, spread WIDE — the same orientation as the clamp but
-        held high and box-independent. Used as a transit waypoint so the
-        home<->grasp motion clears the table. Returns {arm: {joint: angle}} for
-        the arms whose IK converged.
-        """
-        from jiuwensymbiosis.adapters.cruzr.geometry import ready_targets, solve_arm_ik
-        tgts = ready_targets()
-        out = {}
-        for arm in ("left", "right"):
-            r = solve_arm_ik(chains[arm], q_fixed, arm, tgts[arm])
-            if r.converged:
-                out[arm] = r.q
-        return out
-
-    def _arm_home_path_collides(self, q_fixed: dict, arm_start: dict, arm_goal: dict, n: int = 8) -> bool:
-        """Self-collision along a linear arm interpolation start->goal (fixed lifter/waist). False if unavailable."""
-        from jiuwensymbiosis.adapters.cruzr.geometry import ARM_JOINTS
-        from jiuwensymbiosis.kinematics import self_collision as sc
-
-        cfg = self.env.cfg
-        pkg = cfg.urdf_package_dir
-        if not sc.available(cfg.urdf_path, pkg):
-            logger.warning("[CruzrApi] home: self-collision unavailable; homing UNCHECKED")
-            return False
-        names = [j for a in ("left", "right") for j in ARM_JOINTS[a]]
-        for i in range(n + 1):
-            t = i / n
-            jv = dict(q_fixed)
-            for j in names:
-                jv[j] = (1.0 - t) * float(arm_start.get(j, 0.0)) + t * float(arm_goal.get(j, 0.0))
-            qf = sc.full_q(cfg.urdf_path, pkg, jv)
-            if qf is not None and sc.in_self_collision(cfg.urdf_path, pkg, qf):
-                return True
-        return False
-
-    def _safe_home_arms(self) -> dict:
-        """Home both arms to zero along a self-collision-checked path, escalating through
-        recovery strategies so the robot reliably reaches home instead of getting stuck:
-
-          0. PRIMARY — abduct the arms OUT to the sides (cfg.home_clearance_arm_q), then
-             descend to 0, so the forearms come down along the body's sides and never drag
-             across the torso (the self-collision model does not always catch that contact);
-          1. both arms straight to zero (deep fallback — only if clearance is off/blocked);
-          2. ONE arm at a time — breaks the common failure where both forearms cross in
-             front of the chest when swept together; tried right-first then left-first;
-          3. raise both to the box-independent ready pose, then descend (together, else
-             one arm at a time from ready).
-
-        Every leg is self-collision-checked before it is commanded and the first fully
-        clear plan wins. Only if EVERY strategy still self-collides do we refuse (no
-        motion) — a genuinely stuck pose that needs manual recovery, not a blind sweep
-        through the body.
-        """
-        from jiuwensymbiosis.adapters.cruzr.geometry import ARM_JOINTS
-        cfg = self.env.cfg
-        qq = self._ll().get_joint_positions() or {}
-        cur = {j: float(qq.get(j, 0.0)) for a in ("left", "right") for j in ARM_JOINTS[a]}
-        _fixed_names = ("lifter_pitch_1_joint", "lifter_pitch_2_joint",
-                        "lifter_pitch_3_joint", cfg.waist_yaw_joint)
-        qf = {n: float(qq.get(n, 0.0)) for n in _fixed_names}
-        zeros = {j: 0.0 for j in cur}
-
-        def _one_arm_zeroed(base: dict, arm: str) -> dict:
-            """``base`` with ``arm``'s joints set to 0 (the other arm held where base has it)."""
-            m = dict(base)
-            m.update({j: 0.0 for j in ARM_JOINTS[arm]})
-            return m
-
-        def _try(name: str, waypoints: list[dict]) -> dict | None:
-            """Command ``waypoints`` (cur -> ... -> zeros) iff every leg is collision-free."""
-            legs = list(zip(waypoints, waypoints[1:]))
-            if any(self._arm_home_path_collides(qf, s, g) for s, g in legs):
-                return None
-            logger.info("[CruzrApi] home: arm home via %s", name)
-            for wp in waypoints[1:]:
-                self._move_arms_sync({a: {j: wp[j] for j in ARM_JOINTS[a]} for a in ("left", "right")})
-            return {"ok": True}
-
-        # 0) PRIMARY: abduct the arms OUT to the sides (cfg.home_clearance_arm_q), THEN descend
-        #    to 0 — so the forearms come down along the body's sides instead of dragging across
-        #    the torso, which the self-collision model does not always catch. Empty config
-        #    disables it and we fall straight through to the direct/one-arm/ready escalation.
-        clr = {j: float(v) for j, v in (getattr(cfg, "home_clearance_arm_q", None) or {}).items()
-               if j in zeros}
-        if clr:
-            cl = {**zeros, **clr}
-            for name, wps in (("clearance", [cur, cl, zeros]),
-                              ("clearance+right-first", [cur, cl, _one_arm_zeroed(cl, "right"), zeros]),
-                              ("clearance+left-first", [cur, cl, _one_arm_zeroed(cl, "left"), zeros])):
-                out = _try(name, wps)
-                if out is not None:
-                    return out
-
-        # 1) both direct  2) one arm at a time (both orders) — fallback if clearance is off or
-        #    its path self-collides (direct is now only a deep fallback, not the normal home).
-        for name, wps in (("direct", [cur, zeros]),
-                          ("right-arm-first", [cur, _one_arm_zeroed(cur, "right"), zeros]),
-                          ("left-arm-first", [cur, _one_arm_zeroed(cur, "left"), zeros])):
-            out = _try(name, wps)
-            if out is not None:
-                return out
-
-        # 3) raise both to the box-independent ready pose, then descend (together / one-at-a-time)
-        from jiuwensymbiosis.kinematics.urdf_chain import parse_chain
-        chains = {"left": parse_chain(cfg.urdf_path, "base_link", cfg.left_arm_leaf),
-                  "right": parse_chain(cfg.urdf_path, "base_link", cfg.right_arm_leaf)}
-        ready = self._ready_arm_q(chains, qf)
-        if all(a in ready for a in ("left", "right")):
-            rf = {j: float(ready[a][j]) for a in ("left", "right") for j in ARM_JOINTS[a]}
-            for name, wps in (("ready", [cur, rf, zeros]),
-                              ("ready+right-first", [cur, rf, _one_arm_zeroed(rf, "right"), zeros]),
-                              ("ready+left-first", [cur, rf, _one_arm_zeroed(rf, "left"), zeros])):
-                out = _try(name, wps)
-                if out is not None:
-                    return out
-
-        logger.error("[CruzrApi] home: NO self-collision-free home path "
-                     "(clearance / direct / one-arm-at-a-time / ready all blocked); refusing — needs manual recovery")
-        return {"ok": False, "reason": "home_path_self_collision"}
-
-    @robot_tool(
-        desc="Home both arms along a self-collision-checked path, escalating through fallbacks "
-             "(abduct clear of the torso first, then descend). For wrapping up a task prefer home.",
-        tags=["motion"],
-        provides=["body.home"],
-    )
-    def home_arms(self) -> dict:
-        """Home both arms to zero via the self-collision-checked escalation (see _safe_home_arms)."""
-        return self._safe_home_arms()
-
-    @implements(LIFT_TO_CLEARANCE)
-    def lift_to_clearance(self, box: Optional[dict] = None, upright_tol_rad: float = 0.05) -> dict:
-        """Stand the torso up (lifter -> 0) and raise the held box to the PRESET absolute
-        height ``transit_lift_z_m`` (base-frame z) in ONE coordinated move (lifter + arms
-        together); the paddle gap is preserved at the endpoints.
+        Two things here are paddle facts and nothing else's: the CLAMP targets keep the gap
+        the grasp actually achieved (re-deriving it from the box width squeezes or drops the
+        box during the long, arms-extended descent), and each paddle is pulled a little PAST
+        that held position toward the centre so the arms actively press in — commanding the
+        exact held gap leaves near-zero position error, so a stiff controller applies almost
+        no inward force and the box slides out.
         """
         from dataclasses import replace
 
-        import numpy as np
-
-        from jiuwensymbiosis.adapters.cruzr.geometry import (
-            ARM_JOINTS,
-            LIFTER_JOINTS,
-            TOOL_APPROACH_LOCAL,
-            TOOL_PADDLE_LOCAL,
-            both,
-            plan_clamp_targets,
-            solve_arm_ik,
-        )
-        from jiuwensymbiosis.kinematics.fk import fk_chain
-
-        box = box if isinstance(box, dict) else self._last_grasped_box
-        if not box:
-            return {"ok": False, "reason": "no_box_to_lift"}
-        from jiuwensymbiosis.kinematics.urdf_chain import parse_chain
+        from jiuwensymbiosis.adapters.cruzr.geometry import plan_clamp_targets
+        from jiuwensymbiosis.motion.dual_arm import both
 
         cfg = self.env.cfg
-        b = _geometry_from_payload(box)
-        if b is None:
-            return {"ok": False, "reason": "incomplete_box_payload"}
-        chains = {
-            "left": parse_chain(cfg.urdf_path, "base_link", cfg.left_arm_leaf),
-            "right": parse_chain(cfg.urdf_path, "base_link", cfg.right_arm_leaf),
-        }
-        q = self._ll().get_joint_positions()
-        fixed_names = ("lifter_pitch_1_joint", "lifter_pitch_2_joint",
-                       "lifter_pitch_3_joint", "waist_yaw_joint")
-        if not q or any(n not in q for n in fixed_names):
-            return {"ok": False, "reason": "no_joint_state"}
-        q_fixed = {k: q[k] for k in fixed_names}
-        cur = {a: {j: q.get(j, 0.0) for j in ARM_JOINTS[a]} for a in ("left", "right")}
-
-        # Raise the box to a PRESET ABSOLUTE height (not a relative +dz, whose final
-        # height varied with the grasp pose and could leave the camera occluded). Plan
-        # everything for the UPRIGHT torso so we never move on an unreachable target:
-        # standing up holds the arm joints (rigid), so FK with the current arm joints
-        # but the lifter at 0 gives where each paddle will be right AFTER standing up.
-        # We keep that x/y + orientation and set ONLY z to the preset -> both paddles go
-        # to the same absolute z, so the gap (and box level) is preserved exactly.
-        target_z = float(cfg.transit_lift_z_m)
-        lifter_from = {j: float(q_fixed[j]) for j in LIFTER_JOINTS}
-        stand_needed = any(abs(v) > upright_tol_rad for v in lifter_from.values())
-        zero_lifter = {j: 0.0 for j in LIFTER_JOINTS}
-        q_upright = {**q, **zero_lifter}                 # FK: arms held, lifter at 0
-        q_fixed_upright = {**q_fixed, **zero_lifter}     # IK: solve with the torso upright
-
-        _, _, clamp = plan_clamp_targets(b)              # per-arm tcp_offset template only
-        lifted = {}
-        for a, chain, tgt in both(chains, clamp):
-            tf = fk_chain(chain, q_upright)
-            r = tf[:3, :3]
-            tcp = tf[:3, 3] + r @ np.asarray(tgt.tcp_offset_local, dtype=float)
-            lifted[a] = replace(
-                clamp[a],
-                pos_m=(float(tcp[0]), float(tcp[1]), target_z),
-                approach=tuple(float(v) for v in r @ np.asarray(TOOL_APPROACH_LOCAL, dtype=float)),
-                paddle=tuple(float(v) for v in r @ np.asarray(TOOL_PADDLE_LOCAL, dtype=float)),
-            )
-        ik = {a: solve_arm_ik(chain, q_fixed_upright, a, tgt, q_init=c,
-                             check_collision=True, package_dir=cfg.urdf_package_dir)
-              for a, chain, tgt, c in both(chains, lifted, cur)}
-        if not all(ik[a].converged for a in ("left", "right")):
-            return {"ok": False, "reason": "lift_unreachable",
-                    "pos_err_m": {a: ik[a].pos_err_m for a in ("left", "right")}}
-
-        # ONE coordinated motion: command the arms to the raised (upright-torso) IK pose
-        # and — if the torso is leaned — the lifter to 0 IN THE SAME move, so they ramp
-        # together. Endpoints are exact (box centred at the preset height, torso upright,
-        # paddle gap preserved); the gap / box-level are NOT held constant mid-ramp because
-        # the arms and lifter change at once — accepted for a single, faster lift.
-        cmd = {**ik["left"].q, **ik["right"].q}
-        if stand_needed:
-            cmd.update(zero_lifter)
-        logger.info("[CruzrApi] lift_to_clearance -> z=%.3f%s (one move)",
-                    target_z, f", lifter 0 from {lifter_from}" if stand_needed else "")
-        self._ll().move_joints_blocking(cmd, ramp_duration_s=getattr(cfg, "lifter_ramp_duration_s", None))
-        return {"ok": True, "target_z_m": target_z, "stood_up": stand_needed, "lifter_from": lifter_from}
-
-    # Not an action of its own — ``home`` IS the safe retreat (see api/actions.py:HOME).
-    # Kept as a named method because the grasp/place paths and the bring-up script call
-    # it directly, and because ``tol_rad`` is a body knob no contract should carry.
-    def _home_safely(self, tol_rad: float = 0.05) -> dict:
-        """Retreat to a safe home, doing the minimum motion for the current state.
-
-        - already upright AND arms home AND waist neutral → do nothing (``skipped``);
-        - upright but arms not home / waist rotated → neutralize the waist then home the arms;
-        - leaned forward (or unknown) → straighten the lifter, neutralize the waist, then home.
-        """
-        from jiuwensymbiosis.adapters.cruzr.geometry import ARM_JOINTS, LIFTER_JOINTS
-
-        cfg = self.env.cfg
-        q = self._ll().get_joint_positions() or {}
-        upright = all(abs(q.get(j, 0.0)) <= tol_rad for j in LIFTER_JOINTS)
-        arms_home = all(
-            abs(q.get(j, 0.0)) <= tol_rad
-            for a in ("left", "right") for j in ARM_JOINTS[a]
-        )
-        waist_home = abs(q.get(cfg.waist_yaw_joint, 0.0)) <= tol_rad
-        # With no joint state we cannot tell where we are; fall through to the
-        # full safe sequence (treat as possibly leaned).
-        have_state = bool(q)
-
-        at_home_posture = arms_home and waist_home
-        if have_state and upright and at_home_posture:
-            return {"ok": True, "skipped": "already_home"}
-        if have_state and upright:
-            self._neutralize_waist(tol_rad)   # body straight: no table to clear
-            return self._safe_home_arms()
-
-        # Leaned forward (or unknown): straighten the lifter, neutralize the waist, then home.
-        self._ll().set_lifter({j: 0.0 for j in LIFTER_JOINTS})
-        self._neutralize_waist(tol_rad)
-        return self._safe_home_arms()
-
-    def _neutralize_waist(self, tol_rad: float = 0.05) -> None:
-        """Turn waist_yaw back to 0 if rotated, holding the arms where they now are."""
-        from jiuwensymbiosis.adapters.cruzr.geometry import ARM_JOINTS
-
-        cfg = self.env.cfg
-        qq = self._ll().get_joint_positions() or {}
-        if abs(qq.get(cfg.waist_yaw_joint, 0.0)) <= tol_rad:
-            return
-        hold = {}
-        for arm_joints in (ARM_JOINTS["left"], ARM_JOINTS["right"]):
-            for j in arm_joints:
-                if j in qq:
-                    hold[j] = float(qq.get(j, 0.0))
-        self._ll().turn_waist_blocking(0.0, hold=hold, waist_joint=cfg.waist_yaw_joint)
-
-    def recovery_home(self, tol_rad: float = 0.05) -> dict:
-        """Payload-aware retreat; ``RecoveryRail`` prefers this over ``home``.
-
-        ``home`` homes the arms, which un-clamps the paddles — with a box held
-        that is a drop, not a recovery. While a payload is held, retreat only the parts
-        that cannot drop it: straighten the lifter and neutralize the waist, leaving the
-        arms clamped for a human (or a retried ``dual_arm_place``) to resolve.
-        """
-        if not getattr(self.env, "holding_payload", False):
-            return self._home_safely(tol_rad)
-
-        from jiuwensymbiosis.adapters.cruzr.geometry import LIFTER_JOINTS
-
-        logger.warning("[CruzrApi] recovery_home: payload held → keeping arms clamped")
-        self._ll().set_lifter({j: 0.0 for j in LIFTER_JOINTS})
-        self._neutralize_waist(tol_rad)
-        return {"ok": True, "payload_preserved": True}
-
-    @implements(DUAL_ARM_PLACE)
-    def dual_arm_place(self, target: Optional[dict] = None, inset_mm: float = 6.5,
-                  descend_dz_m: float = 0.02, surface_z_mm: Optional[float] = None,
-                  surface: Optional[dict] = None) -> dict:
-        """Reverse of grasp: move the box over a validated landing point ON the table,
-        lower, drop the torso ~``descend_dz_m`` to clear the box rim, release, then raise.
-
-        Pass ``surface`` = the full ``locate_for_place()`` result (table XY footprint +
-        top z); when omitted it falls back to the last ``locate_for_place`` (cached), so an
-        LLM calls ``locate_for_place()`` then ``dual_arm_place()`` with no args. The box is landed
-        FULLY on the table clear of the edges — Y centred, X just inside the near edge — so
-        it never sits on the rim or overhangs. Returns a
-        ``box_wider_than_table`` / ``box_deeper_than_table`` error (no motion) if the box
-        can't fit, or an unreachable error if the landing point is out of arm range (drive
-        closer and retry). ``surface_z_mm`` alone is the legacy z-only path (places at the
-        current carried XY — un-validated). Does NOT return to zero — the lifter-straighten
-        and arm-home are delegated to ``home()`` (call it after placing). ``box`` is
-        the geometry dict from ``locate_for_grasp``/``dual_arm_grasp``; when omitted it falls back
-        to the most recent successful ``dual_arm_grasp``.
-        """
-        from dataclasses import replace
-
-        import numpy as np
-
-        from jiuwensymbiosis.adapters.cruzr.geometry import (
-            ARM_JOINTS,
-            LIFTER_JOINTS,
-            both,
-            plan_clamp_targets,
-            search_lifter_for_place,
-            solve_arm_ik,
-        )
-        from jiuwensymbiosis.kinematics.fk import fk_chain
-        from jiuwensymbiosis.kinematics.urdf_chain import parse_chain
-
-        box = target if isinstance(target, dict) else self._last_grasped_box
-        if not box:
-            return {"ok": False, "reason": "no_box_to_place"}
-        # Fall back to the last sensed table so an LLM can call locate_for_place() then
-        # dual_arm_place() with no args (the footprint dict is too large to echo back).
-        if surface is None:
-            surface = self._last_surface
-
-        cfg = self.env.cfg
-        b = _geometry_from_payload(box)
-        if b is None:
-            return {"ok": False, "reason": "incomplete_box_payload"}
-        chains = {
-            "left": parse_chain(cfg.urdf_path, "base_link", cfg.left_arm_leaf),
-            "right": parse_chain(cfg.urdf_path, "base_link", cfg.right_arm_leaf),
-        }
-        q = self._ll().get_joint_positions()
-        fixed_names = ("lifter_pitch_1_joint", "lifter_pitch_2_joint",
-                       "lifter_pitch_3_joint", "waist_yaw_joint")
-        if not q or any(name not in q for name in fixed_names):
-            # no state to warm-start safely; at least open+home blind is unsafe, so bail
-            return {"ok": False, "reason": "no_joint_state"}
-        q_fixed = {k: q[k] for k in fixed_names}
-        cur = {a: {j: q.get(j, 0.0) for j in ARM_JOINTS[a]} for a in ("left", "right")}
-
-        # Where the box is being carried right now, via FK of the measured joints (the
-        # mean of the two paddle TCPs is the box centre in x,y). Used for the legacy
-        # z-only path and to log how far the box moves to reach the table.
-        clamp_tmpl = plan_clamp_targets(b, inset_mm=inset_mm)[2]
-        held_tcp: dict[str, tuple[float, float, float]] = {}
-        for a, chain, tmpl in both(chains, clamp_tmpl):
-            tf = fk_chain(chain, q)
-            p = tf[:3, 3] + tf[:3, :3] @ np.asarray(tmpl.tcp_offset_local, dtype=float)
-            held_tcp[a] = (float(p[0]), float(p[1]), float(p[2]))
-        cx = [held_tcp["left"][0], held_tcp["right"][0]]
-        cy = [held_tcp["left"][1], held_tcp["right"][1]]
-        cx_now_mm = 500.0 * (cx[0] + cx[1])   # (x0 + x1)/2 * 1000
-        cy_now_mm = 500.0 * (cy[0] + cy[1])   # (y0 + y1)/2 * 1000
-
-        # Pick the landing XY. With a sensed table footprint, land the box FULLY on the
-        # table clear of the edges (Y centred on the table; X just inside the near edge so
-        # the whole box sits on it and the arms reach the least far) — NOT at the carried
-        # XY, which is never validated against the table and drops the box on the rim or in
-        # mid-air. Without `surface`, keep the legacy z-only behaviour (place at the carried
-        # XY). Fit checks bail (no motion) if the box cannot sit inside the edges + margin.
-        if surface is not None:
-            if any(f not in surface for f in _SURFACE_FIELDS):
-                return {"ok": False, "reason": "incomplete_surface_payload"}
-            near_x, far_x = float(surface.get("front_x_mm")), float(surface.get("back_x_mm"))
-            table_cy, table_w = float(surface.get("center_mm")[1]), float(surface.get("width_mm"))
-            surf_z: Optional[float] = float(surface.get("surface_z_mm"))
-            # box depth along x; fall back to width if the far face was not detected
-            box_depth = (b.back_x_mm - b.front_x_mm) if b.back_x_mm > b.front_x_mm else b.width_mm
-            m = float(cfg.place_edge_margin_mm)
-            if b.width_mm / 2.0 + m > table_w / 2.0:
-                return {"ok": False, "reason": "box_wider_than_table"}
-            if box_depth + 2.0 * m > (far_x - near_x):
-                return {"ok": False, "reason": "box_deeper_than_table"}
-            landing_x = near_x + box_depth / 2.0 + m
-            landing_y = table_cy
-            logger.info("[CruzrApi] dual_arm_place: table x=[%.1f,%.1f] cy=%.1f w=%.1f -> landing (%.1f, %.1f) "
-                        "(carried %.1f, %.1f)", near_x, far_x, table_cy, table_w,
-                        landing_x, landing_y, cx_now_mm, cy_now_mm)
-        else:
-            landing_x, landing_y, surf_z = cx_now_mm, cy_now_mm, surface_z_mm
-
+        b = box
+        landing_x, landing_y, surf_z = landing
+        # The two contact points as measured right now, in the (x-list, y-list) shape the
+        # spacing arithmetic below reads.
+        cx = [held["left"][0], held["right"][0]]
+        cy = [held["left"][1], held["right"][1]]
+        squeeze_mm = float(getattr(cfg, "place_squeeze_mm", 0.0)
+                           if place_squeeze_mm is None else place_squeeze_mm)
         # Rebuild LEVEL place targets at the landing x,y (front == back == depth mid so the
         # clamp sits at landing_x). No waist-delta rotation is needed — FK already reflects
         # the current waist. _apply_surface_z then lands the box bottom on the surface
@@ -1070,36 +464,41 @@ class CruzrApi(BaseRobotApi):
         # out during the lower. Grasp instead overshoots the faces (grasp_inset_mm) to press in. So
         # pull each paddle place_squeeze_mm/2 PAST the held position toward the box centre: the arms
         # actively squeeze during the lower. Centre + x are untouched, so the box still lands on target.
-        squeeze_half_m = 0.5 * float(getattr(cfg, "place_squeeze_mm", 0.0)) / 1000.0
+        squeeze_half_m = 0.5 * squeeze_mm / 1000.0
         inward = {"left": -1.0, "right": 1.0}   # left paddle is +Y → inward is -Y; right mirrors
         clamp = {a: replace(tgt, pos_m=(cx[i] + dx_m,
                                         cy[i] + dy_m + sign * squeeze_half_m,
                                         tgt.pos_m[2]))
                  for i, (a, tgt, sign) in enumerate(both(clamp, inward))}
         approach_t, descend, clamp = self._apply_surface_z(b, (approach_t, descend, clamp), surf_z)
+        return approach_t, descend, clamp
 
-        # Nudge the lifter as LITTLE as possible so the ARMS can reach the place targets:
-        # search the SMALLEST level-manifold lean (capped at place_max_lift_lean_rad) from
-        # which both arms reach the (base-frame, fixed) place clamp targets, then lean there
-        # holding the arm joints. A big forward lean would drop the torso onto the table, so
-        # the arms — not the lifter — position the box; if the arms can't reach within the
-        # cap, place returns unreachable (drive closer) rather than leaning into the table.
-        cur_lifter = {j: q_fixed[j] for j in LIFTER_JOINTS}
-        lp = search_lifter_for_place(clamp, chains["left"], chains["right"],
-                                     cur_lifter, q_fixed["waist_yaw_joint"],
-                                     max_lean_rad=float(cfg.place_max_lift_lean_rad))
-        if not lp.found:
-            return {"ok": False, "reason": lp.reason or "place_unreachable_any_lifter"}
-        if lp.improves:
-            held = {j: float(q.get(j, 0.0)) for a in ("left", "right") for j in ARM_JOINTS[a]}
-            logger.info("[CruzrApi] dual_arm_place: leaning lifter to %s to reach place targets", lp.q_lifter)
-            self._ll().move_joints_blocking(
-                {**held, **lp.q_lifter}, ramp_duration_s=getattr(cfg, "lifter_ramp_duration_s", None))
-            q = self._ll().get_joint_positions()
-            if not q or any(name not in q for name in fixed_names):
-                return {"ok": False, "reason": "no_joint_state"}
-            q_fixed = {k: q[k] for k in fixed_names}
-            cur = {a: {j: q.get(j, 0.0) for j in ARM_JOINTS[a]} for a in ("left", "right")}
+    def lower_and_release(self, chains: dict, arm_joints: dict, q_fixed: dict,
+                          plan: tuple, held_q: dict, *, descend_dz_m: float = 0.02,
+                          **_: Any) -> dict:
+        """Descend keeping the paddle gap, slide the paddles off the rim, then open outward.
+
+        The descent is streamed in CARTESIAN, not as one joint ramp: a joint ramp only holds
+        the gap at its two endpoints and bows it OPEN in between, which is exactly when the
+        arms are most extended and least stiff — the box slips out. Interpolating the TCPs
+        makes the commanded gap only ever tighten toward the squeeze.
+        """
+        from dataclasses import replace
+
+        import numpy as np
+
+        from jiuwensymbiosis.adapters.cruzr.geometry import (
+            LIFTER_JOINTS,
+            solve_arm_ik,
+        )
+        from jiuwensymbiosis.kinematics.fk import fk_chain
+        from jiuwensymbiosis.motion.dual_arm import both
+
+        cfg = self.env.cfg
+        approach_t, descend, clamp = plan
+        cur = held_q
+        q = self._ll().get_joint_positions() or {}
+        fixed_names = tuple(self.env.torso_joints)
         # Ramp split (same as grasp): the box-CONTACT lower (below) runs on the dedicated PLACE
         # contact ramp — separate from the grasp clamp's arm_contact_ramp_duration_s so the box can
         # be set down gently without slowing the clamp; falls back to the shared contact ramp if the
@@ -1198,9 +597,419 @@ class CruzrApi(BaseRobotApi):
         # 4. back to the raised "ready" posture (arms up in front, clear). The
         #    return-to-zero (straighten lifter -> 0, then arms -> 0) is delegated
         #    to home() — call it after placing to retreat to a safe home.
-        return {"ok": True, "leaned": bool(lp.improves), "lifter": lp.q_lifter,
-                "surface_z_mm": surf_z, "landing_mm": [landing_x, landing_y],
-                "carried_mm": [cx_now_mm, cy_now_mm]}
+        return {"ok": True}
+
+    @property
+    def last_grasped(self) -> dict | None:
+        """What dual_arm_grasp last took hold of — what a bare dual_arm_place acts on."""
+        return self._last_grasped_box
+
+    def lift_plan(self, box: Any, chains: dict, q_upright: dict, target_z_m: float) -> dict:
+        """Paddle TCPs at the transit height: keep the live x/y + orientation, set only z.
+
+        Both paddles go to the SAME absolute z, so the gap — and with it the box level — is
+        preserved exactly.
+        """
+        from dataclasses import replace
+
+        import numpy as np
+
+        from jiuwensymbiosis.adapters.cruzr.geometry import (
+            TOOL_APPROACH_LOCAL,
+            TOOL_PADDLE_LOCAL,
+            plan_clamp_targets,
+        )
+        from jiuwensymbiosis.kinematics.fk import fk_chain
+        from jiuwensymbiosis.motion.dual_arm import both
+
+        target_z = target_z_m
+        b = box
+        _, _, clamp = plan_clamp_targets(b)              # per-arm tcp_offset template only
+        lifted = {}
+        for a, chain, tgt in both(chains, clamp):
+            tf = fk_chain(chain, q_upright)
+            r = tf[:3, :3]
+            tcp = tf[:3, 3] + r @ np.asarray(tgt.tcp_offset_local, dtype=float)
+            lifted[a] = replace(
+                clamp[a],
+                pos_m=(float(tcp[0]), float(tcp[1]), target_z),
+                approach=tuple(float(v) for v in r @ np.asarray(TOOL_APPROACH_LOCAL, dtype=float)),
+                paddle=tuple(float(v) for v in r @ np.asarray(TOOL_PADDLE_LOCAL, dtype=float)),
+            )
+        return lifted
+
+    # ------------------------------------------------- place hooks (grasp.paddle)
+    def carried_contacts(self, chains: dict, q_all: dict, box: Any, *,
+                         inset_mm: float = 6.5, **_: Any) -> dict:
+        """Where each paddle TCP is right now, by FK of the measured joints."""
+        import numpy as np
+
+        from jiuwensymbiosis.adapters.cruzr.geometry import plan_clamp_targets
+        from jiuwensymbiosis.kinematics.fk import fk_chain
+        from jiuwensymbiosis.motion.dual_arm import both
+
+        tmpl = plan_clamp_targets(box, inset_mm=float(inset_mm))[2]
+        out: dict = {}
+        for a, chain, t in both(chains, tmpl):
+            tf = fk_chain(chain, q_all)
+            p = tf[:3, 3] + tf[:3, :3] @ np.asarray(t.tcp_offset_local, dtype=float)
+            out[a] = (float(p[0]), float(p[1]), float(p[2]))
+        return out
+
+    def lifter_for_place(self, clamp: dict, q_fixed: dict) -> Any:
+        """Smallest level-manifold lean from which both arms reach the place targets."""
+        from jiuwensymbiosis.adapters.cruzr.geometry import LIFTER_JOINTS, search_lifter_for_place
+        from jiuwensymbiosis.kinematics.urdf_chain import parse_chain
+
+        cfg = self.env.cfg
+        chains = {"left": parse_chain(cfg.urdf_path, "base_link", cfg.left_arm_leaf),
+                  "right": parse_chain(cfg.urdf_path, "base_link", cfg.right_arm_leaf)}
+        cur_lifter = {j: q_fixed[j] for j in LIFTER_JOINTS}
+        return search_lifter_for_place(clamp, chains["left"], chains["right"], cur_lifter,
+                                       q_fixed[self.env.waist_joint],
+                                       max_lean_rad=float(cfg.place_max_lift_lean_rad))
+
+    # ---------------------------------- approach body hooks (motion/approach.py reads these)
+    def base_driver(self) -> Any:
+        """Drive the servo worker through the driver directly (the SDK handle is its own)."""
+        return self._ll()
+
+    def nav_relative(self, dx_m: float, dy_m: float, dyaw_rad: float, **gains: Any) -> dict:
+        """Relative base move that forwards the gentle approach-only steering gains."""
+        return self._ll().navigate_relative(float(dx_m), float(dy_m), float(dyaw_rad), **gains)
+
+    def search_frames(self, camera: Optional[str] = None) -> Any:
+        """One raw frame tuple from ``camera``. The head is a stereo pair read as its RIGHT eye
+        alone — no depth on that path, which costs nothing here: looking around wants a bearing.
+        """
+        return self._ll().grab_frames(camera=camera or "waist")
+
+    def sweep_for_bearing(self, object_name: str, on: Optional[str] = None) -> dict:
+        """Pan the HEAD left + right over the current facing — cruzr can aim a camera without
+        moving the base, so it looks around with the neck before anything else turns.
+        """
+        return _acquire_with_head(self, object_name, self.env.cfg, on=on)
+
+    def reset_search_sensor(self) -> None:
+        """Re-centre the head to its forward pose."""
+        _reset_head(self, self.env.cfg)
+
+    @implements(NAVIGATE_RELATIVE)
+    def navigate_relative(self, dx_m: float, dy_m: float = 0.0, dyaw_rad: float = 0.0) -> dict:
+        """Move the base by a relative offset via SDK wheel-velocity + odom closed loop."""
+        logger.info("[CruzrApi] navigate_relative dx=%.3f dy=%.3f dyaw=%.3f", dx_m, dy_m, dyaw_rad)
+        return self._ll().navigate_relative(float(dx_m), float(dy_m), float(dyaw_rad))
+
+    @implements(ROTATE_BASE)
+    def rotate_base(self, dyaw_rad: float) -> dict:
+        """Rotate the base in place by ``dyaw_rad`` (dx=dy=0). Does NOT touch the arms."""
+        logger.info("[CruzrApi] rotate_base dyaw=%.3f", dyaw_rad)
+        return self._ll().navigate_relative(0.0, 0.0, float(dyaw_rad))
+
+    @implements(DRIVE_ARC)
+    def drive_arc(self, radius_m: float, dyaw_rad: float) -> dict:
+        """Drive ONE constant-curvature arc (``radius_m``, signed ``dyaw_rad``) via the low-level ``--arc``
+        mode. Bring-up / calibration tool: no perception — use it in open space to measure the realized
+        radius vs commanded and tune ``arc_curv_gain``/``arc_k_fwd`` before ever enabling
+        ``grasp_arc_enabled``. Does NOT touch the arms.
+        """
+        logger.info("[CruzrApi] drive_arc radius=%.3f dyaw=%.3f", radius_m, dyaw_rad)
+        return self._ll().navigate_arc(float(radius_m), float(dyaw_rad))
+
+
+    def check_reachable(self, target: dict) -> bool:
+        """Override of ``Reachability.check_reachable`` with cruzr's exact DUAL-ARM + lifter judge:
+        当前底盘/关节姿态下，双臂能否抓到该 base 系目标(允许自适应 lifter，不含底盘移动)。纯离线只读，
+        复用 dual_arm_grasp 的 IK 可达搜索，无运动/无硬件副作用。供 fast 规划器判断"要不要先编长距离移动"。
+        保守快筛：不确定/无关节状态/出错一律判不可达(保留 approach_for_grasp 兜底，对误判鲁棒)。target 为
+        analyze_scene 形状的目标 dict(含 center_mm)。
+        """
+        from jiuwensymbiosis.adapters.cruzr.geometry import LIFTER_JOINTS, search_lifter_for_box
+        from jiuwensymbiosis.kinematics.urdf_chain import parse_chain
+
+        try:
+            c = target.get("center_mm")
+            if not (isinstance(c, (list, tuple)) and len(c) == 3):
+                return False
+            fixed_names = ("lifter_pitch_1_joint", "lifter_pitch_2_joint",
+                           "lifter_pitch_3_joint", "waist_yaw_joint")
+            q = self._ll().get_joint_positions()
+            if not q or any(n not in q for n in fixed_names):
+                return False   # 无关节状态 → 保守判不可达
+            cfg = self.env.cfg
+            # scene 只有 center/宽/高/forward，缺 front_x/top_z/back_x → 近似构造(depth≈width)。
+            # 保守快筛，不追求精确；真正的精解仍由执行期 dual_arm_grasp 负责。
+            forward = float(target.get("forward_mm", c[0]))
+            width = float(target.get("width_mm", 0.0))
+            height = float(target.get("height_mm", 0.0))
+            box = ObjectGeometry3D(
+                ok=True, reason="", center_mm=(float(c[0]), float(c[1]), float(c[2])),
+                width_mm=width, height_mm=height,
+                front_x_mm=forward - width / 2.0, top_z_mm=float(c[2]) + height / 2.0,
+                n_points=500, back_x_mm=forward + width / 2.0,
+            )
+            left = parse_chain(cfg.urdf_path, "base_link", cfg.left_arm_leaf)
+            right = parse_chain(cfg.urdf_path, "base_link", cfg.right_arm_leaf)
+            current_lifter = {j: q[j] for j in LIFTER_JOINTS}
+            lp = search_lifter_for_box(box, left, right, current_lifter,
+                                       q["waist_yaw_joint"], ik_max_iters=300)
+            return bool(lp.found)
+        except Exception as exc:  # noqa: BLE001 — best-effort precheck; any failure → not reachable
+            logger.debug("[CruzrApi] reachability precheck skipped: %s", exc)
+            return False
+
+    @implements(DUAL_ARM_GRASP)
+    def dual_arm_grasp(self, target: Optional[dict] = None, object_name: str = "box") -> dict:
+        """Both paddles take hold of an already-detected box and confirm by force.
+
+        The sequence is shared (``motion/dual_arm.py``); this body supplies the four seams it
+        needs — ``grasp_plan`` and ``ready_plan`` (paddle geometry), ``lifter_for_object`` (it
+        leans) and ``contact_confirmed`` (hand FT).
+        """
+        out = dual_arm.dual_arm_grasp(self, target, object_name)
+        if out.get("ok"):
+            # Bookkeeping this body needs for a later bare dual_arm_place: WHAT was grasped,
+            # and at WHICH waist angle — if turn_waist rotates the torso in between, place
+            # rotates its paddle targets by the difference.
+            self._last_grasped_box = out["box"]
+            q = self._ll().get_joint_positions() or {}
+            self._last_grasp_waist_yaw = float(q.get(self.env.cfg.waist_yaw_joint, 0.0))
+        else:
+            self._last_grasped_box = None
+            self._last_grasp_waist_yaw = None
+        return out
+
+
+    def _move_arms_sync(self, q_by_arm: dict, *, ramp_duration_s: Optional[float] = None) -> None:
+        """Command BOTH arms in ONE message so they move simultaneously. ``ramp_duration_s``
+        overrides the global ramp for this move only — non-contact transit moves in grasp/place
+        (ready / descend-outside-faces / raise-clear) pass the shorter
+        ``cfg.arm_transit_ramp_duration_s``; the clamp and place-lower keep the careful default.
+        """
+        combined: dict = {}
+        for arm_q in q_by_arm.values():
+            combined.update(arm_q)
+        if combined:
+            self.env.move_named_joints(combined, ramp_duration_s=ramp_duration_s)
+
+    def _ready_arm_q(self, chains: dict, q_fixed: dict) -> dict:
+        """'Ready' (pre-grasp embrace) joint poses: both paddles in front of the
+        chest, facing inward, spread WIDE — the same orientation as the clamp but
+        held high and box-independent. Used as a transit waypoint so the
+        home<->grasp motion clears the table. Returns {arm: {joint: angle}} for
+        the arms whose IK converged.
+        """
+        from jiuwensymbiosis.adapters.cruzr.geometry import ready_targets, solve_arm_ik
+        tgts = ready_targets()
+        out = {}
+        for arm in ("left", "right"):
+            r = solve_arm_ik(chains[arm], q_fixed, arm, tgts[arm])
+            if r.converged:
+                out[arm] = r.q
+        return out
+
+    def _arm_home_path_collides(self, q_fixed: dict, arm_start: dict, arm_goal: dict, n: int = 8) -> bool:
+        """Self-collision along a linear arm interpolation start->goal (fixed lifter/waist). False if unavailable."""
+        from jiuwensymbiosis.adapters.cruzr.geometry import ARM_JOINTS
+        from jiuwensymbiosis.kinematics import self_collision as sc
+
+        cfg = self.env.cfg
+        pkg = cfg.urdf_package_dir
+        if not sc.available(cfg.urdf_path, pkg):
+            logger.warning("[CruzrApi] home: self-collision unavailable; homing UNCHECKED")
+            return False
+        names = [j for a in ("left", "right") for j in ARM_JOINTS[a]]
+        for i in range(n + 1):
+            t = i / n
+            jv = dict(q_fixed)
+            for j in names:
+                jv[j] = (1.0 - t) * float(arm_start.get(j, 0.0)) + t * float(arm_goal.get(j, 0.0))
+            qf = sc.full_q(cfg.urdf_path, pkg, jv)
+            if qf is not None and sc.in_self_collision(cfg.urdf_path, pkg, qf):
+                return True
+        return False
+
+    def _safe_home_arms(self) -> dict:
+        """Home both arms to zero along a self-collision-checked path, escalating through
+        recovery strategies so the robot reliably reaches home instead of getting stuck:
+
+          0. PRIMARY — abduct the arms OUT to the sides (cfg.home_clearance_arm_q), then
+             descend to 0, so the forearms come down along the body's sides and never drag
+             across the torso (the self-collision model does not always catch that contact);
+          1. both arms straight to zero (deep fallback — only if clearance is off/blocked);
+          2. ONE arm at a time — breaks the common failure where both forearms cross in
+             front of the chest when swept together; tried right-first then left-first;
+          3. raise both to the box-independent ready pose, then descend (together, else
+             one arm at a time from ready).
+
+        Every leg is self-collision-checked before it is commanded and the first fully
+        clear plan wins. Only if EVERY strategy still self-collides do we refuse (no
+        motion) — a genuinely stuck pose that needs manual recovery, not a blind sweep
+        through the body.
+        """
+        from jiuwensymbiosis.adapters.cruzr.geometry import ARM_JOINTS
+        cfg = self.env.cfg
+        qq = self._ll().get_joint_positions() or {}
+        cur = {j: float(qq.get(j, 0.0)) for a in ("left", "right") for j in ARM_JOINTS[a]}
+        _fixed_names = ("lifter_pitch_1_joint", "lifter_pitch_2_joint",
+                        "lifter_pitch_3_joint", cfg.waist_yaw_joint)
+        qf = {n: float(qq.get(n, 0.0)) for n in _fixed_names}
+        zeros = dict.fromkeys(cur, 0.0)
+
+        def _one_arm_zeroed(base: dict, arm: str) -> dict:
+            """``base`` with ``arm``'s joints set to 0 (the other arm held where base has it)."""
+            m = dict(base)
+            m.update(dict.fromkeys(ARM_JOINTS[arm], 0.0))
+            return m
+
+        def _try(name: str, waypoints: list[dict]) -> dict | None:
+            """Command ``waypoints`` (cur -> ... -> zeros) iff every leg is collision-free."""
+            legs = list(zip(waypoints, waypoints[1:]))
+            if any(self._arm_home_path_collides(qf, s, g) for s, g in legs):
+                return None
+            logger.info("[CruzrApi] home: arm home via %s", name)
+            for wp in waypoints[1:]:
+                self._move_arms_sync({a: {j: wp[j] for j in ARM_JOINTS[a]} for a in ("left", "right")})
+            return {"ok": True}
+
+        # 0) PRIMARY: abduct the arms OUT to the sides (cfg.home_clearance_arm_q), THEN descend
+        #    to 0 — so the forearms come down along the body's sides instead of dragging across
+        #    the torso, which the self-collision model does not always catch. Empty config
+        #    disables it and we fall straight through to the direct/one-arm/ready escalation.
+        clr = {j: float(v) for j, v in (getattr(cfg, "home_clearance_arm_q", None) or {}).items()
+               if j in zeros}
+        if clr:
+            cl = {**zeros, **clr}
+            for name, wps in (("clearance", [cur, cl, zeros]),
+                              ("clearance+right-first", [cur, cl, _one_arm_zeroed(cl, "right"), zeros]),
+                              ("clearance+left-first", [cur, cl, _one_arm_zeroed(cl, "left"), zeros])):
+                out = _try(name, wps)
+                if out is not None:
+                    return out
+
+        # 1) both direct  2) one arm at a time (both orders) — fallback if clearance is off or
+        #    its path self-collides (direct is now only a deep fallback, not the normal home).
+        for name, wps in (("direct", [cur, zeros]),
+                          ("right-arm-first", [cur, _one_arm_zeroed(cur, "right"), zeros]),
+                          ("left-arm-first", [cur, _one_arm_zeroed(cur, "left"), zeros])):
+            out = _try(name, wps)
+            if out is not None:
+                return out
+
+        # 3) raise both to the box-independent ready pose, then descend (together / one-at-a-time)
+        from jiuwensymbiosis.kinematics.urdf_chain import parse_chain
+        chains = {"left": parse_chain(cfg.urdf_path, "base_link", cfg.left_arm_leaf),
+                  "right": parse_chain(cfg.urdf_path, "base_link", cfg.right_arm_leaf)}
+        ready = self._ready_arm_q(chains, qf)
+        if all(a in ready for a in ("left", "right")):
+            rf = {j: float(ready[a][j]) for a in ("left", "right") for j in ARM_JOINTS[a]}
+            for name, wps in (("ready", [cur, rf, zeros]),
+                              ("ready+right-first", [cur, rf, _one_arm_zeroed(rf, "right"), zeros]),
+                              ("ready+left-first", [cur, rf, _one_arm_zeroed(rf, "left"), zeros])):
+                out = _try(name, wps)
+                if out is not None:
+                    return out
+
+        logger.error("[CruzrApi] home: NO self-collision-free home path "
+                     "(clearance / direct / one-arm-at-a-time / ready all blocked); refusing — needs manual recovery")
+        return {"ok": False, "reason": "home_path_self_collision"}
+
+    # No ``home_arms`` tool: it was one line of ``self._safe_home_arms()``, and ``home``
+    # — the action every body owes — already runs it as part of the safe posture.
+
+    @implements(LIFT_TO_CLEARANCE)
+    def lift_to_clearance(self, box: Optional[dict] = None, upright_tol_rad: float = 0.05) -> dict:
+        """Stand the torso up and raise the held box to the transit height.
+
+        Shared sequence (``motion/lift.py``); this body supplies ``lift_plan`` — where the
+        paddle TCPs end up once the box is up.
+        """
+        return lift.lift_to_clearance(self, box, upright_tol_rad)
+
+    # Not an action of its own — ``home`` IS the safe retreat (see api/actions.py:HOME).
+    # Kept as a named method because the grasp/place paths and the bring-up script call
+    # it directly, and because ``tol_rad`` is a body knob no contract should carry.
+
+    def _home_safely(self, tol_rad: float = 0.05) -> dict:
+        """Retreat to a safe home, doing the minimum motion for the current state.
+
+        - already upright AND arms home AND waist neutral → do nothing (``skipped``);
+        - upright but arms not home / waist rotated → neutralize the waist then home the arms;
+        - leaned forward (or unknown) → straighten the lifter, neutralize the waist, then home.
+        """
+        from jiuwensymbiosis.adapters.cruzr.geometry import ARM_JOINTS, LIFTER_JOINTS
+
+        cfg = self.env.cfg
+        q = self._ll().get_joint_positions() or {}
+        upright = all(abs(q.get(j, 0.0)) <= tol_rad for j in LIFTER_JOINTS)
+        arms_home = all(
+            abs(q.get(j, 0.0)) <= tol_rad
+            for a in ("left", "right") for j in ARM_JOINTS[a]
+        )
+        waist_home = abs(q.get(cfg.waist_yaw_joint, 0.0)) <= tol_rad
+        # With no joint state we cannot tell where we are; fall through to the
+        # full safe sequence (treat as possibly leaned).
+        have_state = bool(q)
+
+        at_home_posture = arms_home and waist_home
+        if have_state and upright and at_home_posture:
+            return {"ok": True, "skipped": "already_home"}
+        if have_state and upright:
+            self._neutralize_waist(tol_rad)   # body straight: no table to clear
+            return self._safe_home_arms()
+
+        # Leaned forward (or unknown): straighten the lifter, neutralize the waist, then home.
+        self._ll().set_lifter(dict.fromkeys(LIFTER_JOINTS, 0.0))
+        self._neutralize_waist(tol_rad)
+        return self._safe_home_arms()
+
+    def _neutralize_waist(self, tol_rad: float = 0.05) -> None:
+        """Turn waist_yaw back to 0 if rotated, holding the arms where they now are."""
+        from jiuwensymbiosis.adapters.cruzr.geometry import ARM_JOINTS
+
+        cfg = self.env.cfg
+        qq = self._ll().get_joint_positions() or {}
+        if abs(qq.get(cfg.waist_yaw_joint, 0.0)) <= tol_rad:
+            return
+        hold = {}
+        for arm_joints in (ARM_JOINTS["left"], ARM_JOINTS["right"]):
+            for j in arm_joints:
+                if j in qq:
+                    hold[j] = float(qq.get(j, 0.0))
+        self._ll().turn_waist_blocking(0.0, hold=hold, waist_joint=cfg.waist_yaw_joint)
+
+    def recovery_home(self, tol_rad: float = 0.05) -> dict:
+        """Payload-aware retreat; ``RecoveryRail`` prefers this over ``home``.
+
+        ``home`` homes the arms, which un-clamps the paddles — with a box held
+        that is a drop, not a recovery. While a payload is held, retreat only the parts
+        that cannot drop it: straighten the lifter and neutralize the waist, leaving the
+        arms clamped for a human (or a retried ``dual_arm_place``) to resolve.
+        """
+        if not getattr(self.env, "holding_payload", False):
+            return self._home_safely(tol_rad)
+
+        from jiuwensymbiosis.adapters.cruzr.geometry import LIFTER_JOINTS
+
+        logger.warning("[CruzrApi] recovery_home: payload held → keeping arms clamped")
+        self._ll().set_lifter(dict.fromkeys(LIFTER_JOINTS, 0.0))
+        self._neutralize_waist(tol_rad)
+        return {"ok": True, "payload_preserved": True}
+
+    @implements(DUAL_ARM_PLACE)
+    def dual_arm_place(self, target: dict | None = None, inset_mm: float = 6.5,
+                       descend_dz_m: float = 0.02, surface_z_mm: float | None = None,
+                       surface: dict | None = None) -> dict:
+        """Set the held box down on a sensed surface and withdraw.
+
+        The sequence is shared (``motion/dual_arm.py``); this body supplies the paddle seams:
+        ``place_plan`` (keep the held gap, add the squeeze), ``lower_and_release`` (Cartesian
+        descent, slide off the rim, open outward), ``carried_contacts`` and ``lifter_for_place``.
+        """
+        return dual_arm.dual_arm_place(
+            self, target, surface, inset_mm=inset_mm, descend_dz_m=descend_dz_m,
+            surface_z_mm=surface_z_mm)
+
 
     def _rotate_targets_for_waist_delta(self, chain, q_fixed: dict, target_dicts: tuple) -> tuple:
         """Rotate paddle-target dicts by the torso transform from the recorded grasp
@@ -1354,7 +1163,7 @@ class _NullPose:
 # navigate_relative / set_head / locate_for_grasp) — no direct ROS, fully mockable.
 # Head is mounted high: when the base nears a low box the target drops out of the
 # head FOV → (A) pitch-track it down; (B) probe the (near-range) waist camera before
-# declaring it lost. run_approach is the search-grasp demo entry (not a @robot_tool).
+# declaring it lost. run_approach is the search-grasp demo entry, not an action.
 # ---------------------------------------------------------------------------
 
 def _reset_head(api: Any, cfg: Any) -> None:

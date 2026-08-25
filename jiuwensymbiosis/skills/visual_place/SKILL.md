@@ -13,7 +13,7 @@ invalidates_locations: true
 同时满足：
 
 1. 用户指令含"把（手上的 / 刚抓的）X 放到 Y / 放下 / 放进去"等放置意图。
-2. `api.capabilities` 含**至少一种抓取能力**（`grasp.parallel` / `grasp.suction` / `grasp.dual_arm`）；放置点靠视觉定位时还需 `vision.detection`。
+2. `api.capabilities` 含**至少一种抓取能力**（`grasp.*` 轴：`grasp.parallel` / `grasp.suction` / `grasp.paddle`）；放置点靠视觉定位时还需 `vision.detection`。
 3. 已注册 `robot_control`。
 4. **前置：末端已抓住目标物**（刚跑完 `visual_pick`，或上层已显式抓住）。不满足则**不要**启用——会让末端在空中释放。
 
@@ -29,7 +29,12 @@ invalidates_locations: true
 |---|---|---|
 | `grasp.parallel` | `get_grasp_info_simple` | `open_gripper` |
 | `grasp.suction` | `get_grasp_info_simple` | `deactivate_suction` |
-| `grasp.dual_arm` | `locate_for_place` | `dual_arm_place` |
+| `motion.dual_arm` | `locate_for_place` | `dual_arm_place` |
+
+> **两个轴**：`motion.*` 说这个本体**能动什么**（决定调哪个动作），`grasp.*` 说它**能握住什么**
+> （决定能拿什么样的物体）。协同双臂用哪种末端——夹板 `grasp.paddle`、每臂一只夹爪
+> `grasp.parallel`——**不改变调用的动作名**：协同是同一件事，接触方式由本体自己实现。
+
 
 会移动的本体（`motion.base`）另有一个占位符：
 
@@ -76,7 +81,7 @@ invalidates_locations: true
 | 4 | `goto_xyzr` | `{"x":px,"y":py,"z":"place_z + 60"}` | 提回搬运高度，避免拖到刚放下的物体。 |
 | 5 | `home` | `{}` | 回 home，任务结束。 |
 
-### 支 B — 双臂（`grasp.dual_arm`）
+### 支 B — 协同双臂（`motion.dual_arm`）
 
 放置就是**一个 `<放置>`**（复合动作，内部完成对位 → 下放 → 松手）；放置面高度由 `<感知放置面>` 感知并被 `<放置>` 直接消费，几何字段不必回传，参数省略即可。**找放置面用 `<搜索并驱近放置面>` / `<感知放置面>`，绝不用 `locate_for_grasp`**——后者量的是抓取点（近面、面法向），不含落点高度和 footprint，而且是单次检测、看不到就失败。
 

@@ -27,7 +27,7 @@ def _recording(api: Any, bound: Callable[..., Any]) -> Callable[..., Any]:
 
     ``RobotControlTool`` records at its own dispatch point; this covers the
     separate-tool strategy, so world state is tracked identically whichever
-    strategy an agent was built with. The wrapper preserves ``__robot_tool__``
+    strategy an agent was built with. The wrapper preserves ``__tool_meta__``
     (via ``functools.wraps``) because the tool builder and rails read it back off
     the callable.
     """
@@ -56,7 +56,9 @@ def _effective_capabilities(api: Any, env: Any) -> frozenset[str]:
     api_caps = getattr(api, "capabilities", None) or frozenset()
     if env is None:
         return frozenset(api_caps)
-    env_caps = getattr(env, "capabilities", None) or frozenset()
+    # ``effective_capabilities`` when the env offers it: it adds what the body SHIPS
+    # (a URDF → planning.reachability) on top of what it declares.
+    env_caps = getattr(env, "effective_capabilities", None) or getattr(env, "capabilities", None) or frozenset()
     return frozenset(api_caps) & frozenset(env_caps)
 
 
@@ -102,7 +104,7 @@ def build_robot_tools(
                 continue
             if not callable(attr_value):
                 continue
-            meta = getattr(attr_value, "__robot_tool__", None)
+            meta = getattr(attr_value, "__tool_meta__", None)
             if meta is None:
                 continue
             seen.add(attr_name)
@@ -139,7 +141,7 @@ def list_tool_meta(api: Any, *, env: Any = None) -> list[dict]:
         for attr_name, attr_value in cls.__dict__.items():
             if attr_name in seen or not callable(attr_value):
                 continue
-            meta = getattr(attr_value, "__robot_tool__", None)
+            meta = getattr(attr_value, "__tool_meta__", None)
             if meta is None:
                 continue
             seen.add(attr_name)

@@ -142,3 +142,21 @@ class TestPoseHelpers:
         defaults.goto_xyzr(SimpleNamespace(env=env), 150.0, 0.0, 100.0)
         assert env.moved_to.rz == 42.0
         assert (env.moved_to.rx, env.moved_to.ry) == (180.0, 0.0)
+
+    def test_preserve_keeps_the_live_tilt_so_the_move_is_a_pure_translation(self):
+        env = _FakeMotionEnv()
+        env._pose.rx, env._pose.ry, env._pose.rz = 90.0, 45.0, 42.0
+        defaults.goto_xyzr(SimpleNamespace(env=env), 150.0, 0.0, 100.0, orientation_policy="preserve")
+        assert (env.moved_to.rx, env.moved_to.ry) == (90.0, 45.0)
+
+    def test_explicit_yaw_overrides_the_live_one_under_preserve(self):
+        env = _FakeMotionEnv()
+        env._pose.rx, env._pose.ry, env._pose.rz = 90.0, 45.0, 42.0
+        defaults.goto_xyzr(SimpleNamespace(env=env), 150.0, 0.0, 100.0, 7.0, orientation_policy="preserve")
+        assert (env.moved_to.rx, env.moved_to.ry, env.moved_to.rz) == (90.0, 45.0, 7.0)
+
+    def test_a_policy_the_generic_form_cannot_honour_is_refused_not_ignored(self):
+        env = _FakeMotionEnv()
+        with pytest.raises(ValueError, match="orientation_policy"):
+            defaults.goto_xyzr(SimpleNamespace(env=env), 150.0, 0.0, 100.0, orientation_policy="grasp")
+        assert env.moved_to is None

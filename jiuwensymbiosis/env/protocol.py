@@ -101,7 +101,13 @@ class CartesianDriver(RobotDriver, Protocol):
 
 @runtime_checkable
 class JointDriver(Protocol):
-    """Optional joint-space surface. Implementations may pick a subset."""
+    """Optional INDEXED joint-space surface — the whole joint vector, in chain order.
+
+    The sibling ``NamedJointDriver`` is the same capability (``motion.joint``) in the other
+    encoding; see it for when a body needs that one instead. A single-chain arm implements
+    this slice, and units are the body's own convention (the one ``move_joint`` states), so a
+    consumer reads them off the body rather than assuming.
+    """
 
     def get_angles(self) -> Any:
         """Return current joint angles as the vendor's JointAngles dataclass."""
@@ -113,6 +119,42 @@ class JointDriver(Protocol):
         timeout_s: float = 30.0,
     ) -> None:
         """Move to joint configuration ``q``, blocking until reached or ``timeout_s`` elapses."""
+
+
+@runtime_checkable
+class NamedJointDriver(Protocol):
+    """Optional NAMED joint-space surface — the same ``motion.joint`` capability as
+    ``JointDriver``, in the encoding a multi-limb body needs.
+
+    Named subsumes indexed (``move_joints_blocking(dict(zip(names, q)))`` is
+    ``move_joint_blocking(q)``), so this is deliberately NOT a merge with ``JointDriver``: a
+    single contract holding both encodings would leave a bench arm — which has no named-joint
+    interface — failing its own composite, the same "forces NotImplementedError stubs" reason
+    this module splits by capability at all. A body implements the encoding its hardware
+    speaks; cruzr happens to speak both and implements both slices.
+
+    Two things the indexed form cannot express, which is why this slice exists:
+
+    * **A partial command.** A dict commands a subset and holds the rest; a list must state
+      every joint. "Raise the right shoulder, hold everything else" is only sayable as a dict.
+    * **A body with more than one kinematic chain.** A list needs an agreed index order. For
+      one arm that is the chain; for two arms plus a waist and a lifter, index 7 means nothing.
+    """
+
+    def get_joint_positions(self) -> dict[str, float]:
+        """Return the latest known joint positions keyed by joint name."""
+
+    def move_joints_blocking(
+        self,
+        targets: dict[str, float],
+        *,
+        timeout_s: float = 30.0,
+    ) -> Any:
+        """Move the NAMED joints in ``targets`` to their absolute positions, holding the rest.
+
+        Blocks until reached or ``timeout_s`` elapses. Joints absent from ``targets`` are held,
+        which is what makes this the form a multi-limb body can use.
+        """
 
 
 @runtime_checkable
@@ -192,11 +234,14 @@ class WaistDriver(Protocol):
 
 @runtime_checkable
 class DualArmDriver(Protocol):
-    """Two-arm end effector — ``grasp.dual_arm``.
+    """Two arms driven in coordination — ``motion.dual_arm``.
 
-    Only ``home`` is contractual: clamping geometry, IK and force confirmation
-    have no cross-vendor default, so ``dual_arm_grasp`` / ``dual_arm_place`` have no
-    entry in ``api/defaults.py`` — each body implements them against its own driver.
+    A TOPOLOGY slice, not an end-effector one: what the arms carry (paddles, grippers, a
+    hand) is the separate ``grasp.*`` axis, and only that part has no cross-vendor default.
+    The coordination around it does — two-arm IK, the ready/descend/contact sequence and
+    the force confirmation are the same whatever is on the end — so ``dual_arm_grasp`` /
+    ``dual_arm_place`` reach a shared implementation and take the contact plan from a body
+    hook. Only ``home`` is contractual here.
     """
 
     def home(self) -> None:

@@ -39,6 +39,12 @@ class PiperEnv(BaseRobotEnv):
         }
     )
     name = "piper"
+    # The Piper SDK speaks degrees (``PiperJointAngles``, ``move_joint_blocking(q)``), so
+    # ``joint_limits`` and the observed joints are degrees too.
+    _joint_units = "deg"
+    # ``PiperApi.goto_xyzr`` offers only ``top_down`` (its Literal says so), so the default
+    # and the whole enum are the same single value.
+    _default_orientation_policy = "top_down"
 
     def __init__(self, cfg: PiperConfig) -> None:
         """Store config; driver is None until connect()."""
@@ -52,8 +58,15 @@ class PiperEnv(BaseRobotEnv):
         return self._inner
 
     @low_level.setter
-    def low_level(self, _: CartesianDriver | None) -> None:
-        raise AttributeError("PiperEnv.low_level is read-only (binds to self._inner via connect/disconnect)")
+    def low_level(self, value: CartesianDriver | None) -> None:
+        """Bind a driver before connect() — the seam a smoke test or a simulator uses.
+
+        Once one is bound, only connect/disconnect may rebind it: that is the invariant the
+        binding protects, and it holds whether the driver came from connect() or from here.
+        """
+        if self._inner is not None:
+            raise AttributeError("PiperEnv.low_level is already bound — connect/disconnect owns rebinding")
+        self._inner = value
 
     @property
     def z_min_safe(self) -> float | None:
@@ -66,6 +79,24 @@ class PiperEnv(BaseRobotEnv):
     @z_min_safe.setter
     def z_min_safe(self, _: float | None) -> None:
         raise AttributeError("PiperEnv.z_min_safe is read-only (computed from driver/config)")
+
+    @property
+    def joint_names(self) -> list[str] | None:
+        """``j1..j6`` in chain order — read off ``PiperJointAngles`` so it cannot drift.
+
+        The shared ``move_joint`` action addresses joints by NAME; the Piper SDK takes a
+        vector, and this is the ordering the Env converts between them with. Derived rather
+        than hard-coded because the dataclass IS the vendor's order.
+        """
+        from dataclasses import fields
+
+        from jiuwensymbiosis.adapters.piper.lowlevel import PiperJointAngles
+
+        return [f.name for f in fields(PiperJointAngles)]
+
+    @joint_names.setter
+    def joint_names(self, _: list[str] | None) -> None:
+        raise AttributeError("PiperEnv.joint_names is read-only (the vendor joint dataclass)")
 
     @property
     def workspace_bounds(self) -> tuple[float, float, float, float] | None:
@@ -167,6 +198,10 @@ class PiperEnv(BaseRobotEnv):
             logger.warning("PiperEnv disconnect failed: %s", exc)
         self._inner = None
         self._connected = False
+
+    def home(self) -> None:
+        """Move the arm to its home pose (blocking) — the driver's snapshotted init pose."""
+        self._require_cartesian().home()
 
     # -------------------------------------------------------------- observation
     def get_observation(self) -> RobotObservation:

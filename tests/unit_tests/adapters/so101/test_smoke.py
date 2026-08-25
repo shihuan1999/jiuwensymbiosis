@@ -4,7 +4,7 @@
 """Process-level smoke test: drive every emitted SO-101 tool via the smoke harness.
 
 Mirrors the plan §A7 requirement: call ``smoke_test_api`` in-process with a fake
-env (driver spy already bound) so every ``@robot_tool`` runs once and its return
+env (driver spy already bound) so every action runs once and its return
 is JSON-serializable — surfacing spelling/contract bugs that static validation
 cannot. No LeRobot / hardware needed.
 """

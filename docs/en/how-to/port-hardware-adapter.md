@@ -180,7 +180,7 @@ Inherit ordinary motion, joint, grasp, and image operations. Override only publi
 vertical tool, TIP-to-FLANGE conversion can look like:
 
 ```python
-@robot_tool(desc="Move the tool tip to a base-frame target.", tags=["motion"])
+@implements(GOTO_XYZR)   # the contract — description, gate, params — comes from the spec
 def goto_xyzr(self, x: float, y: float, z: float, r: float | None = None) -> None:
     current = self.env.get_flange_pose()
     flange = MyPose(x, y, z + self.env.tool_offset_mm,

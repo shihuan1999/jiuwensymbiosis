@@ -18,8 +18,8 @@ import pytest
 
 from jiuwensymbiosis.agent.fast.sequence import SequenceError, parse_sequence
 from jiuwensymbiosis.agent.run import _blocked_access
+from jiuwensymbiosis.api.actions import ActionSpec, implements
 from jiuwensymbiosis.api.base import BaseRobotApi
-from jiuwensymbiosis.api.decorators import robot_tool
 from jiuwensymbiosis.env.base import BaseRobotEnv, RobotObservation
 from jiuwensymbiosis.tools.robot_control_tool import _build_action_index
 
@@ -32,6 +32,8 @@ class _Env(BaseRobotEnv):
 
     def disconnect(self) -> None: ...
 
+    def home(self) -> None: ...
+
     def get_observation(self) -> RobotObservation:
         return RobotObservation(pose={}, joints=[])
 
@@ -41,33 +43,33 @@ class _Api(BaseRobotApi):
 
     capability = {"vision.detection", "grasp.parallel", "motion.base"}
 
-    @robot_tool(desc="measure a thing", capability="vision.detection", produces_location=True,
-                planner_visible=True)
+    @implements(ActionSpec(name="locate", description="measure a thing", capability="vision.detection",
+                           produces_location=True))
     def locate(self, object_name: str, reference: str | None = None, relation: str = "on") -> dict:
         return {"ok": True, "position": [0.0, 0.0, 0.0]}
 
-    @robot_tool(desc="drive up to a thing", capability="motion.base", invalidates_locations=True,
-                planner_visible=True)
+    @implements(ActionSpec(name="approach", description="drive up to a thing", capability="motion.base",
+                           invalidates_locations=True))
     def approach(self, object_name: str, reference: str | None = None, relation: str = "on") -> dict:
         return {"ok": True}
 
-    @robot_tool(desc="take hold of it", capability="grasp.parallel", requires=["payload.clear"],
-                provides=["payload.held"], planner_visible=True)
+    @implements(ActionSpec(name="grasp", description="take hold of it", capability="grasp.parallel",
+                           requires=("payload.clear",), provides=("payload.held",)))
     def grasp(self) -> dict:
         return {"ok": True}
 
-    @robot_tool(desc="put it down", capability="grasp.parallel", requires=["payload.held"],
-                provides=["payload.clear"], planner_visible=True)
+    @implements(ActionSpec(name="place", description="put it down", capability="grasp.parallel",
+                           requires=("payload.held",), provides=("payload.clear",)))
     def place(self) -> dict:
         return {"ok": True}
 
-    @robot_tool(desc="pull it open", capability="motion.base", requires=["payload.clear"],
-                opens_access=True, planner_visible=True)
+    @implements(ActionSpec(name="pull", description="pull it open", capability="motion.base",
+                           requires=("payload.clear",), opens_access=True))
     def pull(self, object_name: str) -> dict:
         return {"ok": True}
 
-    @robot_tool(desc="push it shut", capability="motion.base", requires=["payload.clear"],
-                closes_access=True, planner_visible=True)
+    @implements(ActionSpec(name="push", description="push it shut", capability="motion.base",
+                           requires=("payload.clear",), closes_access=True))
     def push(self, object_name: str) -> dict:
         return {"ok": True}
 

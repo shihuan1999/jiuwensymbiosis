@@ -8,9 +8,11 @@ Hardware-dependent paths (actual motion, detection) are tested via mock injectio
 
 from __future__ import annotations
 
+import pytest
+
 
 class TestPiperApiStructure:
-    def test_api_has_robot_tool_methods(self):
+    def test_api_has_action_methods(self):
         from jiuwensymbiosis.adapters.piper.api import PiperApi
 
         expected_methods = [
@@ -28,7 +30,7 @@ class TestPiperApiStructure:
         for name in expected_methods:
             method = getattr(PiperApi, name, None)
             assert method is not None, f"PiperApi.{name} not found"
-            assert hasattr(method, "__robot_tool__"), f"PiperApi.{name} missing @robot_tool"
+            assert hasattr(method, "__tool_meta__"), f"PiperApi.{name} missing @implements"
 
     def test_api_capabilities(self):
         from jiuwensymbiosis.adapters.piper.api import PiperApi
@@ -99,25 +101,39 @@ class TestPiperApiDelegatesThroughEnv:
         assert "home" in driver.log
 
     def test_move_joint_reaches_driver_through_env(self):
+        """The action names joints; the Piper SDK takes a vector. The Env converts using
+        ``joint_names`` (j1..j6, read off PiperJointAngles)."""
         api, _env, driver = self._build()
-        api.move_joint([0, 1, 2, 3, 4, 5])
-        assert ("joint", [0, 1, 2, 3, 4, 5]) in driver.log
+        api.move_joint({"j1": 0.0, "j2": 1.0, "j3": 2.0, "j4": 3.0, "j5": 4.0, "j6": 5.0})
+        assert ("joint", [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]) in driver.log
 
-    def test_goto_flange_pose_reaches_driver_through_env(self):
-        """The FLANGE entry still drives the arm — it just does not enter the shared vocabulary,
-        because where the flange sits depends on this robot's tool length."""
-        from jiuwensymbiosis.adapters.piper.geometry import FlangePose
-
+    def test_a_partial_command_holds_the_joints_it_does_not_name(self):
+        """Naming one joint must not zero the others: the Env fills the rest from the
+        current reading before handing the indexed driver its vector."""
         api, _env, driver = self._build()
-        api.goto_flange_pose(FlangePose(1, 2, 3, 180, 0, 0))
-        assert any(c[0] == "move" for c in driver.log)
+        api.move_joint({"j2": 1.5})
+        sent = [entry for entry in driver.log if entry[0] == "joint"][-1][1]
+        assert sent[1] == 1.5
+        assert len(sent) == 6
 
-    def test_the_flange_entry_is_not_a_planner_action(self):
+    def test_an_unknown_joint_name_is_refused(self):
+        api, _env, _driver = self._build()
+        with pytest.raises(ValueError, match="unknown joint"):
+            api.move_joint({"elbow": 1.0})
+
+    def test_the_flange_frame_is_reached_through_the_env_not_the_api(self):
+        """Where the flange sits depends on this robot's tool length, so it is no action.
+        Bring-up and calibration speak to the Env verb directly; the api surface is TIP-only."""
         from jiuwensymbiosis.adapters.piper.api import PiperApi
+        from jiuwensymbiosis.adapters.piper.geometry import FlangePose
         from jiuwensymbiosis.api.actions import ACTIONS
 
+        api, env, driver = self._build()
+        env.move_to_flange(FlangePose(1, 2, 3, 180, 0, 0))
+        assert any(c[0] == "move" for c in driver.log)
         assert "goto_flange_pose" not in ACTIONS
-        assert PiperApi.goto_flange_pose.__robot_tool__.planner_visible is False
+        assert not hasattr(PiperApi, "goto_flange_pose")
+        assert not hasattr(PiperApi, "get_flange_pose")
 
     def test_goto_xyzr_reaches_driver_through_env(self):
         api, _env, driver = self._build()

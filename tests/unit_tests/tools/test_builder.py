@@ -74,6 +74,9 @@ class TestEnvIntersectionGating:
             def disconnect(self):
                 pass
 
+            def home(self):
+                pass
+
             def get_observation(self):
                 return RobotObservation()
 

@@ -23,7 +23,7 @@ Design:
 - Log lines are captured by :class:`~jiuwensymbiosis.utils.logging.TraceLogHandler`
   bound to this rail; no business code changes needed.
 
-No tool / env / ``@robot_tool`` is modified.
+No tool / env / action implementation is modified.
 """
 
 from __future__ import annotations

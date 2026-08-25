@@ -15,6 +15,7 @@ import pytest
 
 import jiuwensymbiosis.adapters.cruzr.geometry as lifter_mod
 from jiuwensymbiosis.adapters.cruzr.geometry import LIFTER_JOINTS
+from jiuwensymbiosis.motion import dual_arm as _da_mod
 from tests.unit_tests.adapters.cruzr.test_grasp_box_api import (
     _DET,
     _api,
@@ -45,6 +46,7 @@ class TestHoldingPayloadFlag:
 
         monkeypatch.setattr(_gp_mod, "solve_grasp", _fake_solve_grasp)
         monkeypatch.setattr(_gp_mod, "solve_arm_ik", _fake_solve_arm_ik)
+        monkeypatch.setattr(_da_mod, "solve_arm_ik", _fake_solve_arm_ik)
         monkeypatch.setattr(lifter_mod, "search_lifter_for_box", _no_move_lifter)
 
         api, env = _api(monkeypatch)
@@ -58,6 +60,7 @@ class TestHoldingPayloadFlag:
 
         monkeypatch.setattr(_gp_mod, "solve_grasp", _fake_solve_grasp)
         monkeypatch.setattr(_gp_mod, "solve_arm_ik", _fake_solve_arm_ik)
+        monkeypatch.setattr(_da_mod, "solve_arm_ik", _fake_solve_arm_ik)
         monkeypatch.setattr(lifter_mod, "search_lifter_for_box", _no_move_lifter)
 
         api, env = _api(monkeypatch)
@@ -70,6 +73,7 @@ class TestHoldingPayloadFlag:
         import jiuwensymbiosis.adapters.cruzr.geometry as _gp_mod
 
         monkeypatch.setattr(_gp_mod, "solve_arm_ik", _fake_solve_arm_ik_nonzero)
+        monkeypatch.setattr(_da_mod, "solve_arm_ik", _fake_solve_arm_ik_nonzero)
         monkeypatch.setattr(lifter_mod, "search_lifter_for_place", _no_move_place)
 
         api, env = _api(monkeypatch)

@@ -25,7 +25,7 @@ from jiuwensymbiosis.agent.fast.sequence import (
 )
 
 # A stand-in action vocabulary; in production this comes from the live api's
-# @robot_tool index, so any robot/skill's actions validate the same way.
+# action index, so any robot/skill's actions validate the same way.
 _ALLOWED = frozenset({"home", "goto_xyzr", "open_gripper", "close_gripper", "get_grasp_info_simple"})
 
 

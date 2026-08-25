@@ -125,7 +125,7 @@ class _RailRegistry:
             # The rail retreats via the robot's own (always-safe) ``home()``.
             any_capabilities=[
                 "motion.cartesian", "motion.joint", "motion.base",
-                "grasp.suction", "grasp.parallel", "grasp.dual_arm",
+                "grasp.suction", "grasp.parallel", "motion.dual_arm",
             ],
         ),
     ]

@@ -39,13 +39,21 @@ class BaseRobotApi:
         # Maintained by the dispatch layer from each action's declared contract —
         # adapters must not hand-roll their own caches for this.
         self.memory = ExecutionMemory()
-        # The last sensing, kept HERE rather than inside the Scene3D component because both
-        # the component and the approach loops (motion/approach.py) read it, and a body's
-        # own grasp/place steps consume it. One copy, one owner, no forwarding.
+        # The last sensing's PAYLOAD, kept HERE rather than inside the Scene3D component
+        # because both the component and the approach loops (motion/approach.py) read it,
+        # and a body's own grasp/place steps consume it. One copy, no forwarding.
+        #
+        # Whether that payload survives an action is NOT this cache's to decide: ``memory``
+        # owns freshness across actions, and ``invalidate_sensing_cache`` below is how it
+        # drives this cache. An action may still manage the cache WITHIN its own run (the
+        # approach loops drop the surface the moment they start creeping, then re-sense) —
+        # what must not exist is a second place deciding that a *completed* action stales
+        # it, because that is how the planner and the acting step come to disagree about
+        # whether a location exists at all.
         self._last_detection: dict | None = None
         self._last_surface: dict | None = None
 
-    # The Scene3D / Approach components a body HOLDS read and write this state, so it is a
+    # Scene3D and the motion/approach loops both read and write this state, so it is a
     # cross-object contract: these accessors say so instead of exposing the underscore.
     @property
     def last_detection(self) -> dict | None:
@@ -64,6 +72,17 @@ class BaseRobotApi:
     @last_surface.setter
     def last_surface(self, value: dict | None) -> None:
         self._last_surface = value
+
+    def invalidate_sensing_cache(self) -> None:
+        """Forget the cached sensing — the standpoint it was measured from is gone.
+
+        Called by the dispatch layer when an action's contract invalidates locations,
+        so this cache and ``memory.locations`` empty together. A body that caches more
+        base-frame geometry overrides this and clears that too; anything measured in a
+        frame that travels WITH the robot (a held payload) must NOT be cleared here.
+        """
+        self._last_detection = None
+        self._last_surface = None
 
     # ``home`` lives here rather than on a capability mixin because returning to a
     # safe posture is not an optional capability — every body owes one, and
@@ -93,9 +112,15 @@ class BaseRobotApi:
             elif isinstance(cap, (set, frozenset, list, tuple)):
                 caps.update(cap)
             for attr_value in cls.__dict__.values():
-                meta = getattr(attr_value, "__robot_tool__", None)
+                meta = getattr(attr_value, "__tool_meta__", None)
                 if meta is not None and meta.capability:
                     caps.add(meta.capability)
+        # ``planning.reachability`` is derived on both sides and declared on neither: the Api
+        # side is "does this body hold a judge", the Env side is "does it ship the model the
+        # judge reads" (BaseRobotEnv.effective_capabilities). Only the intersection is true,
+        # which is what stops a body claiming reach while shipping no URDF.
+        if callable(getattr(self, "check_reachable", None)):
+            caps.add("planning.reachability")
         return frozenset(caps)
 
     def describe(self) -> dict[str, Any]:

@@ -32,7 +32,8 @@ contract param — a body may add optional params of its own, never drop one.
 
 Adding an action:
   1. Add its ``ActionSpec`` here (name, capability, params, result shape, contract).
-  2. Implement it with ``@implements(THE_SPEC)`` on a mixin or an adapter.
+  2. Implement it with ``@implements(THE_SPEC)`` on the adapter's Api — forwarding to
+     ``api.defaults`` when the body has nothing of its own to say.
   3. Nothing else — tool emission, prompt rendering and sequence validation all
      read the resulting ``ToolMeta`` exactly as before.
 """
@@ -41,111 +42,65 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
 from typing import Any
 
-from jiuwensymbiosis.api.decorators import ToolMeta, schema_from_signature, schema_from_typeddict
-from jiuwensymbiosis.api.state import validate_tokens
-from jiuwensymbiosis.env.base import KNOWN_CAPABILITIES
-from jiuwensymbiosis.motion.approach import (
+from jiuwensymbiosis.api.decorators import (
+    ActionSpec,
+    ToolMeta,
+    UnknownCapability,
+    schema_from_signature,
+)
+from jiuwensymbiosis.contracts import (
+    SPATIAL_RELATIONS,
     ApproachFailure,
     ApproachResult,
-    SearchResult,
-)
-from jiuwensymbiosis.perception.frame import BasePoint
-from jiuwensymbiosis.perception.scene3d import (
-    SPATIAL_RELATIONS,
+    BasePoint,
+    GraspFailure,
+    GraspResult,
     ObjectGeometryResult,
     SceneScanResult,
+    SearchResult,
     SensingFailure,
     SurfaceGeometryResult,
 )
-from jiuwensymbiosis.perception.vision import GraspFailure, GraspResult
 
-
-class UnknownCapability(ValueError):
-    """A spec declared a capability outside ``KNOWN_CAPABILITIES``."""
-
-
-@dataclass(frozen=True)
-class ActionSpec:
-    """What one action is: its name, gate, parameters, result shape and contract.
-
-    Attributes:
-        name: the action name a plan writes as ``op``. Unique across the vocabulary.
-        description: what the action does, what it needs and what it establishes.
-            This is the ONLY text a planner sees, so it must stay true on every body:
-            an implementation has no channel for adding prose of its own.
-        capability: the capability gate. ``None`` = every body has it (``home``).
-        params: parameter names a planner may pass.
-        required_params: the subset that must be passed. Everything else is optional.
-        param_schema: per-parameter JSON Schema refining what the signature can express
-            — e.g. the field names inside a ``pose`` dict, which every 6-DoF body agrees
-            on and a bare ``dict`` annotation would lose. Merged over the derived schema.
-        result: a ``TypedDict`` (or a union of them) describing the result fields, so
-            a later step can read ``<bind>.field`` and the validator can reject a
-            field that does not exist. ``None`` = shape unknown → field checking is
-            skipped rather than everything being rejected.
-        requires / provides / invalidates: robot self-state, over the closed
-            vocabulary in ``api/state.py``.
-        produces_location / consumes_location / invalidates_locations: location
-            freshness (see ``api/state.py``).
-        opens_access / closes_access: this action clears (or restores) whatever blocks
-            the thing it acts on — a door, a lid, a stacked crate, a lock. Only the
-            barrier side declares anything; which steps reach *through* a barrier is
-            derived from the sequence (see ``api/state.py``).
-        tags: rail triggers (``VisualFeedbackRail`` / ``RecoveryRail`` watch these).
-            NOT a visibility mechanism — that is ``planner_visible``.
-        planner_visible: whether the action enters the planner's vocabulary. ``False``
-            for bring-up / calibration / diagnostic actions, which stay callable
-            through ``robot_control`` and from scripts but must not compete for the
-            planner's attention.
-    """
-
-    name: str
-    description: str
-    capability: str | None = None
-    params: tuple[str, ...] = ()
-    required_params: tuple[str, ...] = ()
-    param_schema: Mapping[str, Any] | None = None
-    result: Any = None
-    requires: tuple[str, ...] = ()
-    provides: tuple[str, ...] = ()
-    invalidates: tuple[str, ...] = ()
-    produces_location: bool = False
-    consumes_location: bool = False
-    invalidates_locations: bool = False
-    opens_access: bool = False
-    closes_access: bool = False
-    tags: tuple[str, ...] = ()
-    planner_visible: bool = True
-
-    def __post_init__(self) -> None:
-        """Validate the spec against the closed vocabularies it draws on."""
-        if self.capability is not None and self.capability not in KNOWN_CAPABILITIES:
-            raise UnknownCapability(
-                f"action {self.name!r} declares unknown capability {self.capability!r}. "
-                f"Add it to KNOWN_CAPABILITIES in jiuwensymbiosis/env/base.py first."
-            )
-        for field_name in ("requires", "provides", "invalidates"):
-            validate_tokens(getattr(self, field_name), field=field_name, owner=f"action {self.name}")
-        unknown = set(self.required_params) - set(self.params)
-        if unknown:
-            raise ValueError(f"action {self.name!r}: required_params {sorted(unknown)} are not in params")
-        if self.produces_location and not schema_from_typeddict(self.result).get("properties"):
-            raise ValueError(
-                f"action {self.name!r} produces a location but declares no readable result shape "
-                f"(result={self.result!r}). A plan could not read any field off it, and the sequence "
-                f"validator would silently stop checking the fields it invents. Declare a TypedDict."
-            )
+# ``ActionSpec`` / ``UnknownCapability`` are defined next to ``ToolMeta`` (api/decorators.py)
+# so the contract type and the carrier that holds one live together; this module is the
+# vocabulary built out of them. Re-exported because that is where every reader looks.
+__all__ = ["ACTIONS", "ActionSpec", "ContractViolation", "UnknownCapability", "implements", "planner_vocabulary"]
 
 
 def _register(*specs: ActionSpec) -> dict[str, ActionSpec]:
-    """Index specs by name, rejecting a duplicate rather than silently overwriting."""
+    """Index specs by name, enforcing what a *vocabulary* entry additionally owes.
+
+    Beyond being a valid spec (checked on construction), an entry here is read by a
+    planner on bodies its author never saw, so it must also:
+
+    * be unique by name — a duplicate would silently overwrite a contract;
+    * state its ``params``, so a body that adds a parameter of its own does not
+      advertise it and no plan comes to depend on something the next robot lacks;
+    * declare a readable result shape when it ``produces_location`` — otherwise a plan
+      could read no field off it and the sequence validator would silently stop
+      checking the fields it invents.
+
+    A one-off spec declared inline next to its single implementation owes none of these,
+    which is why they live here rather than in ``ActionSpec.__post_init__``.
+    """
     out: dict[str, ActionSpec] = {}
     for spec in specs:
         if spec.name in out:
             raise ValueError(f"duplicate action spec {spec.name!r}")
+        if spec.params is None:
+            raise ValueError(
+                f"action {spec.name!r} is in the shared vocabulary but does not state its params; "
+                f"declare params=(...) — or params=() when it takes none."
+            )
+        if spec.produces_location and not spec.result_schema().get("properties"):
+            raise ValueError(
+                f"action {spec.name!r} produces a location but declares no readable result shape "
+                f"(result={spec.result!r}). A plan could not read any field off it, and the sequence "
+                f"validator would silently stop checking the fields it invents. Declare a TypedDict."
+            )
         out[spec.name] = spec
     return out
 
@@ -156,12 +111,21 @@ def _register(*specs: ActionSpec) -> dict[str, ActionSpec]:
 GOTO_XYZR = ActionSpec(
     name="goto_xyzr",
     description=(
-        "Move the end-effector TIP to absolute (x, y, z[, r]) in mm/deg, base frame. If r is omitted, "
-        "the current r is preserved. This is the restricted form of goto_pose: the tool points "
-        "down and only the yaw r is yours to choose. Need a different orientation → goto_pose."
+        "Move the end-effector TIP to absolute (x, y, z[, r]) in mm/deg, base frame. r is the YAW "
+        "and ONLY the yaw; if omitted the current yaw is kept. The remaining tilt is chosen by "
+        "orientation_policy: 'preserve' keeps the tilt the arm is already in (it only translates), "
+        "'top_down' points the tool at the floor, 'grasp' uses the body's calibrated grasp tilt. "
+        "Omit it and the body's configured default applies — which is NOT top_down on every robot, "
+        "so ask for 'top_down' explicitly when the approach direction matters. Check this body's "
+        "orientation_policy enum for the values it actually accepts; it refuses the rest. Need full "
+        "control of the orientation → goto_pose. On an arm with fewer joints than the pose demands, "
+        "position is enforced and orientation is best-effort."
     ),
     capability="motion.cartesian",
-    params=("x", "y", "z", "r"),
+    # ``orientation_policy`` deliberately carries no ``param_schema`` here: its legal values are
+    # per-body and come from each implementation's ``Literal[...]`` annotation, so a planner reads
+    # what THIS robot accepts rather than a union no single body honours.
+    params=("x", "y", "z", "r", "orientation_policy"),
     required_params=("x", "y", "z"),
     invalidates=("body.home",),
     tags=("motion",),
@@ -256,19 +220,33 @@ HOME = ActionSpec(
 MOVE_JOINT = ActionSpec(
     name="move_joint",
     description=(
-        "Move to a joint configuration: q is the FULL joint vector, in the robot's own "
-        "convention (rad or deg). To drive a single named joint use move_named_joint."
+        "Move joints to absolute positions. targets maps JOINT NAME to position; joints you leave "
+        "out are HELD, so commanding one joint means passing one entry. Read the names from "
+        "get_joint_positions or the world state — never invent one, an unknown name is refused. "
+        "The unit is the body's joint_units ('deg' or 'rad'), also in the world state: do NOT "
+        "assume, because the same number is a nudge in one and a large swing in the other, and "
+        "when joint_units is absent the body has not stated it — prefer a Cartesian action over "
+        "guessing. Joint space is for posture (raising an arm, clearing a pose); to move the "
+        "end-effector somewhere use goto_xyzr / goto_pose."
     ),
     capability="motion.joint",
-    params=("q",),
-    required_params=("q",),
+    params=("targets",),
+    required_params=("targets",),
+    param_schema={
+        "targets": {
+            "type": "object",
+            "description": "joint name -> absolute position, in the body's joint_units",
+            "additionalProperties": {"type": "number"},
+        }
+    },
     invalidates=("body.home",),
     tags=("motion",),
 )
 
 MOVE_NAMED_JOINT = ActionSpec(
     name="move_named_joint",
-    description="Move ONE named joint to an absolute position in radians.",
+    description="Move ONE named joint to an absolute position in RADIANS — this action states its "
+    "own unit in the parameter name, so it does not depend on the body's joint_units.",
     capability="motion.joint",
     params=("joint_name", "position_rad"),
     required_params=("joint_name", "position_rad"),
@@ -279,7 +257,8 @@ MOVE_NAMED_JOINT = ActionSpec(
 
 GET_JOINT_POSITIONS = ActionSpec(
     name="get_joint_positions",
-    description="Read the latest known joint positions, keyed by joint name.",
+    description="Read the latest known joint positions, keyed by joint name, in the body's "
+    "joint_units.",
     capability="motion.joint",
     params=(),
     planner_visible=False,  # diagnostic; WorldState already carries joints into the prompt
@@ -592,17 +571,21 @@ SEARCH_TARGET = ActionSpec(
 )
 
 # =============================================================================
-# Dual-arm grasp — grasp.dual_arm
+# Coordinated two-arm grasp — motion.dual_arm (the TOPOLOGY axis: it decides which action to
+# call. What the arms hold is the separate grasp.* axis, and the body says so there.)
 # =============================================================================
 DUAL_ARM_GRASP = ActionSpec(
     name="dual_arm_grasp",
     description=(
-        "Clamp an ALREADY-DETECTED target between both arms and confirm the grip by force. "
+        "Have BOTH arms take hold of an ALREADY-DETECTED target together and confirm the grip "
+        "by force. HOW they contact it is the body's own — plates clamping a face each side, a "
+        "gripper per arm, a hand enveloping it — so this says nothing about what shape of object "
+        "will hold; read the body's grasp.* capability for that. "
         "Does NOT detect and does NOT lift: run a detection or approach step first (omit the "
         "argument to use the most recent one), then lift_to_clearance. No detection → "
         "{ok:False, reason:'no_detection'}; no contact force → does not lift."
     ),
-    capability="grasp.dual_arm",
+    capability="motion.dual_arm",
     params=("target",),
     requires=("payload.clear",),
     provides=("payload.held",),
@@ -618,7 +601,7 @@ DUAL_ARM_PLACE = ActionSpec(
         "move over a landing point that fits, lower, release, raise. Sense the surface first "
         "(omit the arguments to use the most recent sensing); returning to a safe posture is left to home."
     ),
-    capability="grasp.dual_arm",
+    capability="motion.dual_arm",
     params=("target", "surface"),
     requires=("payload.held",),
     provides=("payload.clear",),
@@ -699,7 +682,7 @@ def implements(spec: ActionSpec) -> Callable[[Callable[..., Any]], Callable[...,
     """
 
     def _wrap(func: Callable[..., Any]) -> Callable[..., Any]:
-        missing = _accepts(func, spec.params)
+        missing = _accepts(func, spec.params or ())
         if missing:
             raise ContractViolation(
                 f"{func.__qualname__} implements action {spec.name!r} but does not accept "
@@ -708,32 +691,23 @@ def implements(spec: ActionSpec) -> Callable[[Callable[..., Any]], Callable[...,
             )
         # Advertise exactly the contract: types/defaults come from the signature (where the
         # type checker sees them), but a param this body added on its own stays unadvertised
-        # so the planner cannot come to depend on something another body lacks.
+        # so the planner cannot come to depend on something another body lacks. A spec that
+        # states no params has no other body to protect (see ActionSpec.params) — it gets
+        # the whole signature.
         schema = schema_from_signature(func)
-        props = {k: v for k, v in (schema.get("properties") or {}).items() if k in spec.params}
+        all_props = schema.get("properties") or {}
+        props = all_props if spec.params is None else {k: v for k, v in all_props.items() if k in spec.params}
         for name, refinement in (spec.param_schema or {}).items():
-            if name in props:
-                props[name] = {**props[name], **refinement}
+            # Merged over the derived schema, and able to introduce a param the signature
+            # cannot express (a ``**kwargs`` body) — ``_accepts`` above has already proved
+            # this implementation can be called with it.
+            props[name] = {**props.get(name, {}), **refinement}
         input_params: dict[str, Any] = {"type": "object", "properties": props}
         if spec.required_params:
             input_params["required"] = list(spec.required_params)
-        func.__robot_tool__ = ToolMeta(  # type: ignore[attr-defined]
-            name=spec.name,
-            description=spec.description,
-            input_params=input_params,
-            capability=spec.capability,
-            tags=list(spec.tags),
-            returns=schema_from_typeddict(spec.result),
-            requires=spec.requires,
-            provides=spec.provides,
-            invalidates=spec.invalidates,
-            produces_location=spec.produces_location,
-            consumes_location=spec.consumes_location,
-            invalidates_locations=spec.invalidates_locations,
-            opens_access=spec.opens_access,
-            closes_access=spec.closes_access,
-            planner_visible=spec.planner_visible,
-        )
+        # The spec goes on as-is: every contract field is read back off it, so there is
+        # nothing here that could disagree with the vocabulary.
+        func.__tool_meta__ = ToolMeta(spec=spec, input_params=input_params)  # type: ignore[attr-defined]
         return func
 
     return _wrap

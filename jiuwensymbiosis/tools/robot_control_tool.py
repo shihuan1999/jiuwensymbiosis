@@ -31,7 +31,8 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from jiuwensymbiosis.agent.abstractions import Tool, ToolCard, ToolOutput
-from jiuwensymbiosis.api.memory import ExecutionMemory
+from jiuwensymbiosis.api.decorators import ToolMeta
+from jiuwensymbiosis.api.memory import ExecutionMemory, action_succeeded
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +47,34 @@ def record_action(api: Any, method: Callable[..., Any], params: dict[str, Any], 
     memory = getattr(api, "memory", None)
     if not isinstance(memory, ExecutionMemory):
         return
+    meta = getattr(method, "__tool_meta__", None)
     try:
-        memory.observe(getattr(method, "__robot_tool__", None), params, result)
+        memory.observe(meta, params, result)
+        _stale_sensing_cache(api, meta, result)
     except Exception as exc:  # noqa: BLE001 - state bookkeeping must not break dispatch
         logger.warning("[memory] failed to record %s: %s", getattr(method, "__name__", method), exc)
+
+
+def _stale_sensing_cache(api: Any, meta: ToolMeta | None, result: Any) -> None:
+    """Drop the api's sensing cache whenever the memory's locations went stale.
+
+    ``ExecutionMemory`` owns whether a reading is still *valid*; the api cache only
+    holds the payload a later grasp/place consumes. The two must go at once, or the
+    planner sees "no location" while the acting step still reads base-frame
+    coordinates measured from a standpoint the body has left.
+
+    An action that also ``produces_location`` refreshed the cache itself while it
+    ran (the approach loops write it mid-flight), so clearing it afterwards would
+    throw away the fresh reading — this mirrors the net effect ``observe`` gets by
+    invalidating before it records.
+    """
+    if meta is None or not meta.invalidates_locations or meta.produces_location:
+        return
+    if not action_succeeded(result):
+        return
+    clear = getattr(api, "invalidate_sensing_cache", None)
+    if callable(clear):
+        clear()
 
 
 def _build_action_index(api: Any, env: Any = None, *, planner_only: bool = False) -> dict[str, Callable[..., Any]]:
@@ -81,7 +106,7 @@ def _build_action_index(api: Any, env: Any = None, *, planner_only: bool = False
                 continue
             if not callable(attr_value):
                 continue
-            meta = getattr(attr_value, "__robot_tool__", None)
+            meta = getattr(attr_value, "__tool_meta__", None)
             if meta is None:
                 continue
             seen.add(attr_name)

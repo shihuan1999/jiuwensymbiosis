@@ -94,18 +94,20 @@ Hardware Layer    XxxDriver — adapter author's main work (serial/CAN/socket)
 
 ### Key Architectural Patterns
 
-**Shared Action Vocabulary**: an action's contract — name, capability gate, params, result shape, pre-conditions and effects — is declared **once** in `api/actions.py` as an `ActionSpec`; a body supplies only an *implementation* via `@implements(SPEC)`. So the same action name means the same thing on every robot, and a plan or SKILL.md written for one body is meaningful on the next. A tool only one body has (bring-up, calibration, vendor demo) keeps the plain `@robot_tool` decorator and is **invisible to the planner** by default. `jiuwensymbiosis-actions --vocabulary` prints the whole vocabulary; `--config <yaml>` prints the subset one body's capabilities admit.
+**Shared Action Vocabulary**: an action's contract — name, capability gate, params, result shape, pre-conditions and effects — is declared **once** in `api/actions.py` as an `ActionSpec`; a body supplies only an *implementation* via `@implements(SPEC)`. So the same action name means the same thing on every robot, and a plan or SKILL.md written for one body is meaningful on the next. There is no second way in: bring-up, calibration and debug views are not actions — they are plain methods driven from `scripts/`. `jiuwensymbiosis-actions --vocabulary` prints the whole vocabulary; `--config <yaml>` prints the subset one body's capabilities admit.
 
-**Capability Gating**: Tools are emitted only for `api.capabilities ∩ env.capabilities`. Env declares what hardware can do (manual `frozenset`); Api derives capabilities from the actions it implements, plus any mixin `capability` attr (automatic). `build_robot_tools(api, env=env)` enforces the intersection — an action whose capability isn't in env simply doesn't become an LLM tool. The capability comes from the action's own `ActionSpec`, never from whichever class declares the method.
+**Capability Gating**: Tools are emitted only for `api.capabilities ∩ env.capabilities`. Env declares what hardware can do (manual `frozenset`); Api derives capabilities from the actions it implements, plus any `capability` class attr for a marker capability no action advertises (automatic). `build_robot_tools(api, env=env)` enforces the intersection — an action whose capability isn't in env simply doesn't become an LLM tool. The capability comes from the action's own `ActionSpec`, never from whichever class declares the method.
 
 **Defaults & Components** (the mixin layer is gone): an action whose implementation is one line of delegation to an Env verb is a plain function in `api/defaults.py` that the adapter calls explicitly — `@implements(GOTO_XYZR)` then `return defaults.goto_xyzr(self, ...)` — so no base class is involved and the MRO stays flat. What is still a class lives in `api/components.py`, because it carries state plus body hooks: `Scene3D` (last detection) and `Approach` (last sensed surface) hold the shared 3D/approach geometry, and a body supplies only the hooks (how to grab a calibrated frame, which detector to run, how to drive the base, whether a wide-angle sensor exists); `Reachability` is not an action provider at all but answers a planning question the planner reads directly. An adapter should *hold* these (`self._scene = Scene3D(self)`, as cruzr does) rather than inherit them. The vendor-specific vision work — `get_grasp_info_simple` / `pixel_to_base_xyz` / `analyze_scene` — has no default and is implemented per adapter on top of `perception/vision.py` (`detect_and_centroid`, `apply_xy_correction`, `build_grasp_result`).
 
-**@robot_tool Decorator**: Annotates unbound methods with `ToolMeta` (name, desc, input_params JSON Schema auto-generated from type hints, capability, tags). `build_robot_tools` walks the MRO, finds decorated methods, binds them, and wraps them as openjiuwen `LocalFunction` tools. Override methods inherit the decorator metadata; re-decorate to customize descriptions.
+**One contract, one carrier, one decorator**: `ActionSpec` (declared in `api/decorators.py`, next to the carrier) is what an action IS; `ToolMeta` is what `@implements(SPEC)` pins to a method — that spec plus `input_params`, the call schema derived from *this body's* signature. `ToolMeta` **holds** its spec instead of copying it, so the contract fields exist in one place and a planner cannot read a different answer from the vocabulary. `build_robot_tools` walks the MRO, finds the decorated methods, binds them, and wraps them as openjiuwen `LocalFunction` tools.
 
-**Planning Contract** (what makes a body plannable, not just callable): beyond the call schema, every `@robot_tool` carries `returns` (result-field JSON Schema, auto-derived from a `TypedDict` return annotation), `requires` / `provides` / `invalidates` (robot self-state, over the closed vocabulary in `api/state.py:KNOWN_STATE_TOKENS`), and `produces_location` / `consumes_location` / `invalidates_locations` (per-referent location freshness — an action that moves the base stales every prior sensed position). `SkillSpec` + SKILL.md frontmatter carry the same fields, because **a skill is a compound action** and both planning tiers share one reasoning machine. The contract never encodes an order; it states pre-conditions and effects so a planner can *derive* one, and `parse_sequence` accepts any permutation whose pre-conditions hold. `WorldState.snapshot(session)` reports the same vocabulary at runtime (observation overrides belief; an absent token means *unknown*, never *false*). Full manual: `docs/autonomous-planning.md`.
+There is no second decorator for "a tool only this body has". Both agent paths build their tool list with `planner_only=True`, so such a tool was never reachable by anything but a hand-written script — which is what bring-up, calibration and debug views should be (a plain method plus something under `scripts/`). If a body genuinely needs one, decide first **how it becomes reachable**.
+
+**Planning Contract** (what makes a body plannable, not just callable): beyond the call schema, every action carries `returns` (result-field JSON Schema, auto-derived from a `TypedDict` return annotation), `requires` / `provides` / `invalidates` (robot self-state, over the closed vocabulary in `api/state.py:KNOWN_STATE_TOKENS`), and `produces_location` / `consumes_location` / `invalidates_locations` (per-referent location freshness — an action that moves the base stales every prior sensed position). `SkillSpec` + SKILL.md frontmatter carry the same fields, because **a skill is a compound action** and both planning tiers share one reasoning machine. The contract never encodes an order; it states pre-conditions and effects so a planner can *derive* one, and `parse_sequence` accepts any permutation whose pre-conditions hold. `WorldState.snapshot(session)` reports the same vocabulary at runtime (observation overrides belief; an absent token means *unknown*, never *false*). Full manual: `docs/autonomous-planning.md`.
 
 **Two Tool Strategies** (can coexist):
-- `build_robot_tools(api)` — each `@robot_tool` method becomes a separate LLM tool (good for few tools)
+- `build_robot_tools(api)` — each `@implements` method becomes a separate LLM tool (good for few tools)
 - `RobotControlTool(api)` — single `robot_control` entry point with `action`/`params` dispatch (good for SKILL.md workflows); appended by `build_robot_agent` only when `RobotAgentConfig.enable_skill=True`
 - `InProcessCodeTool` — in-process Python execution (available in "code" and "hybrid" modes)
 
@@ -165,7 +167,8 @@ New robot types follow this pattern under `jiuwensymbiosis/adapters/<name>/`:
 5. `session.py` — `make_builder(cfg_cls, env_cls, api_cls, ...)` one-liner; `api_kwargs_from_cfg` accepts a declarative list (`["cfg_attr"` or `"cfg_attr:api_kwarg"`, dotted paths OK) so same/near-named cfg→Api field mapping needs no hand-written extractor, and `make_detector_sidecar()` provides the standard detection-server sidecar
 6. `config_template.yaml` — YAML template with Chinese annotations
 
-Template at `templates/xxx_adapter/`. Validate statically with `scripts/validate_adapter.py`; smoke-test runtime behavior (every `@robot_tool` callable + JSON-serializable) with `scripts/smoke_test_adapter.py`.
+Template at `templates/xxx_adapter/`. Validate statically with `scripts/validate_adapter.py`; smoke-test runtime behavior (every action callable + JSON-serializable, driven by a stub driver) with
+`scripts/smoke_test_adapter.py --module <adapter>`.
 
 ### Visual Perception Pipeline
 
@@ -182,7 +185,7 @@ jiuwensymbiosis/          # Main package
   agent/                  # RobotSession, build_robot_agent, RobotAgentConfig, ModelSpec, MockModel (--mock)
     fast/                 # Two-tier planner (plan_task), sequence validator, runner, skill registry
   api/                    # BaseRobotApi, actions.py (shared ActionSpec vocabulary),
-                          #   @implements / @robot_tool decorators, capability mixins
+                          #   decorators.py (ActionSpec + ToolMeta), @implements,
                           #   state.py (state vocabulary), memory.py (ExecutionMemory), world_state.py
   env/                    # BaseRobotEnv, MockArmEnv, KNOWN_CAPABILITIES, protocol.py (driver Protocols)
   tools/                  # build_robot_tools, RobotControlTool, InProcessCodeTool
@@ -196,6 +199,9 @@ jiuwensymbiosis/          # Main package
     cruzr/                # Cruzr mobile dual-arm (base + lifter + waist + paddle grasp)
     _common/              # Shared adapter utilities (builder, detector, vision, calibration)
   serving/                # Visual perception server subprocess (GroundingDINO + SAM2)
+  contracts.py            # Action result shapes + the spatial-relation set. Owned by no layer
+                          #   (api/ promises them, perception/ + motion/ build them) and imports
+                          #   nothing, so neither side depends on the other. Keep it dependency-free.
   introspect.py           # Machine-readable actions / skills / state views (the CLI's backend)
   utils/                  # proxy hygiene (proxy.py), centralised logging (logging.py)
 configs/{piper,so101,cruzr}/  # Per-body YAML; the top-level `adapter:` key picks the session builder
@@ -205,7 +211,7 @@ tests/
   mocks/                  # MockApi, MockEnv, MockDriver, MockScene
   integration/            # Hardware/GPU-dependent tests
 scripts/validate_adapter.py  # Static compatibility checker for new adapters
-scripts/smoke_test_adapter.py # Runtime smoke test: drive each @robot_tool with MockEnv
+scripts/smoke_test_adapter.py # Runtime smoke test: drive each action with a stub driver
 examples/                 # Runnable demo (run_task — generic runner)
 docs/                     # Diátaxis docs: zh/en tutorial, how-to, reference, explanation
 design/                   # Internal design and migration records

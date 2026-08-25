@@ -30,11 +30,13 @@ class CruzrEnv(BaseRobotEnv):
             "motion.waist",
             "motion.goal",
             "vision.search",
-            "grasp.dual_arm",
-            "planning.reachability",
+            "motion.dual_arm",   # topology: two arms in coordination
+            "grasp.paddle",      # end effector: two plates that clamp a face each side
         }
     )
     name = "cruzr"
+    # ROS 2 joint commands and the URDF limits are radians throughout.
+    _joint_units = "rad"
 
     # Waist first: it is the one that carries depth, so a hit there answers "where exactly"
     # and the base can square up straight away. The head only ever answers "which way".
@@ -61,6 +63,37 @@ class CruzrEnv(BaseRobotEnv):
         self.urdf_path = getattr(cfg, "urdf_path", None) or None
         self.arm_chains = {"left": ("base_link", cfg.left_arm_leaf),
                            "right": ("base_link", cfg.right_arm_leaf)}
+        # Which joints each arm actuates. The chains above run from base_link through the
+        # lifter and waist, which the arm solve must hold fixed — so this cannot be read off
+        # the chain and the body has to say it.
+        from jiuwensymbiosis.adapters.cruzr.geometry import ARM_JOINTS
+        self.arm_joints = {a: list(j) for a, j in ARM_JOINTS.items()}
+        self.waist_joint = cfg.waist_yaw_joint
+        self._joint_limits: dict[str, tuple[float, float]] | None = None
+
+    @property
+    def joint_limits(self) -> dict[str, tuple[float, float]] | None:
+        """Per-joint range read off the URDF, for SafetyRail's ``move_named_joint`` check.
+
+        Read once and cached. ``move_named_joint`` is how a plan says "raise the arm", and
+        without a stated range a hallucinated angle would reach the hardware unchecked. No
+        URDF → None, i.e. no range check (the framework's "never invent a limit" rule).
+        """
+        if self._joint_limits is None and self.urdf_path:
+            from jiuwensymbiosis.kinematics.urdf_chain import parse_chain
+
+            limits: dict[str, tuple[float, float]] = {}
+            for root, leaf in self.arm_chains.values():
+                try:
+                    limits.update(parse_chain(self.urdf_path, root, leaf).limits())
+                except Exception as exc:  # no URDF/limits → no range check
+                    logger.warning("CruzrEnv.joint_limits: %s→%s unavailable: %s", root, leaf, exc)
+            self._joint_limits = limits or None
+        return self._joint_limits
+
+    @joint_limits.setter
+    def joint_limits(self, value: dict[str, tuple[float, float]] | None) -> None:
+        self._joint_limits = value
 
     @property
     def low_level(self) -> Any:
@@ -68,6 +101,17 @@ class CruzrEnv(BaseRobotEnv):
         if self._inner is None:
             raise RuntimeError("CruzrEnv is not connected.")
         return self._inner
+
+    @low_level.setter
+    def low_level(self, value: Any) -> None:
+        """Bind a driver before connect() — the seam a smoke test or a simulator uses.
+
+        Once one is bound, only connect/disconnect may rebind it: that is the invariant the
+        binding protects, and it holds whether the driver came from connect() or from here.
+        """
+        if self._inner is not None:
+            raise AttributeError("CruzrEnv.low_level is already bound — connect/disconnect owns rebinding")
+        self._inner = value
 
     def connect(self) -> None:
         """Connect to ROS 2 and create command publisher."""
@@ -185,6 +229,20 @@ class CruzrEnv(BaseRobotEnv):
                 "command_topic": self.cfg.command_topic,
                 "state_topic": self.cfg.state_topic,
             },
+        )
+
+    def home(self) -> None:
+        """This body has no env-level home verb — ``CruzrApi.home`` is the HOME action.
+
+        Safe homing here is composite (straighten the lifter, square the waist, then
+        bring both arms down along a self-collision-checked path) and lives in the Api.
+        The driver's ``home(arm=...)`` is a bring-up primitive — ONE shoulder-pitch joint
+        of one arm — so wiring it up here would answer the safe-posture contract with a
+        motion that can sweep the arms across a leaned-forward torso.
+        """
+        raise NotImplementedError(
+            f"{self.name}: safe homing is composite and implemented as the HOME action in "
+            "CruzrApi.home(); there is no env-level home verb."
         )
 
     def reset(self) -> None:

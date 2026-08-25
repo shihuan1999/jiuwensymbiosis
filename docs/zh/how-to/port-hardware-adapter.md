@@ -163,7 +163,7 @@ class MyEnv(BaseRobotEnv):
 运动、关节、抓取和取图通常直接继承 Mixin。只覆写公共语义与机型不一致的部分。例如垂直工具的 TIP→FLANGE 转换：
 
 ```python
-@robot_tool(desc="将工具末端移动到基座坐标系目标。", tags=["motion"])
+@implements(GOTO_XYZR)   # 描述、能力门、参数都来自词表里的那条 spec
 def goto_xyzr(self, x: float, y: float, z: float, r: float | None = None) -> None:
     current = self.env.get_flange_pose()
     flange = MyPose(x, y, z + self.env.tool_offset_mm,

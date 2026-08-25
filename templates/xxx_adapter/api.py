@@ -16,9 +16,9 @@ Two kinds of method below:
   list of what the body offers.
 * **body-specific** — your geometry / SDK / calibration. Write it out.
 
-A tool only this robot has (bring-up, calibration, a vendor demo) uses the plain
-``@robot_tool`` decorator instead: it stays callable but is invisible to the planner,
-because a plan written against a one-robot tool would not survive being moved.
+Bring-up, calibration and debug views are NOT actions: leave them undecorated and drive
+them from a script under ``scripts/``. A plan written against a one-robot tool would not
+survive being moved, and the agent's tool list is the shared vocabulary only.
 
 Key patterns:
   - Motion / end-effector go through the Env verbs (``self.env.home()`` /
@@ -32,6 +32,8 @@ Key patterns:
 """
 
 from __future__ import annotations
+
+from typing import Literal
 
 from jiuwensymbiosis.api import defaults
 from jiuwensymbiosis.api.actions import (
@@ -89,19 +91,22 @@ class XxxApi(BaseRobotApi):
         }
 
     @implements(GOTO_XYZR)
-    def goto_xyzr(self, x: float, y: float, z: float, r: float | None = None) -> None:
-        """Move the tip to an absolute pose.
+    def goto_xyzr(self, x: float, y: float, z: float, r: float | None = None,
+                  orientation_policy: Literal["top_down"] = "top_down") -> None:
+        """Move the tip to an absolute pose; ``orientation_policy`` picks the tilt.
 
-        The generic default (``defaults.goto_xyzr``) commands the flange straight down
-        with no offset. Keep this override only if your body needs the tip↔flange
-        conversion or a tilted tool; otherwise forward to the default.
+        The generic default (``defaults.goto_xyzr``) does ``top_down`` and ``preserve``, so
+        widen the Literal to match whichever your body really honours — it is what tells a
+        planner this body's options, and a value you accept but ignore is a silent lie.
+        Keep this override only if your body needs the tip↔flange conversion or a tilted
+        tool; otherwise forward to the default.
         """
         raise NotImplementedError("TODO: convert the TIP target to a flange command and dispatch it")
 
     # ================================================================ Joint  [选填]
     # @implements(MOVE_JOINT)
-    # def move_joint(self, q: list[float]) -> None:
-    #     return defaults.move_joint(self, q)
+    # def move_joint(self, targets: dict[str, float]) -> Any:
+    #     return defaults.move_joint(self, targets)
 
     # ================================================================ End effector  [选填]
     # Two-state bodies forward to the defaults; width_mm / force_n are accepted for

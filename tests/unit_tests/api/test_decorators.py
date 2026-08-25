@@ -10,11 +10,12 @@ from typing import Literal
 
 import pytest
 
+from jiuwensymbiosis.api.actions import implements
 from jiuwensymbiosis.api.decorators import (
+    ActionSpec,
     ToolMeta,
     _annotation_to_schema,
     _schema_from_signature,
-    robot_tool,
 )
 
 
@@ -100,53 +101,56 @@ class TestSchemaFromSignature:
         assert "kwargs" not in schema["properties"]
 
 
-class TestRobotToolDecorator:
-    def test_attaches_meta(self):
-        @robot_tool(desc="test tool", tags=["motion"])
+class TestToolMetaCarriesTheSpec:
+    """``ToolMeta`` holds its ``ActionSpec`` instead of copying it.
+
+    That is the whole reason the contract fields are declared in one place: a reader
+    of ``meta.requires`` and a reader of ``SPEC.requires`` cannot be looking at two
+    different answers.
+    """
+
+    def test_the_contract_is_the_spec_not_a_copy(self):
+        spec = ActionSpec(name="my_tool", description="test tool", tags=("motion",),
+                          requires=("payload.clear",), capability="vision.detection")
+
+        @implements(spec)
         def my_tool(self, x: float) -> None:
             pass
 
-        assert hasattr(my_tool, "__robot_tool__")
-        meta = my_tool.__robot_tool__
+        meta = my_tool.__tool_meta__
         assert isinstance(meta, ToolMeta)
-        assert meta.name == "my_tool"
-        assert meta.description == "test tool"
-        assert meta.tags == ["motion"]
+        assert meta.spec is spec
+        assert (meta.name, meta.description, meta.capability) == ("my_tool", "test tool", "vision.detection")
+        assert meta.requires == ("payload.clear",)
+        assert meta.tags == ["motion"]  # a list, because that is what the rails read
 
-    def test_custom_name(self):
-        @robot_tool(name="custom_name", desc="custom desc")
-        def my_tool(self) -> None:
-            pass
-
-        assert my_tool.__robot_tool__.name == "custom_name"
-
-    def test_capability_gating(self):
-        @robot_tool(capability="vision.detection")
-        def detect(self) -> dict:
-            pass
-
-        assert detect.__robot_tool__.capability == "vision.detection"
-
-    def test_docstring_as_description(self):
-        @robot_tool()
-        def my_tool(self) -> None:
-            """First line of docstring."""
-
-        assert my_tool.__robot_tool__.description == "First line of docstring."
-
-    def test_input_params_auto_generated(self):
-        @robot_tool()
+    def test_input_params_come_from_this_body_signature(self):
+        @implements(ActionSpec(name="my_tool", description="d"))
         def my_tool(self, x: float, y: float = 0.0) -> None:
             pass
 
-        assert "x" in my_tool.__robot_tool__.input_params["properties"]
-        assert my_tool.__robot_tool__.input_params["type"] == "object"
+        params = my_tool.__tool_meta__.input_params
+        assert params["type"] == "object"
+        assert {"x", "y"} <= set(params["properties"])
 
-    def test_explicit_input_params(self):
-        schema = {"type": "object", "properties": {"a": {"type": "integer"}}}
+    def test_a_declared_param_list_is_what_gets_advertised(self):
+        """A body may take more than the contract promises; only the contract is advertised,
+        so no plan comes to depend on something the next robot lacks."""
 
-        @robot_tool(input_params=schema)
-        def my_tool(self) -> None:
+        @implements(ActionSpec(name="my_tool", description="d", params=("x",)))
+        def my_tool(self, x: float, body_only_knob: float = 0.0) -> None:
             pass
 
-        assert my_tool.__robot_tool__.input_params == schema
+        assert set(my_tool.__tool_meta__.input_params["properties"]) == {"x"}
+
+    def test_param_schema_refines_what_the_signature_cannot_say(self):
+        spec = ActionSpec(
+            name="my_tool", description="d", params=("pose",),
+            param_schema={"pose": {"type": "object", "properties": {"x": {"type": "number"}}}},
+        )
+
+        @implements(spec)
+        def my_tool(self, pose: dict) -> None:
+            pass
+
+        assert my_tool.__tool_meta__.input_params["properties"]["pose"]["properties"] == {"x": {"type": "number"}}

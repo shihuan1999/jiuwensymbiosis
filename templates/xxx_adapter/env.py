@@ -99,6 +99,18 @@ class XxxEnv(BaseRobotEnv):
 
         return RobotObservation(pose=pose, rgb=rgb, depth=depth)
 
+    # ------------------------------------------------------------- safe posture
+
+    def home(self) -> None:
+        """Return the body to its safe home posture (blocking) — REQUIRED.
+
+        ``home`` is the one unconditional action (``capability=None`` in the vocabulary),
+        so every Env must say how THIS body gets back to a known-safe pose. A Cartesian
+        arm delegates to the driver, as below; a body whose safe posture is composite
+        (straighten a torso, square a waist, then fold the arms) writes that sequence here.
+        """
+        self._require_cartesian().home()
+
     # ----------------------------------------------------------- optional overrides
 
     def reset(self) -> None:

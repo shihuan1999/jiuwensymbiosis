@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 
@@ -49,11 +49,10 @@ from jiuwensymbiosis.api.actions import (
     implements,
 )
 from jiuwensymbiosis.api.base import BaseRobotApi
-from jiuwensymbiosis.api.components import Reachability
+from jiuwensymbiosis.api.reachability import Reachability
+from jiuwensymbiosis.contracts import GraspFailure, GraspResult
 from jiuwensymbiosis.perception.detector_client import init_detector
 from jiuwensymbiosis.perception.vision import (
-    GraspFailure,
-    GraspResult,
     apply_xy_correction,
     detect_and_centroid,
     dump_grasp_debug,
@@ -85,8 +84,11 @@ class So101Api(BaseRobotApi):
     #                         is already an ABSOLUTE base-frame point; tracking uses that
     #                         directly instead of the eye-in-hand relative correction.
     #   vision.depth        — the D405 returns aligned depth.
-    #   planning.reachability — it ships a URDF, so it holds the generic reach judge below.
-    capability = {"motion.servo", "vision.eye_to_hand", "vision.depth", "planning.reachability"}
+    # planning.reachability is NOT declared here: it is derived from whether the body can
+    # actually answer (a judge on the Api ∩ a URDF + arm_chains on the Env). This body holds
+    # the generic judge but its Env exposes no URDF, so the judge degrades to "unknown" —
+    # declaring it by hand used to make that claim anyway.
+    capability = {"motion.servo", "vision.eye_to_hand", "vision.depth"}
 
     # ---- generic actions: the Env delegation is the whole implementation ----
     # Planning-time proprioception: read by the planner (agent/run.py), never by the LLM.
@@ -109,8 +111,8 @@ class So101Api(BaseRobotApi):
         return defaults.move_direction(self, direction, distance_mm)
 
     @implements(MOVE_JOINT)
-    def move_joint(self, q: list[float]) -> None:
-        return defaults.move_joint(self, q)
+    def move_joint(self, targets: dict[str, float]) -> Any:
+        return defaults.move_joint(self, targets)
 
     @implements(GET_IMAGE)
     def get_image(self):
@@ -179,7 +181,7 @@ class So101Api(BaseRobotApi):
     def is_grasp_confirmed(self, result: Mapping[str, Any] | None = None) -> bool:
         """Whether the last close stopped on object contact.
 
-        This is a private fast-runner hook, deliberately not a ``robot_tool``.
+        This is a private fast-runner hook, deliberately not an action.
         Reaching the configured fully-closed position means the gripper closed
         on empty space; only the driver's conservative contact state confirms a
         payload.
@@ -203,14 +205,16 @@ class So101Api(BaseRobotApi):
         y: float,
         z: float,
         r: float | None = None,
-        orientation_policy: str | None = None,
+        orientation_policy: Literal["preserve", "top_down", "grasp"] | None = None,
     ) -> None:
         """Move the control frame to ``(x, y, z[, r])`` mm/deg, base frame.
 
         SO-101 is a 5-DoF underactuated arm: position is the strong constraint,
         orientation is best-effort (the IK solver weights position higher via
         ``ik_orientation_weight``). General motion defaults to preserving the
-        live orientation instead of silently imposing a top-down pose.
+        live orientation instead of silently imposing a top-down pose — the
+        ``Literal`` above is what puts that choice, and this body's default, in
+        front of the planner instead of leaving it a config-file surprise.
         """
         rx, ry, rz = self._resolve_orientation(orientation_policy, rz_override=r)
         self.goto_pose(So101Pose(x=float(x), y=float(y), z=float(z), rx=rx, ry=ry, rz=rz))
@@ -387,7 +391,7 @@ class So101Api(BaseRobotApi):
     def get_grasp_tracking_sample(self, object_name: str) -> dict[str, Any]:
         """Private SO101 fast-path sample including mask/depth-quality metadata.
 
-        This method intentionally has no ``@robot_tool`` decorator: it is an
+        This method intentionally carries no ``ActionSpec``: it is an
         adapter-to-runner hook, not an LLM/API action.  The public
         :meth:`get_grasp_info_simple` response remains JSON-compatible and
         unchanged.

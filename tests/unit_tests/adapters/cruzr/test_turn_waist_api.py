@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import jiuwensymbiosis.kinematics.urdf_chain as urdf_chain_mod
 from jiuwensymbiosis.adapters.cruzr.api import CruzrApi
 from jiuwensymbiosis.adapters.cruzr.geometry import ARM_JOINTS
+from tests.unit_tests.adapters.cruzr import description
 
 _ARMS = [j for a in ("left", "right") for j in ARM_JOINTS[a]]
 
@@ -99,10 +100,9 @@ def test_waist_yaw_on_real_arm_chain():
 
     import pytest
 
-    from jiuwensymbiosis.adapters.cruzr.config import CruzrConfig
     from jiuwensymbiosis.kinematics.urdf_chain import parse_chain
 
-    cfg = CruzrConfig()
+    cfg = description.config()
     if not Path(cfg.urdf_path).exists():
         pytest.skip("urdf not present")
     limits = parse_chain(cfg.urdf_path, "base_link", cfg.left_arm_leaf).limits()

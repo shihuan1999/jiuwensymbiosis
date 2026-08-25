@@ -92,15 +92,41 @@ def get_home_pose(api: Any) -> dict:
     return pose_to_dict(api.env.home_pose)
 
 
-def goto_xyzr(api: Any, x: float, y: float, z: float, r: float | None = None) -> None:
-    """Top-down move to an absolute Cartesian pose (tip == flange, rx=180, ry=0).
+def goto_xyzr(
+    api: Any,
+    x: float,
+    y: float,
+    z: float,
+    r: float | None = None,
+    *,
+    orientation_policy: str = "top_down",
+) -> None:
+    """Move to an absolute Cartesian pose (tip == flange), tilt chosen by ``orientation_policy``.
 
-    A body with a tool offset or a tilted tool writes its own instead of calling this.
+    ``top_down`` commands rx=180 / ry=0; ``preserve`` keeps the tilt the arm is already in, so
+    the move is a pure translation. ``top_down`` is the default here only because it is what
+    this function has always done — the contract does not promise it, and a body states its own
+    default by what it passes.
+
+    A body with a tool offset or a tilted tool writes its own instead of calling this: the
+    flange conversion then depends on the resolved tilt, which this tip==flange form has not got.
     """
+    # Read the live pose only when something actually needs it — an explicit r with top_down
+    # needs no hardware round-trip, which is the common path.
+    cur = api.env.get_flange_pose() if (r is None or orientation_policy == "preserve") else None
     if r is None:
-        cur = api.env.get_flange_pose()
         r = getattr(cur, "rz", getattr(cur, "r", 0.0))
-    api.env.move_to_flange(SimpleNamespace(x=float(x), y=float(y), z=float(z), rx=180.0, ry=0.0, rz=float(r)))
+    if orientation_policy == "top_down":
+        rx, ry = 180.0, 0.0
+    elif orientation_policy == "preserve":
+        rx = float(getattr(cur, "rx", 180.0))
+        ry = float(getattr(cur, "ry", 0.0))
+    else:
+        raise ValueError(
+            f"goto_xyzr: orientation_policy must be 'top_down' or 'preserve', got "
+            f"{orientation_policy!r}. A calibrated 'grasp' tilt is a per-body policy."
+        )
+    api.env.move_to_flange(SimpleNamespace(x=float(x), y=float(y), z=float(z), rx=rx, ry=ry, rz=float(r)))
 
 
 def move_direction(api: Any, direction: str, distance_mm: float) -> dict:
@@ -137,9 +163,9 @@ def move_direction(api: Any, direction: str, distance_mm: float) -> dict:
 # =============================================================================
 # Joint motion
 # =============================================================================
-def move_joint(api: Any, q: list[float]) -> None:
-    """Move to a joint configuration (delegates to the Env verb)."""
-    api.env.move_joint(q)
+def move_joint(api: Any, targets: dict[str, float]) -> Any:
+    """Move the named joints to absolute positions (delegates to the Env verb)."""
+    return api.env.move_joint(targets)
 
 
 # =============================================================================
@@ -211,3 +237,63 @@ def set_lift_pose(api: Any, q_lifter: dict) -> dict:
 def turn_waist(api: Any, delta_rad: float) -> dict:
     """Rotate waist (delegates to the Env verb)."""
     return api.env.turn_waist(float(delta_rad))
+
+
+# =============================================================================
+# Approach — motion.goal / vision.search
+# =============================================================================
+# One hop, like every other action here: the implementation and its algorithm both live in
+# ``motion/approach.py``. They used to reach it through an ``Approach`` component the adapter
+# held, which made these three the only actions in the vocabulary whose implementation path
+# differed from the other twenty-seven.
+def search_target(api: Any, object_name: str = "box", reference: str | None = None,
+                  relation: str = "on") -> dict:
+    """Look through every camera at the current heading; report the first bearing found."""
+    from jiuwensymbiosis.motion import approach
+
+    return approach.search_target(api, object_name, reference, relation)
+
+
+def approach_for_grasp(api: Any, object_name: str = "box", reference: str | None = None,
+                       relation: str = "on") -> dict:
+    """Find the target, face it, drive square to its face at the work distance."""
+    from jiuwensymbiosis.motion import approach
+
+    return approach.approach_target_for_grasp(api, object_name, reference, relation)
+
+
+def approach_for_place(api: Any, object_name: str = "table", reference: str | None = None,
+                       relation: str = "on") -> dict:
+    """Find the surface, face it, drive to its near edge at placing distance."""
+    from jiuwensymbiosis.motion import approach
+
+    return approach.approach_target_for_place(api, object_name, reference, relation)
+
+
+# =============================================================================
+# 3-D scene sensing — vision.detection
+# =============================================================================
+# Same one hop as everything else: the pipeline and its orchestration both live in
+# ``perception/scene3d.py``. These three used to reach it through a ``Scene3D`` component
+# the adapter held.
+def locate_for_grasp(api: Any, object_name: str = "box", reference: str | None = None,
+                     relation: str = "on") -> dict:
+    """Measure a target and return what PICKING IT UP needs, in the base frame."""
+    from jiuwensymbiosis.perception import scene3d
+
+    return scene3d.locate_for_grasp(api, object_name, reference, relation)
+
+
+def locate_for_place(api: Any, object_name: str = "table", reference: str | None = None,
+                     relation: str = "on") -> dict:
+    """Measure a support surface and return what PUTTING SOMETHING ON IT needs."""
+    from jiuwensymbiosis.perception import scene3d
+
+    return scene3d.locate_for_place(api, object_name, reference, relation)
+
+
+def analyze_scene(api: Any, object_name: str = "box") -> dict:
+    """Every instance of ``object_name`` in the current frame, with base-frame geometry."""
+    from jiuwensymbiosis.perception import scene3d
+
+    return scene3d.analyze_scene(api, object_name)

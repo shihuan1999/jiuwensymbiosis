@@ -9,10 +9,14 @@ import pytest
 import jiuwensymbiosis.adapters.cruzr.geometry as gp
 from jiuwensymbiosis.adapters.cruzr.api import CruzrApi
 from jiuwensymbiosis.adapters.cruzr.geometry import (
-    ARM_JOINTS, TOOL_APPROACH_LOCAL, TOOL_PADDLE_LOCAL,
+    ARM_JOINTS,
+    LIFTER_JOINTS,
+    TOOL_APPROACH_LOCAL,
+    TOOL_PADDLE_LOCAL,
 )
 from jiuwensymbiosis.kinematics.ik import IKResult
-from jiuwensymbiosis.adapters.cruzr.geometry import LIFTER_JOINTS
+from jiuwensymbiosis.motion import dual_arm as _da_mod
+from tests.unit_tests.adapters.cruzr import description
 
 _ARMS = [j for a in ("left", "right") for j in ARM_JOINTS[a]]
 _DET = {"center_mm": [350.0, 0.0, 700.0], "width_mm": 270.0, "height_mm": 200.0,
@@ -21,16 +25,16 @@ _DET = {"center_mm": [350.0, 0.0, 700.0], "width_mm": 270.0, "height_mm": 200.0,
 
 class _FakeChain:
     def limits(self):
-        return {j: (-3.14, 3.14) for j in _ARMS}
+        return dict.fromkeys(_ARMS, (-3.14, 3.14))
 
 
 class _LL:
     def __init__(self, lifter=None):
         self.moves = []
-        self._lifter = lifter or {j: 0.0 for j in LIFTER_JOINTS}
+        self._lifter = lifter or dict.fromkeys(LIFTER_JOINTS, 0.0)
 
     def get_joint_positions(self):
-        q = {j: 0.0 for j in _ARMS}
+        q = dict.fromkeys(_ARMS, 0.0)
         q.update({j: float(self._lifter.get(j, 0.0)) for j in LIFTER_JOINTS})
         q["waist_yaw_joint"] = 0.0
         return q
@@ -41,12 +45,43 @@ class _LL:
 
 
 class _Env:
+    # What the shared sequence reads off the Env (see test_grasp_box_api._Env).
+    capabilities = frozenset({"motion.dual_arm", "grasp.paddle", "motion.lift", "motion.waist"})
+    arm_chains = {"left": ("base_link", "L_sixforce_link"),
+                  "right": ("base_link", "R_sixforce_link")}
+    waist_joint = "waist_yaw_joint"
+
+    @property
+    def urdf_path(self):
+        return self.cfg.urdf_path
+
+    @property
+    def arm_joints(self):
+        from jiuwensymbiosis.adapters.cruzr.geometry import ARM_JOINTS
+
+        return {a: list(j) for a, j in ARM_JOINTS.items()}
+
+    @property
+    def torso_joints(self):
+        from jiuwensymbiosis.adapters.cruzr.geometry import LIFTER_JOINTS
+
+        return [*LIFTER_JOINTS, "waist_yaw_joint"]
+
+    @property
+    def lift_limits(self):
+        from jiuwensymbiosis.adapters.cruzr.geometry import LIFTER_LIMITS
+
+        return dict(LIFTER_LIMITS)
+
+    def move_named_joints(self, targets, **kwargs):
+        """Mirror BaseRobotEnv: the Api reaches named joints through the Env seam."""
+        return self.low_level.move_joints_blocking(targets, **kwargs)
     def __init__(self, lifter=None):
         self.low_level = _LL(lifter)
         self.cfg = SimpleNamespace(
             transit_lift_z_m=0.95, urdf_path="/nonexistent.urdf",
             left_arm_leaf="L_sixforce_link", right_arm_leaf="R_sixforce_link",
-            urdf_package_dir="/home/riemann/Robot/Cruzr_ws/cruzr_s2_description")
+            urdf_package_dir=description.PACKAGE_DIR)
 
 
 def _api(monkeypatch, *, converged=True, lifter=None):
@@ -66,12 +101,19 @@ def _api(monkeypatch, *, converged=True, lifter=None):
     monkeypatch.setattr("jiuwensymbiosis.kinematics.fk.fk_chain", _fake_fk)
     captured = []
 
-    def _fake_ik(chain, q_fixed, arm, tgt, **k):
+    def _fake_ik(chain, q_fixed, arm_or_joints, tgt, **k):
+        # Patched over BOTH solve_arm_ik seams: cruzr's wrapper takes the arm name, the
+        # shared one takes that arm's joint names.
+        joints = ARM_JOINTS[arm_or_joints] if isinstance(arm_or_joints, str) else arm_or_joints
+        arm = arm_or_joints if isinstance(arm_or_joints, str) else (
+            "left" if any(str(j).startswith("L_") for j in joints) else "right")
         captured.append((arm, tgt))
-        return IKResult(q={j: 0.1 for j in ARM_JOINTS[arm]}, converged=converged,
+        return IKResult(q=dict.fromkeys(joints, 0.1), converged=converged,
                         pos_err_m=0.001 if converged else 0.5, normal_err=0.001, iters=3)
 
     monkeypatch.setattr(gp, "solve_arm_ik", _fake_ik)
+    # The shared sequence resolves it in its OWN module — patch there too.
+    monkeypatch.setattr(_da_mod, "solve_arm_ik", _fake_ik)
     env = _Env(lifter)
     api = CruzrApi(env)
     api._last_grasped_box = dict(_DET)
@@ -121,7 +163,7 @@ def test_lift_merges_standup_and_raise_when_leaned(monkeypatch):
 
 def test_lift_skips_standup_within_tol(monkeypatch):
     # Lifter within upright_tol_rad of 0 -> treated as upright, no stand-up move (raise only).
-    near0 = {j: 0.03 for j in LIFTER_JOINTS}
+    near0 = dict.fromkeys(LIFTER_JOINTS, 0.03)
     api, env, _ = _api(monkeypatch, converged=True, lifter=near0)
     out = api.lift_to_clearance()               # default upright_tol_rad=0.05
     assert out["ok"] is True and out["stood_up"] is False

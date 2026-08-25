@@ -8,14 +8,14 @@ import pytest
 
 pytest.importorskip("pinocchio")
 
-from jiuwensymbiosis.adapters.cruzr.config import CruzrConfig
 from jiuwensymbiosis.kinematics import self_collision as sc
+from tests.unit_tests.adapters.cruzr import description
 
-_MESH = "/home/riemann/Robot/Cruzr_ws/cruzr_s2_description/cruzr_s2_description/meshes"
+_MESH = description.MESHES
 
 
 def _cfg_or_skip():
-    cfg = CruzrConfig()
+    cfg = description.config()
     if not Path(cfg.urdf_path).exists() or not Path(_MESH).exists():
         pytest.skip("urdf/meshes not present")
     return cfg

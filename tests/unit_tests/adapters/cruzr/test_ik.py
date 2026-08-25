@@ -11,8 +11,9 @@ from jiuwensymbiosis.kinematics.ik import (
     tool_normal_base,
 )
 from jiuwensymbiosis.kinematics.urdf_chain import parse_chain
+from tests.unit_tests.adapters.cruzr import description
 
-URDF = "/home/riemann/Robot/Cruzr_ws/cruzr_s2_description/cruzr_s2_description/urdf/cruzr_s2_v1/cruzr_s2_v1.urdf"
+URDF = description.URDF
 ARM = [
     "L_shoulder_pitch_joint", "L_shoulder_roll_joint", "L_shoulder_yaw_joint",
     "L_elbow_roll_joint", "L_elbow_yaw_joint", "L_wrist_pitch_joint", "L_wrist_roll_joint",

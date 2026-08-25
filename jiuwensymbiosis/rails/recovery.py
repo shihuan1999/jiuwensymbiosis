@@ -233,7 +233,7 @@ class RecoveryRail(AgentRail):
         if api is None:
             return False
         method = getattr(api, effective_name, None)
-        meta = getattr(method, "__robot_tool__", None)
+        meta = getattr(method, "__tool_meta__", None)
         if meta is None:
             return False
         return bool(set(meta.tags) & self.watch_tags)
@@ -242,7 +242,7 @@ class RecoveryRail(AgentRail):
         """Return the effective API method's robot-tool tags."""
         api = getattr(self.session, "api", None)
         method = getattr(api, effective_name, None) if api is not None else None
-        meta = getattr(method, "__robot_tool__", None)
+        meta = getattr(method, "__tool_meta__", None)
         return set(getattr(meta, "tags", ()))
 
     @staticmethod

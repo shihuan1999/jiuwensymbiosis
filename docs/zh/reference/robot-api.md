@@ -24,9 +24,11 @@ RobotObservation(
 connect() -> None
 disconnect() -> None
 get_observation() -> RobotObservation
+home() -> None
 ```
 
-可选生命周期方法为 `reset()` 和 `emergency_stop()`。常用属性包括 `capabilities`、`low_level`、`z_min_safe`、`workspace_bounds`、`joint_limits`、`home_pose` 和 `tool_offset_mm`。
+`home` 之所以是抽象方法：它背后是唯一的无条件动作，若给出笛卡尔默认实现，就会把 `motion.cartesian`
+悄悄塞进能力门拦不住的本体里。可选生命周期方法为 `reset()` 和 `emergency_stop()`。常用属性包括 `capabilities`、`low_level`、`z_min_safe`、`workspace_bounds`、`joint_limits`、`home_pose` 和 `tool_offset_mm`。
 
 `has(capability)` 检查能力声明。子类创建时，未知能力会立即触发 `ValueError`。
 
@@ -62,21 +64,19 @@ get_observation() -> RobotObservation
 
 实际词表以 `jiuwensymbiosis.env.base.KNOWN_CAPABILITIES` 为准。
 
-## `@robot_tool`
+## `@implements(SPEC)`
 
 ```python
-robot_tool(
-    _func=None,
-    *,
-    name=None,
-    desc=None,
-    capability=None,
-    input_params=None,
-    tags=None,
-)
+implements(spec: ActionSpec) -> Callable   # api/actions.py
 ```
 
-装饰器把 `ToolMeta` 附加到未绑定方法。未显式提供时，工具名取函数名、描述取 docstring 第一行、输入 JSON Schema 从类型注解和默认值推导。子类覆写 Mixin 方法时会继承元数据。
+方法变成工具的唯一入口。它把一个 `ToolMeta` 挂到方法上，内含 `spec` 与 `input_params`——后者由本体自己的签名推导
+（按 `spec.params` 过滤，再由 `spec.param_schema` 细化）。描述、capability、tags、requires / provides / invalidates、
+位置新鲜度等契约字段全部回读自 spec，所以实现方没有渠道对规划器说词表之外的话。
+
+若签名接不下 spec 承诺的参数，导入时即抛 `ContractViolation`。
+
+bring-up、标定与调试视图**不是动作**：不加装饰器，用 `scripts/` 下的脚本驱动。
 
 ## 工具构建
 

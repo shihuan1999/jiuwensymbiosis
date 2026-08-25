@@ -4,6 +4,7 @@
 from jiuwensymbiosis.adapters.cruzr.geometry import ARM_JOINTS, ArmTarget, solve_arm_ik
 from jiuwensymbiosis.kinematics.ik import IKResult
 from jiuwensymbiosis.kinematics.urdf_chain import Chain
+from jiuwensymbiosis.motion import dual_arm as _da
 
 
 def _tgt():
@@ -22,7 +23,7 @@ def test_dispatch_uses_pinocchio_when_available(monkeypatch):
     def _fake_pin(urdf_path, arm_joints, leaf_link, limits, *a, **k):
         called["urdf"] = urdf_path
         called["leaf"] = leaf_link
-        return IKResult(q={j: 0.1 for j in arm_joints}, converged=True, pos_err_m=0.001, normal_err=0.001, iters=3)
+        return IKResult(q=dict.fromkeys(arm_joints, 0.1), converged=True, pos_err_m=0.001, normal_err=0.001, iters=3)
 
     monkeypatch.setattr(pik, "pin_available", lambda: True)
     monkeypatch.setattr(pik, "solve_pose_ik_pin", _fake_pin)
@@ -34,15 +35,15 @@ def test_dispatch_uses_pinocchio_when_available(monkeypatch):
 
 def test_dispatch_falls_back_to_dls_when_pin_unavailable(monkeypatch):
     import jiuwensymbiosis.kinematics.ik_pinocchio as pik
-    import jiuwensymbiosis.adapters.cruzr.geometry as gp
     legacy = {}
 
     def _fake_dls(chain, q_fixed, arm_joints, *a, **k):
         legacy["hit"] = True
-        return IKResult(q={j: 0.0 for j in arm_joints}, converged=True, pos_err_m=0.0, normal_err=0.0, iters=1)
+        return IKResult(q=dict.fromkeys(arm_joints, 0.0), converged=True, pos_err_m=0.0, normal_err=0.0, iters=1)
 
     monkeypatch.setattr(pik, "pin_available", lambda: False)
-    monkeypatch.setattr(gp, "ik_solve_pose", _fake_dls)
+    # The DLS fallback now lives with the shared two-arm IK, not in the body's geometry.
+    monkeypatch.setattr(_da, "ik_solve_pose", _fake_dls)
     chain = Chain(joints=[], urdf_path="/some.urdf", leaf_link="L_sixforce_link")
     res = solve_arm_ik(chain, _fixed(), "left", _tgt())
     assert legacy.get("hit") is True and res.converged
@@ -55,7 +56,7 @@ def test_dispatch_forwards_check_collision_and_package_dir(monkeypatch):
     def _fake_pin(urdf_path, arm_joints, leaf_link, limits, *a, **k):
         seen["check_collision"] = k.get("check_collision")
         seen["package_dir"] = k.get("package_dir")
-        return IKResult(q={j: 0.0 for j in arm_joints}, converged=True, pos_err_m=0.0, normal_err=0.0, iters=1)
+        return IKResult(q=dict.fromkeys(arm_joints, 0.0), converged=True, pos_err_m=0.0, normal_err=0.0, iters=1)
 
     monkeypatch.setattr(pik, "pin_available", lambda: True)
     monkeypatch.setattr(pik, "solve_pose_ik_pin", _fake_pin)

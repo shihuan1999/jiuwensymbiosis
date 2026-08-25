@@ -57,7 +57,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-# Closed vocabulary of robot self-state. An unknown token in a @robot_tool /
+# Closed vocabulary of robot self-state. An unknown token in an @implements /
 # SKILL.md annotation is a hard error, not a silently ignored string — a typo
 # would otherwise make a pre-condition unsatisfiable and the planner would loop
 # trying to satisfy it.
@@ -78,7 +78,7 @@ KNOWN_STATE_TOKENS: frozenset[str] = frozenset(
 PAYLOAD_TOKENS: frozenset[str] = frozenset({"payload.held", "payload.clear", "payload.stowed"})
 
 # The relations that mean "my target is enclosed by the reference", as opposed to merely
-# located by it. Subset of ``perception/scene3d.py:SPATIAL_RELATIONS`` (on / under / in /
+# located by it. Subset of ``contracts.py:SPATIAL_RELATIONS`` (on / under / in /
 # beside / near); ``tests/unit_tests/api/test_state.py`` pins that it stays one.
 #   in    — the apple IN the drawer: the drawer must be open.
 #   under — the box UNDER the crate: the crate must come off first.

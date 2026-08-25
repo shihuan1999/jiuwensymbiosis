@@ -49,7 +49,6 @@ from jiuwensymbiosis.agent.session import RobotSession
 from jiuwensymbiosis.api import defaults
 from jiuwensymbiosis.api.actions import ACTIONS, ActionSpec, implements
 from jiuwensymbiosis.api.base import BaseRobotApi
-from jiuwensymbiosis.api.decorators import robot_tool
 from jiuwensymbiosis.env.base import BaseRobotEnv, RobotObservation
 from jiuwensymbiosis.tools.builder import build_robot_tools
 from jiuwensymbiosis.tools.inproc_code import InProcessCodeTool
@@ -58,7 +57,6 @@ __all__ = [
     "BaseRobotEnv",
     "RobotObservation",
     "BaseRobotApi",
-    "robot_tool",
     "implements",
     "ActionSpec",
     "ACTIONS",

@@ -10,9 +10,10 @@ import pytest
 import jiuwensymbiosis.adapters.cruzr.geometry as gp
 import jiuwensymbiosis.adapters.cruzr.geometry as lifter_mod
 from jiuwensymbiosis.adapters.cruzr.api import CruzrApi
-from jiuwensymbiosis.adapters.cruzr.geometry import ARM_JOINTS
+from jiuwensymbiosis.adapters.cruzr.geometry import ARM_JOINTS, LIFTER_JOINTS, LifterPlan
 from jiuwensymbiosis.kinematics.ik import IKResult
-from jiuwensymbiosis.adapters.cruzr.geometry import LIFTER_JOINTS, LifterPlan
+from jiuwensymbiosis.motion import dual_arm as _da_mod
+from tests.unit_tests.adapters.cruzr import description
 
 _ARMS = [j for a in ("left", "right") for j in ARM_JOINTS[a]]
 # Grasp-time geometry (what place would WRONGLY use if it read stale geometry):
@@ -26,17 +27,17 @@ _SURFACE = {"ok": True, "surface_z_mm": 500.0, "center_mm": [1000.0, 30.0, 500.0
 
 class _FakeChain:
     def limits(self):
-        return {j: (-3.14, 3.14) for j in _ARMS}
+        return dict.fromkeys(_ARMS, (-3.14, 3.14))
 
 
 class _LL:
     def __init__(self):
         self.moves = []
         self.streams = []
-        self._lifter = {j: 0.0 for j in LIFTER_JOINTS}   # tracks the lean so FK reflects it post-move
+        self._lifter = dict.fromkeys(LIFTER_JOINTS, 0.0)   # tracks the lean so FK reflects it post-move
 
     def get_joint_positions(self):
-        q = {j: 0.0 for j in _ARMS}
+        q = dict.fromkeys(_ARMS, 0.0)
         q.update(self._lifter)
         q["waist_yaw_joint"] = 0.0
         return q
@@ -57,13 +58,41 @@ class _LL:
 
 
 class _Env:
+    # What the shared two-arm sequence reads off the Env (see test_grasp_box_api._Env).
+    capabilities = frozenset({"motion.dual_arm", "grasp.paddle", "motion.lift", "motion.waist"})
+    arm_chains = {"left": ("base_link", "L_sixforce_link"),
+                  "right": ("base_link", "R_sixforce_link")}
+    waist_joint = "waist_yaw_joint"
+
+    @property
+    def urdf_path(self):
+        return self.cfg.urdf_path
+
+    @property
+    def arm_joints(self):
+        from jiuwensymbiosis.adapters.cruzr.geometry import ARM_JOINTS
+
+        return {a: list(j) for a, j in ARM_JOINTS.items()}
+
+    @property
+    def torso_joints(self):
+        from jiuwensymbiosis.adapters.cruzr.geometry import LIFTER_JOINTS
+
+        return [*LIFTER_JOINTS, "waist_yaw_joint"]
+
+    def set_lifter(self, q_lifter):
+        return self.low_level.set_lifter(q_lifter)
+
+    def move_named_joints(self, targets, **kwargs):
+        """Mirror BaseRobotEnv: the Api reaches named joints through the Env seam."""
+        return self.low_level.move_joints_blocking(targets, **kwargs)
     def __init__(self):
         self.low_level = _LL()
         self.cfg = SimpleNamespace(
             urdf_path="/nonexistent.urdf", left_arm_leaf="L_sixforce_link",
             right_arm_leaf="R_sixforce_link", place_edge_margin_mm=20.0,
             place_max_lift_lean_rad=0.35,
-            urdf_package_dir="/home/riemann/Robot/Cruzr_ws/cruzr_s2_description")
+            urdf_package_dir=description.PACKAGE_DIR)
 
 
 def _api(monkeypatch, *, improves=False, q_lifter=None):
@@ -86,9 +115,15 @@ def _api(monkeypatch, *, improves=False, q_lifter=None):
 
     captured = []
 
-    def _fake_ik(chain, q_fixed, arm, tgt, **k):
+    def _fake_ik(chain, q_fixed, arm_or_joints, tgt, **k):
+        # Patched over BOTH solve_arm_ik seams: cruzr's wrapper takes the arm name, the shared
+        # one takes that arm's joint names (which is the point — the generic solver cannot
+        # read them off the chain).
+        joints = (ARM_JOINTS[arm_or_joints] if isinstance(arm_or_joints, str) else arm_or_joints)
+        arm = arm_or_joints if isinstance(arm_or_joints, str) else (
+            "left" if any(str(j).startswith("L_") for j in joints) else "right")
         captured.append((arm, tgt))
-        return IKResult(q={j: 0.1 for j in ARM_JOINTS[arm]}, converged=True,
+        return IKResult(q=dict.fromkeys(joints, 0.1), converged=True,
                         pos_err_m=0.001, normal_err=0.001, iters=3)
 
     def _fake_search(clamp, lc, rc, current_lifter, waist_yaw, **k):
@@ -99,6 +134,8 @@ def _api(monkeypatch, *, improves=False, q_lifter=None):
     monkeypatch.setattr("jiuwensymbiosis.kinematics.urdf_chain.parse_chain", _fake_parse)
     monkeypatch.setattr("jiuwensymbiosis.kinematics.fk.fk_chain", _fake_fk)
     monkeypatch.setattr(gp, "solve_arm_ik", _fake_ik)
+    # The shared sequence resolves it in its OWN module — patch there too.
+    monkeypatch.setattr(_da_mod, "solve_arm_ik", _fake_ik)
     monkeypatch.setattr(lifter_mod, "search_lifter_for_place", _fake_search)
     monkeypatch.setattr(lifter_mod, "lower_torso_lifter", lambda *a, **k: None)  # skip rim descend
     env = _Env()

@@ -19,6 +19,7 @@ from jiuwensymbiosis.env.protocol import (
     GripperDriver,
     JointDriver,
     LifterDriver,
+    NamedJointDriver,
     RobotDriver,
     SuctionDriver,
     VisionDriver,
@@ -233,19 +234,28 @@ class TestProtocolsMirrorCapabilitySpec:
         ("capability", "protocol"),
         [
             ("motion.cartesian", CartesianDriver),
-            ("motion.joint", JointDriver),
+            # motion.joint has two encodings; the spec entry is a tuple, so the pair of
+            # sibling protocols together must declare it.
+            ("motion.joint", (JointDriver, NamedJointDriver)),
             ("grasp.parallel", GripperDriver),
             ("grasp.suction", SuctionDriver),
             ("motion.base", BaseDriver),
             ("motion.base_servo", ContinuousBaseDriver),
             ("motion.lift", LifterDriver),
             ("motion.waist", WaistDriver),
-            ("grasp.dual_arm", DualArmDriver),
+            ("motion.dual_arm", DualArmDriver),
         ],
     )
     def test_every_spec_member_is_declared(self, capability, protocol):
-        missing = [m for m in CAPABILITY_DRIVER_MEMBERS[capability] if not hasattr(protocol, m)]
-        assert not missing, f"{protocol.__name__} is missing {missing} required by '{capability}'"
+        protocols = protocol if isinstance(protocol, tuple) else (protocol,)
+        missing = [
+            m
+            for entry in CAPABILITY_DRIVER_MEMBERS[capability]
+            for m in (entry if isinstance(entry, tuple) else (entry,))
+            if not any(hasattr(p, m) for p in protocols)
+        ]
+        names = "/".join(p.__name__ for p in protocols)
+        assert not missing, f"{names} is missing {missing} required by '{capability}'"
 
 
 class _FullMockDriver(

@@ -355,30 +355,9 @@ class CruzrLowLevel:
     def home(self, *, arm: Optional[str] = None) -> dict[str, Any]:
         """Return the selected arm to the configured home position."""
         joint = self.cfg.joint_name_for_arm(arm)
-        self.move_joint_blocking({joint: self.cfg.home_position_rad})
+        self.move_joints_blocking({joint: self.cfg.home_position_rad})
         return {"ok": True, "arm": arm or self.cfg.default_arm, "joint": joint,
                 "position_rad": self.cfg.home_position_rad}
-
-    def raise_arm_blocking(
-        self,
-        *,
-        arm: Optional[str] = None,
-        return_home: bool = True,
-        target_rad: Optional[float] = None,
-    ) -> dict[str, Any]:
-        """Raise a shoulder pitch joint and optionally lower it back home."""
-        joint = self.cfg.joint_name_for_arm(arm)
-        target = float(self.cfg.raise_position_for_arm(arm) if target_rad is None else target_rad)
-        self._ramp_joint(joint, self.cfg.home_position_rad, target)
-        if return_home:
-            self._ramp_joint(joint, target, self.cfg.home_position_rad)
-        return {
-            "ok": True,
-            "arm": arm or self.cfg.default_arm,
-            "joint": joint,
-            "target_rad": target,
-            "returned_home": bool(return_home),
-        }
 
     def _ramp_to_targets_native(self, targets: dict[str, float],
                                 *, ramp_duration_s: Optional[float] = None) -> bool:
@@ -408,43 +387,6 @@ class CruzrLowLevel:
             self.publish_joint_positions({k: start[k] + a * (targets[k] - start[k]) for k in targets})
             time.sleep(period)
         return not missing
-
-    def move_joint_blocking(
-        self,
-        joint_positions: dict[str, float] | list[float],
-        *,
-        joint_names: Optional[list[str]] = None,
-        timeout_s: float = 10.0,
-    ) -> dict[str, Any]:
-        """Move joints to target positions by repeatedly publishing until timeout/readback.
-
-        When no state has been received, this still sends commands for a short
-        period so the SDK controller receives a stable target.
-        """
-        targets = self._normalize_joint_targets(joint_positions, joint_names)
-        self._ramp_to_targets_native(targets)
-        deadline = time.monotonic() + float(timeout_s)
-        period = 1.0 / max(float(self.cfg.control_rate_hz), 1.0)
-        saw_state = bool(self.get_joint_positions())
-        open_loop_deadline = time.monotonic() + max(float(self.cfg.open_loop_hold_s), period)
-        while time.monotonic() < deadline:
-            self.publish_joint_positions(targets)
-            reached = self._targets_reached(targets)
-            if reached:
-                break
-            if not saw_state:
-                saw_state = bool(self.get_joint_positions())
-                if not saw_state and time.monotonic() >= open_loop_deadline:
-                    break
-            time.sleep(period)
-        time.sleep(max(float(self.cfg.settle_s), 0.0))
-        readback = self.get_joint_positions()
-        return {
-            "ok": True,
-            "targets": targets,
-            "readback": readback,
-            "open_loop": not bool(readback),
-        }
 
     def move_joints_blocking(self, targets: dict[str, float], *, timeout_s: float = 10.0,
                              ramp_duration_s: Optional[float] = None) -> dict:
@@ -574,22 +516,6 @@ class CruzrLowLevel:
             self.publish_joint_position(joint_name, current)
             time.sleep(period)
         time.sleep(max(float(self.cfg.settle_s), 0.0))
-
-    def _normalize_joint_targets(
-        self,
-        joint_positions: dict[str, float] | list[float],
-        joint_names: Optional[list[str]],
-    ) -> dict[str, float]:
-        if isinstance(joint_positions, dict):
-            return {str(k): float(v) for k, v in joint_positions.items()}
-        if joint_names is None:
-            default_joint = self.cfg.joint_name_for_arm(self.cfg.default_arm)
-            if len(joint_positions) != 1:
-                raise ValueError("joint_names is required when moving more than one unnamed joint")
-            joint_names = [default_joint]
-        if len(joint_names) != len(joint_positions):
-            raise ValueError("joint_names and joint_positions length mismatch")
-        return {str(k): float(v) for k, v in zip(joint_names, joint_positions)}
 
     def _targets_reached(self, targets: dict[str, float]) -> bool:
         state = self.get_joint_positions()

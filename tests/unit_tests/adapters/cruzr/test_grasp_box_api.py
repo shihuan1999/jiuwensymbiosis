@@ -4,10 +4,15 @@ import numpy as np
 import jiuwensymbiosis.adapters.cruzr.geometry as lifter_mod
 from jiuwensymbiosis.adapters.cruzr.api import CruzrApi
 from jiuwensymbiosis.adapters.cruzr.geometry import (
-    ArmTarget, GraspPlan, ARM_JOINTS,
+    ARM_JOINTS,
+    LIFTER_JOINTS,
+    ArmTarget,
+    GraspPlan,
+    LifterPlan,
 )
 from jiuwensymbiosis.kinematics.ik import IKResult
-from jiuwensymbiosis.adapters.cruzr.geometry import LIFTER_JOINTS, LifterPlan
+from jiuwensymbiosis.motion import dual_arm as _da_mod
+from tests.unit_tests.adapters.cruzr import description
 
 
 def _no_move_lifter(box, lc, rc, current_lifter, waist_yaw, **k):
@@ -52,10 +57,41 @@ class _LL:
 
 
 class _Env:
+    # What the shared two-arm sequence reads off the Env: the chains to solve, which joints
+    # each arm actuates, and which joints the arm solve holds fixed. On the real CruzrEnv the
+    # last one is derived from motion.lift / motion.waist; spelled out here because this
+    # double does not inherit BaseRobotEnv.
+    capabilities = frozenset({"motion.dual_arm", "grasp.paddle", "motion.lift", "motion.waist"})
+    arm_chains = {"left": ("base_link", "L_sixforce_link"),
+                  "right": ("base_link", "R_sixforce_link")}
+    waist_joint = "waist_yaw_joint"
+
+    @property
+    def urdf_path(self):
+        return self.cfg.urdf_path
+
+    @property
+    def arm_joints(self):
+        from jiuwensymbiosis.adapters.cruzr.geometry import ARM_JOINTS
+
+        return {a: list(j) for a, j in ARM_JOINTS.items()}
+
+    @property
+    def torso_joints(self):
+        from jiuwensymbiosis.adapters.cruzr.geometry import LIFTER_JOINTS
+
+        return [*LIFTER_JOINTS, "waist_yaw_joint"]
+
+    def set_lifter(self, q_lifter):
+        return self.low_level.set_lifter(q_lifter)
+
+    def move_named_joints(self, targets, **kwargs):
+        """Mirror BaseRobotEnv: the Api reaches named joints through the Env seam."""
+        return self.low_level.move_joints_blocking(targets, **kwargs)
     def __init__(self): self.low_level = _LL()
     class cfg:
         default_arm = "left"
-        urdf_path = "/home/riemann/Robot/Cruzr_ws/cruzr_s2_description/cruzr_s2_description/urdf/cruzr_s2_v1/cruzr_s2_v1.urdf"
+        urdf_path = description.URDF
         left_arm_leaf = "L_sixforce_link"
         right_arm_leaf = "R_sixforce_link"
         palm_normal_local = (0.0, 0.0, 1.0)
@@ -64,7 +100,7 @@ class _Env:
         place_edge_margin_mm = 20.0
         place_max_lift_lean_rad = 0.35
         waist_yaw_joint = "waist_yaw_joint"
-        urdf_package_dir = "/home/riemann/Robot/Cruzr_ws/cruzr_s2_description"
+        urdf_package_dir = description.PACKAGE_DIR
         arm_transit_ramp_duration_s = 0.6   # non-contact grasp moves (ready/descend) use this fast ramp
         arm_contact_ramp_duration_s = 0.7   # box-contact moves (clamp/place-lower) use this dedicated ramp
 
@@ -93,7 +129,7 @@ def _api(monkeypatch):
 def _make_converged_ik(arm):
     """Return a converged IKResult with zeros for all joints of the given arm."""
     return IKResult(
-        q={j: 0.0 for j in ARM_JOINTS[arm]},
+        q=dict.fromkeys(ARM_JOINTS[arm], 0.0),
         converged=True,
         pos_err_m=0.001,
         normal_err=0.001,
@@ -115,15 +151,24 @@ def _fake_solve_grasp(*args, **kwargs):
                      approach=approach, descend=descend, clamp=clamp, ik=ik)
 
 
-def _fake_solve_arm_ik(chain, q_fixed, arm, tgt, **kwargs):
+def _arm_of(arm_or_joints):
+    """The fakes are patched over BOTH solve_arm_ik seams and the two differ in one slot:
+    cruzr's wrapper takes the arm name, the shared one takes that arm's joint names (which is
+    the point — the generic solver cannot read them off the chain)."""
+    if isinstance(arm_or_joints, str):
+        return arm_or_joints
+    return "left" if any(str(j).startswith("L_") for j in arm_or_joints) else "right"
+
+
+def _fake_solve_arm_ik(chain, q_fixed, arm_or_joints, tgt, **kwargs):
     """Mock solve_arm_ik (pre-grasp) that always returns a converged IKResult."""
-    return _make_converged_ik(arm)
+    return _make_converged_ik(_arm_of(arm_or_joints))
 
 
-def _fake_solve_arm_ik_nonzero(chain, q_fixed, arm, tgt, **kwargs):
+def _fake_solve_arm_ik_nonzero(chain, q_fixed, arm_or_joints, tgt, **kwargs):
     """Converged IK with NON-zero joints, so a place move is observably not homed-to-zero."""
     return IKResult(
-        q={j: 0.1 for j in ARM_JOINTS[arm]},
+        q=dict.fromkeys(ARM_JOINTS[_arm_of(arm_or_joints)], 0.1),
         converged=True, pos_err_m=0.001, normal_err=0.001, iters=5,
     )
 
@@ -131,6 +176,7 @@ def _fake_solve_arm_ik_nonzero(chain, q_fixed, arm, tgt, **kwargs):
 def test_dual_arm_grasp_no_joint_state(monkeypatch):
     """Guard: if get_joint_positions() returns {}, dual_arm_grasp must return no_joint_state."""
     from pathlib import Path
+
     import pytest
     if not Path(_Env.cfg.urdf_path).exists():
         pytest.skip("urdf not present")
@@ -147,6 +193,7 @@ def test_dual_arm_grasp_no_joint_state(monkeypatch):
 
 def test_dual_arm_grasp_aborts_lift_without_contact(monkeypatch):
     from pathlib import Path
+
     import pytest
     if not Path(_Env.cfg.urdf_path).exists():
         pytest.skip("urdf not present")
@@ -157,6 +204,7 @@ def test_dual_arm_grasp_aborts_lift_without_contact(monkeypatch):
     import jiuwensymbiosis.adapters.cruzr.geometry as _gp_mod
     monkeypatch.setattr(_gp_mod, "solve_grasp", _fake_solve_grasp)
     monkeypatch.setattr(_gp_mod, "solve_arm_ik", _fake_solve_arm_ik)
+    monkeypatch.setattr(_da_mod, "solve_arm_ik", _fake_solve_arm_ik)
     monkeypatch.setattr(lifter_mod, "search_lifter_for_box", _no_move_lifter)
 
     api, env = _api(monkeypatch)
@@ -173,6 +221,7 @@ def test_grasp_transit_fast_clamp_uses_contact_ramp(monkeypatch):
     the dedicated arm_contact ramp — a separate knob so the squeeze speed can be tuned against
     deform / contact-force accuracy without touching the transit or global ramps."""
     from pathlib import Path
+
     import pytest
     if not Path(_Env.cfg.urdf_path).exists():
         pytest.skip("urdf not present")
@@ -180,6 +229,7 @@ def test_grasp_transit_fast_clamp_uses_contact_ramp(monkeypatch):
     import jiuwensymbiosis.adapters.cruzr.geometry as _gp_mod
     monkeypatch.setattr(_gp_mod, "solve_grasp", _fake_solve_grasp)
     monkeypatch.setattr(_gp_mod, "solve_arm_ik", _fake_solve_arm_ik)
+    monkeypatch.setattr(_da_mod, "solve_arm_ik", _fake_solve_arm_ik)
     monkeypatch.setattr(lifter_mod, "search_lifter_for_box", _no_move_lifter)
 
     api, env = _api(monkeypatch)
@@ -193,9 +243,9 @@ def test_grasp_transit_fast_clamp_uses_contact_ramp(monkeypatch):
 
 
 def test_home_arms_moves_both_to_zero(monkeypatch):
-    """home_arms (clear path) issues ONE combined command with all 14 arm joints at 0."""
+    """_safe_home_arms (clear path) issues ONE combined command with all 14 arm joints at 0."""
     api, env = _api(monkeypatch)
-    out = api.home_arms()
+    out = api._safe_home_arms()
     assert out["ok"]
     assert env.low_level.moves, "expected a move command"
     last = env.low_level.moves[-1]
@@ -204,14 +254,14 @@ def test_home_arms_moves_both_to_zero(monkeypatch):
 
 
 def test_home_arms_via_clearance_pose_when_configured(monkeypatch):
-    """With cfg.home_clearance_arm_q set, home_arms abducts the arms OUT to the sides FIRST,
+    """With cfg.home_clearance_arm_q set, _safe_home_arms abducts the arms OUT to the sides FIRST,
     then descends to 0 (two moves) — never a direct sweep across the torso."""
     import pytest
     api, env = _api(monkeypatch)
     monkeypatch.setattr(env.cfg, "home_clearance_arm_q",
                         {"L_shoulder_roll_joint": -0.7, "R_shoulder_roll_joint": -0.7}, raising=False)
     monkeypatch.setattr(api, "_arm_home_path_collides", lambda *a, **k: False)  # every leg clear
-    out = api.home_arms()
+    out = api._safe_home_arms()
     assert out["ok"]
     assert len(env.low_level.moves) == 2                        # clearance waypoint, then 0
     clearance, final = env.low_level.moves[0], env.low_level.moves[1]
@@ -222,9 +272,10 @@ def test_home_arms_via_clearance_pose_when_configured(monkeypatch):
 
 
 def test_home_arms_refuses_when_no_safe_path(monkeypatch):
-    """home_arms is self-collision-checked (not just home_safely): with no collision-free
+    """_safe_home_arms is self-collision-checked (not just home_safely): with no collision-free
     path it refuses rather than sweeping both arms straight through the torso."""
     from pathlib import Path
+
     import pytest
     if not Path(_Env.cfg.urdf_path).exists():
         pytest.skip("urdf not present")
@@ -235,26 +286,34 @@ def test_home_arms_refuses_when_no_safe_path(monkeypatch):
         "L_shoulder_pitch_joint": 0.5,
     }
     monkeypatch.setattr(api, "_arm_home_path_collides", lambda *a, **k: True)  # every path collides
-    out = api.home_arms()
+    out = api._safe_home_arms()
     assert out == {"ok": False, "reason": "home_path_self_collision"}
     assert env.low_level.moves == []  # never swept the arms
 
 
-def test_dual_arm_grasp_passes_grasp_inset_to_solve_grasp(monkeypatch):
-    """dual_arm_grasp drives the clamp depth from cfg.grasp_inset_mm (gentler grip, less crush)."""
+def test_dual_arm_grasp_takes_its_contact_depth_from_the_end_effector_hook(monkeypatch):
+    """The clamp depth comes from cfg.grasp_inset_mm, and it reaches the waypoints through the
+    END-EFFECTOR hook (``grasp_plan``) — not through the shared two-arm solve. That split is what
+    lets a dual-arm body carrying grippers keep the coordination and replace only the contact
+    planning."""
     from pathlib import Path
+
     import pytest
     if not Path(_Env.cfg.urdf_path).exists():
         pytest.skip("urdf not present")
     import jiuwensymbiosis.adapters.cruzr.geometry as _gp_mod
     captured = {}
 
-    def _capture(box, left, right, q_fixed, **kwargs):
+    def _capture(box, **kwargs):
         captured["inset_mm"] = kwargs.get("inset_mm")
-        return _fake_solve_grasp()
+        fake = _fake_solve_grasp()
+        return fake.approach, fake.descend, fake.clamp
 
-    monkeypatch.setattr(_gp_mod, "solve_grasp", _capture)
+    monkeypatch.setattr(_gp_mod, "plan_clamp_targets", _capture)
+    monkeypatch.setattr(_gp_mod, "solve_planned_grasp",
+                        lambda *a, **k: _fake_solve_grasp())
     monkeypatch.setattr(_gp_mod, "solve_arm_ik", _fake_solve_arm_ik)
+    monkeypatch.setattr(_da_mod, "solve_arm_ik", _fake_solve_arm_ik)
     monkeypatch.setattr(lifter_mod, "search_lifter_for_box", _no_move_lifter)
     api, env = _api(monkeypatch)
     env.low_level.read_hand_ft = lambda arm: {"ok": True, "fmag": 10.0}  # contact
@@ -266,12 +325,14 @@ def test_dual_arm_grasp_clamps_and_verifies_contact_no_lift(monkeypatch):
     """On FT contact grasp clamps to the plan pose and returns the FT reading.
     It does NOT lift — the pick-up/clearance lift is delegated to lift_to_clearance."""
     from pathlib import Path
+
     import pytest
     if not Path(_Env.cfg.urdf_path).exists():
         pytest.skip("urdf not present")
     import jiuwensymbiosis.adapters.cruzr.geometry as _gp_mod
     monkeypatch.setattr(_gp_mod, "solve_grasp", _fake_solve_grasp)
     monkeypatch.setattr(_gp_mod, "solve_arm_ik", _fake_solve_arm_ik)
+    monkeypatch.setattr(_da_mod, "solve_arm_ik", _fake_solve_arm_ik)
     monkeypatch.setattr(lifter_mod, "search_lifter_for_box", _no_move_lifter)
 
     api, env = _api(monkeypatch)
@@ -288,6 +349,7 @@ def test_dual_arm_grasp_clamps_and_verifies_contact_no_lift(monkeypatch):
 
 def test_dual_arm_grasp_unreachable_any_lifter(monkeypatch):
     from pathlib import Path
+
     import pytest
     if not Path(_Env.cfg.urdf_path).exists():
         pytest.skip("urdf not present")
@@ -306,6 +368,7 @@ def test_dual_arm_grasp_unreachable_any_lifter(monkeypatch):
 
 def test_dual_arm_grasp_adjusts_lifter_when_it_helps(monkeypatch):
     from pathlib import Path
+
     import pytest
     if not Path(_Env.cfg.urdf_path).exists():
         pytest.skip("urdf not present")
@@ -319,6 +382,7 @@ def test_dual_arm_grasp_adjusts_lifter_when_it_helps(monkeypatch):
     import jiuwensymbiosis.adapters.cruzr.geometry as _gp_mod
     monkeypatch.setattr(_gp_mod, "solve_grasp", _fake_solve_grasp)
     monkeypatch.setattr(_gp_mod, "solve_arm_ik", _fake_solve_arm_ik)
+    monkeypatch.setattr(_da_mod, "solve_arm_ik", _fake_solve_arm_ik)
     monkeypatch.setattr(lifter_mod, "search_lifter_for_box", _improves)
 
     api, env = _api(monkeypatch)
@@ -356,6 +420,7 @@ def test_home_safely_only_homes_arms_when_upright_but_arms_out(monkeypatch):
 def test_home_safely_full_sequence_when_leaned(monkeypatch):
     """Body leaned forward (lifter != 0) -> straighten the lifter then home."""
     from pathlib import Path
+
     import pytest
     if not Path(_Env.cfg.urdf_path).exists():
         pytest.skip("urdf not present")
@@ -375,6 +440,7 @@ def test_dual_arm_place_does_not_return_to_zero(monkeypatch):
     """dual_arm_place places + raises clear but delegates the return-to-zero to
     home_safely: it must NOT straighten the lifter or home the arms."""
     from pathlib import Path
+
     import pytest
     if not Path(_Env.cfg.urdf_path).exists():
         pytest.skip("urdf not present")
@@ -383,6 +449,7 @@ def test_dual_arm_place_does_not_return_to_zero(monkeypatch):
     # box-independent ready pose, so we can't rely on real IK converging here).
     import jiuwensymbiosis.adapters.cruzr.geometry as _gp_mod
     monkeypatch.setattr(_gp_mod, "solve_arm_ik", _fake_solve_arm_ik_nonzero)
+    monkeypatch.setattr(_da_mod, "solve_arm_ik", _fake_solve_arm_ik_nonzero)
     # place now searches a place lifter (its own solve_arm_ik bound in lifter_mod);
     # stub it to "already reaches" so no lean move runs and the test stays hardware-free.
     monkeypatch.setattr(lifter_mod, "search_lifter_for_place", _no_move_place)
@@ -402,12 +469,14 @@ def test_dual_arm_grasp_caches_box_for_place(monkeypatch):
     """On a successful grasp, the detected box is cached on the api so dual_arm_place()
     can later be called WITHOUT the LLM echoing the geometry back."""
     from pathlib import Path
+
     import pytest
     if not Path(_Env.cfg.urdf_path).exists():
         pytest.skip("urdf not present")
     import jiuwensymbiosis.adapters.cruzr.geometry as _gp_mod
     monkeypatch.setattr(_gp_mod, "solve_grasp", _fake_solve_grasp)
     monkeypatch.setattr(_gp_mod, "solve_arm_ik", _fake_solve_arm_ik)
+    monkeypatch.setattr(_da_mod, "solve_arm_ik", _fake_solve_arm_ik)
     monkeypatch.setattr(lifter_mod, "search_lifter_for_box", _no_move_lifter)
 
     api, env = _api(monkeypatch)
@@ -455,21 +524,25 @@ def test_home_safely_skip_requires_waist_home(monkeypatch):
 
 
 def test_dual_arm_grasp_final_solve_checks_collision(monkeypatch):
-    """dual_arm_grasp's final solve_grasp runs with self-collision checking on."""
+    """The shared two-arm solve runs with self-collision checking on."""
     from pathlib import Path
+
     import pytest
     if not Path(_Env.cfg.urdf_path).exists():
         pytest.skip("urdf not present")
     import jiuwensymbiosis.adapters.cruzr.geometry as _gp_mod
     seen = {}
 
-    def _capture(box, left, right, q_fixed, **kwargs):
+    def _capture(contact_z_mm, chains, arm_joints, q_fixed, approach, descend, clamp, **kwargs):
         seen["check_collision"] = kwargs.get("check_collision")
         seen["package_dir"] = kwargs.get("package_dir")
         return _fake_solve_grasp()
 
-    monkeypatch.setattr(_gp_mod, "solve_grasp", _capture)
+    # The shared sequence resolves it in its OWN module — patch there, not on the
+    # body's re-export.
+    monkeypatch.setattr(_da_mod, "solve_planned_grasp", _capture)
     monkeypatch.setattr(_gp_mod, "solve_arm_ik", _fake_solve_arm_ik)
+    monkeypatch.setattr(_da_mod, "solve_arm_ik", _fake_solve_arm_ik)
     monkeypatch.setattr(lifter_mod, "search_lifter_for_box", _no_move_lifter)
     api, env = _api(monkeypatch)
     env.low_level.read_hand_ft = lambda arm: {"ok": True, "fmag": 10.0}
@@ -482,6 +555,7 @@ def test_home_safely_recovers_by_homing_one_arm_at_a_time(monkeypatch):
     """When homing both arms together self-collides (forearms cross in front), home_safely
     recovers by homing one arm at a time rather than refusing."""
     from pathlib import Path
+
     import pytest
     if not Path(_Env.cfg.urdf_path).exists():
         pytest.skip("urdf not present")
@@ -509,6 +583,7 @@ def test_home_safely_recovers_by_homing_one_arm_at_a_time(monkeypatch):
 def test_home_safely_reroutes_via_ready_on_collision(monkeypatch):
     """If direct AND one-arm-at-a-time both self-collide, home_safely goes via the ready pose."""
     from pathlib import Path
+
     import pytest
     if not Path(_Env.cfg.urdf_path).exists():
         pytest.skip("urdf not present")
@@ -531,6 +606,7 @@ def test_home_safely_reroutes_via_ready_on_collision(monkeypatch):
 def test_home_safely_refuses_when_no_safe_path(monkeypatch):
     """If even the ready route self-collides, home_safely refuses rather than sweeping into itself."""
     from pathlib import Path
+
     import pytest
     if not Path(_Env.cfg.urdf_path).exists():
         pytest.skip("urdf not present")
@@ -549,6 +625,7 @@ def test_home_safely_refuses_on_partial_ready_ik(monkeypatch):
     """Direct path collides and the ready-pose IK converges for only ONE arm ->
     the reroute would command a single arm (other arm's segment unverified), so refuse."""
     from pathlib import Path
+
     import pytest
     if not Path(_Env.cfg.urdf_path).exists():
         pytest.skip("urdf not present")
@@ -561,7 +638,7 @@ def test_home_safely_refuses_on_partial_ready_ik(monkeypatch):
     monkeypatch.setattr(api, "_arm_home_path_collides", lambda *a, **k: True)  # direct path collides
     # only the left arm's ready IK converged -> partial reroute target
     monkeypatch.setattr(api, "_ready_arm_q",
-                        lambda chains, qf: {"left": {j: 0.1 for j in ARM_JOINTS["left"]}})
+                        lambda chains, qf: {"left": dict.fromkeys(ARM_JOINTS["left"], 0.1)})
     out = api._home_safely()
     assert out == {"ok": False, "reason": "home_path_self_collision"}
     assert env.low_level.moves == []  # never commanded the partial reroute

@@ -22,10 +22,10 @@ import json
 from typing import Any
 
 from jiuwensymbiosis.agent.fast import planner
-from jiuwensymbiosis.agent.fast.runner import run_sequence
+from jiuwensymbiosis.agent.fast.runner import direct_executor, run_sequence
 from jiuwensymbiosis.agent.fast.sequence import parse_sequence
+from jiuwensymbiosis.api.actions import ActionSpec, implements
 from jiuwensymbiosis.api.base import BaseRobotApi
-from jiuwensymbiosis.api.decorators import robot_tool
 from jiuwensymbiosis.env.base import BaseRobotEnv, RobotObservation
 from jiuwensymbiosis.tools.robot_control_tool import _build_action_index
 
@@ -43,6 +43,8 @@ class _Env(BaseRobotEnv):
 
     def disconnect(self) -> None: ...
 
+    def home(self) -> None: ...
+
     def get_observation(self) -> RobotObservation:
         return RobotObservation(pose={"x": 0.0, "y": 0.0, "z": 0.0}, joints=[0.0])
 
@@ -50,25 +52,36 @@ class _Env(BaseRobotEnv):
 class _Api(BaseRobotApi):
     capability = set(_CAPS)
 
-    @robot_tool(desc="find an object", produces_location=True, capability="vision.detection")
+    @implements(ActionSpec(name="locate", description="find an object", produces_location=True,
+                           capability="vision.detection"))
     def locate(self, object_name: str) -> dict:
         return {"ok": True, "position": [100.0, 0.0, 50.0]}
 
-    @robot_tool(desc="drive up to the sensed object", consumes_location=True, capability="motion.base", tags=["motion"])
-    def approach(self) -> dict:
+    @implements(ActionSpec(name="approach", description="drive up to the sensed object", consumes_location=True,
+                           capability="motion.base", tags=("motion",)))
+    def approach(self, target: Any = None) -> dict:
         return {"ok": True}
 
-    @robot_tool(
-        desc="close the gripper",
-        requires=["payload.clear"],
-        provides=["payload.held"],
+    @implements(ActionSpec(
+        name="drive", description="drive the base somewhere else", invalidates_locations=True,
+        capability="motion.base", tags=("motion",),
+    ))
+    def drive(self) -> dict:
+        return {"ok": True}
+
+    @implements(ActionSpec(
+        name="grip",
+        description="close the gripper",
+        requires=("payload.clear",),
+        provides=("payload.held",),
         capability="grasp.parallel",
-        tags=["grasp"],
-    )
+        tags=("grasp",),
+    ))
     def grip(self) -> dict:
         return {"ok": True}
 
-    @robot_tool(desc="open the gripper", provides=["payload.clear"], capability="grasp.parallel", tags=["grasp"])
+    @implements(ActionSpec(name="release", description="open the gripper", provides=("payload.clear",),
+                           capability="grasp.parallel", tags=("grasp",)))
     def release(self) -> dict:
         return {"ok": True}
 
@@ -280,3 +293,81 @@ def test_a_failing_replanner_leaves_the_original_plan_alone():
 
     res, log = _drifting_run(replan)
     assert res["ok"] is True and log == ["locate", "grip"]
+
+
+# --------------------------------------------------------------------------- #
+# Runtime: the sensing the next step acts on was invalidated after the plan was written
+# --------------------------------------------------------------------------- #
+def _sensing_run(replan, *, moved_out_of_band: bool, acting_step: dict | None = None):
+    """Sense, then act on that sensing — optionally with the body moving in between.
+
+    The move happens INSIDE the locate call rather than as a step, because a move the
+    plan contains is caught at plan time. What only the runner can see is one it does
+    not contain: a body that drives itself into range, a recovery retreat, a re-planned
+    remainder. The executor dispatches through ``direct_executor`` so the real
+    ``ExecutionMemory`` bookkeeping runs. It moves ONCE, so a re-plan can converge.
+    """
+    session = _Session()
+    log: list[str] = []
+    idx = _index()
+    direct = direct_executor(session.api)
+    moves_left = [1] if moved_out_of_band else [0]
+
+    def run(op: str, params: dict) -> dict:
+        log.append(op)
+        result = direct(op, params)
+        if op == "locate" and moves_left[0]:
+            moves_left[0] -= 1
+            direct("drive", {})
+        return result
+
+    steps = parse_sequence(
+        [
+            {"op": "locate", "params": {"object_name": "crate"}, "bind": "crate"},
+            acting_step or {"op": "approach"},
+        ],
+        allowed_ops=idx,
+    )
+    res = run_sequence(session, steps, executor=run, action_index=idx, replan=replan)
+    return res, log
+
+
+def test_an_out_of_band_move_replans_before_acting_on_the_stale_sensing():
+    # Plan time signed this sequence off — and was right to: nothing in it moves the
+    # body. Only the runner can see that something did.
+    seen: list[str] = []
+
+    def replan(world, why):
+        seen.append(why)
+        return parse_sequence(
+            [{"op": "locate", "params": {"object_name": "crate"}}, {"op": "approach"}],
+            allowed_ops=_index(),
+        )
+
+    res, log = _sensing_run(replan, moved_out_of_band=True)
+    assert res["ok"] is True
+    assert log == ["locate", "locate", "approach"]  # re-sensed from where it now stands
+    assert len(seen) == 1 and "approach" in seen[0]
+
+
+def test_sensing_that_still_stands_is_left_alone():
+    def replan(world, why):
+        raise AssertionError(f"re-planned with a valid sensing in hand: {why}")
+
+    res, log = _sensing_run(replan, moved_out_of_band=False)
+    assert res["ok"] is True and log == ["locate", "approach"]
+
+
+def test_a_step_naming_its_own_source_is_not_checked():
+    # Its value is already resolved in the runner's bindings, and an op that binds a
+    # result without a location-producing contract would make an empty memory look
+    # like staleness we cannot prove. Deliberately out of scope for the runtime check.
+    def replan(world, why):
+        raise AssertionError(f"re-planned a step that names its source: {why}")
+
+    res, log = _sensing_run(
+        replan,
+        moved_out_of_band=True,
+        acting_step={"op": "approach", "params": {"target": "crate.position"}},
+    )
+    assert res["ok"] is True and log == ["locate", "approach"]

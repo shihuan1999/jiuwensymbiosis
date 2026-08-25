@@ -4,17 +4,16 @@
 """Tests for scripts/validate_adapter.py — the A-13 capability-tag check.
 
 Guards against the silent-failure regression where the check read a different
-attribute name (``_tool_meta``) than the decorator sets (``__robot_tool__``),
+attribute name (``_tool_meta``) than the decorator sets (``__tool_meta__``),
 which made the check always return an empty list.
 """
 
 from __future__ import annotations
 
 import scripts.validate_adapter as va
-from jiuwensymbiosis.api.base import BaseRobotApi
 from jiuwensymbiosis.api import defaults
-from jiuwensymbiosis.api.actions import GET_HOME_POSE, GOTO_XYZR, implements
-from jiuwensymbiosis.api.decorators import robot_tool
+from jiuwensymbiosis.api.actions import GET_HOME_POSE, GOTO_XYZR, ActionSpec, implements
+from jiuwensymbiosis.api.base import BaseRobotApi
 from jiuwensymbiosis.env.base import KNOWN_CAPABILITIES as BASE_KNOWN_CAPABILITIES
 
 
@@ -22,7 +21,8 @@ class _CartesianApi(BaseRobotApi):
     """The two Cartesian actions the checks below need: one gated, one ungated (`home`)."""
 
     @implements(GOTO_XYZR)
-    def goto_xyzr(self, x: float, y: float, z: float, r: float | None = None) -> None:
+    def goto_xyzr(self, x: float, y: float, z: float, r: float | None = None,
+                  orientation_policy: str = "top_down") -> None:
         return defaults.goto_xyzr(self, x, y, z, r)
 
     @implements(GET_HOME_POSE)
@@ -32,23 +32,25 @@ class _CartesianApi(BaseRobotApi):
 
 class _ApiWithBadCapability(_CartesianApi):
 
-    @robot_tool(desc="a tool that claims a capability the env does not have", capability="myvendor.special")
+    @implements(ActionSpec(name="do_special", description="a tool that claims a capability the env lacks",
+                           capability="grasp.suction"))
     def do_special(self) -> None:
         return None
 
 
 class _ApiWithAlignedCapability(_CartesianApi):
-    @robot_tool(desc="a tool whose capability matches the env", capability="motion.cartesian")
+    @implements(ActionSpec(name="do_aligned", description="a tool whose capability matches the env",
+                           capability="motion.cartesian"))
     def do_aligned(self) -> None:
         return None
 
 
 class TestCheckToolTags:
     def test_detects_capability_not_in_env(self):
-        # env declares only motion.cartesian; the tool claims myvendor.special.
+        # env declares only motion.cartesian; the tool claims grasp.suction.
         env_caps = {"motion.cartesian"}
         warnings = va._check_tool_tags(_ApiWithBadCapability, env_caps)
-        assert any("do_special" in w and "myvendor.special" in w for w in warnings)
+        assert any("do_special" in w and "grasp.suction" in w for w in warnings)
 
     def test_clean_when_capability_aligned(self):
         env_caps = {"motion.cartesian"}

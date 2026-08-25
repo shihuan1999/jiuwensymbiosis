@@ -8,20 +8,24 @@ import pytest
 
 pytest.importorskip("pinocchio")
 
-from jiuwensymbiosis.adapters.cruzr.config import CruzrConfig
 from jiuwensymbiosis.adapters.cruzr.geometry import (
-    ARM_JOINTS, TOOL_APPROACH_LOCAL, TOOL_PADDLE_LOCAL, APPROACH_FORWARD, PADDLE_INWARD,
+    APPROACH_FORWARD,
+    ARM_JOINTS,
+    PADDLE_INWARD,
+    TOOL_APPROACH_LOCAL,
+    TOOL_PADDLE_LOCAL,
 )
 from jiuwensymbiosis.kinematics import ik_pinocchio as pik
 from jiuwensymbiosis.kinematics.fk import fk_chain
 from jiuwensymbiosis.kinematics.urdf_chain import parse_chain
+from tests.unit_tests.adapters.cruzr import description
 
 _FIXED = {"lifter_pitch_1_joint": 0.0, "lifter_pitch_2_joint": 0.0,
           "lifter_pitch_3_joint": 0.0, "waist_yaw_joint": 0.0}
 
 
 def _cfg_or_skip():
-    cfg = CruzrConfig()
+    cfg = description.config()
     if not Path(cfg.urdf_path).exists():
         pytest.skip("urdf not present")
     return cfg

@@ -203,6 +203,9 @@ class ScaraEnv(BaseRobotEnv):
         p = ll.get_pose()
         return RobotObservation(pose={"x": p.x, "y": p.y, "z": p.z, "r": p.rz})
 
+    def home(self) -> None:
+        self._require_cartesian().home()
+
     @property
     def z_min_safe(self) -> float:
         return self._cfg.z_min_safe_mm
@@ -220,33 +223,52 @@ class ScaraEnv(BaseRobotEnv):
         return 0.0
 ```
 
-> `home`/`get_flange_pose`/`move_to_flange`/`set_end_effector`/`grab_rgb` 由 `BaseRobotEnv`
-> 默认委托给 `low_level`，ScaraEnv 无需实现。`home_pose`/`tool_offset_mm` 已暴露为属性。
+> `get_flange_pose`/`move_to_flange`/`set_end_effector`/`grab_rgb` 由 `BaseRobotEnv` 默认委托给
+> `low_level`，ScaraEnv 无需实现。`home` 是抽象方法——每个本体都要自己交代安全姿态，机械臂委托给驱动，
+> 移动本体则写自己的序列。`home_pose`/`tool_offset_mm` 已暴露为属性。
 
 ## 5. 组合 Api
 
-`home` / `goto_xyzr` / `activate_suction` / `deactivate_suction` / `get_home_pose` / `get_image` 继承 Mixin 默认委托——这里只覆写 `get_pose`，把驱动的 `rz` 暴露成 SCARA 习惯的 `r` 字段：
+每个方法用 `@implements(SPEC)` 绑定共享动作词表里的一条——动作名、能力门、参数与 effects 都来自
+`api/actions.py`，不由这个类自己讲。没有本体差异的（`goto_xyzr` / 吸盘开关）转发给 `api.defaults`；
+有差异的才写出方法体——这里就是把驱动的 `rz` 暴露成 SCARA 习惯的 `r` 字段：
 
 ```python
-"""SCARA Api — 4-DOF + 吸盘。home / goto_xyzr / 吸盘开关均继承 Mixin 默认委托。"""
+"""SCARA Api — 4-DOF + 吸盘。goto_xyzr / 吸盘开关转发 api.defaults。"""
+from jiuwensymbiosis.api import defaults
+from jiuwensymbiosis.api.actions import (
+    ACTIVATE_SUCTION,
+    GET_HOME_POSE,
+    GET_POSE,
+    GOTO_XYZR,
+    implements,
+)
 from jiuwensymbiosis.api.base import BaseRobotApi
-from jiuwensymbiosis.api.decorators import robot_tool
-from jiuwensymbiosis.api.mixins import MotionMixin, SuctionMixin
 
 
-class ScaraApi(MotionMixin, SuctionMixin, BaseRobotApi):
-    """4-DOF SCARA + 吸盘末端。仅覆写 get_pose/get_home_pose 以使用 'r' 字段命名。"""
+class ScaraApi(BaseRobotApi):
+    """4-DOF SCARA + 吸盘末端。仅 get_pose/get_home_pose 有本体差异（'r' 字段命名）。"""
 
-    @robot_tool(desc="Get current tip pose in mm/deg.")
+    @implements(GOTO_XYZR)
+    def goto_xyzr(self, x: float, y: float, z: float, r: float | None = None) -> None:
+        return defaults.goto_xyzr(self, x, y, z, r)
+
+    @implements(ACTIVATE_SUCTION)
+    def activate_suction(self) -> dict:
+        return defaults.activate_suction(self)
+
+    @implements(GET_POSE)
     def get_pose(self) -> dict:
         p = self.env.get_flange_pose()
         return {"x": p.x, "y": p.y, "z": p.z, "r": p.rz}
 
-    @robot_tool(desc="Get home pose constants.")
+    @implements(GET_HOME_POSE)
     def get_home_pose(self) -> dict:
         hp = self.env.home_pose
         return {"x": hp.x, "y": hp.y, "z": hp.z, "r": hp.rz}
 ```
+
+`ScaraApi` 不自己声明 capability——`BaseRobotApi.capabilities` 由它实现的那些 spec 反推出来。
 
 ## 6. 组装 Session
 

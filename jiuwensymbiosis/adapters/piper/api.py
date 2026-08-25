@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 
@@ -48,11 +48,9 @@ from jiuwensymbiosis.api.actions import (
     implements,
 )
 from jiuwensymbiosis.api.base import BaseRobotApi
-from jiuwensymbiosis.api.decorators import robot_tool
+from jiuwensymbiosis.contracts import GraspFailure, GraspResult
 from jiuwensymbiosis.perception.detector_client import init_detector
 from jiuwensymbiosis.perception.vision import (
-    GraspFailure,
-    GraspResult,
     apply_xy_correction,
     detect_and_centroid,
     dump_grasp_debug,
@@ -64,22 +62,6 @@ logger = logging.getLogger(__name__)
 # 真机标定(2026-06-08)：略倾 ry≈30 才能在抓取高度可达。tip↔flange 因此带水平分量。
 _TOOL_DOWN_RX = 180.0
 _TOOL_DOWN_RY = 30.0
-
-
-def _flange_pose_from_dict(pose: dict) -> FlangePose:
-    """Build a ``FlangePose`` from the shared ``goto_pose`` payload.
-
-    The contract's keys are ``x/y/z`` (mm) + ``rx/ry/rz`` (deg) — the same ones
-    SafetyRail unpacks to bounds-check the move. This vendor type spells them
-    ``x_mm`` / ``rx_deg``, so translate; the vendor spelling is still accepted so
-    existing callers holding a FlangePose-shaped dict keep working.
-    """
-    if "x_mm" in pose:
-        return FlangePose(**pose)
-    return FlangePose(
-        x_mm=float(pose["x"]), y_mm=float(pose["y"]), z_mm=float(pose["z"]),
-        rx_deg=float(pose["rx"]), ry_deg=float(pose["ry"]), rz_deg=float(pose["rz"]),
-    )
 
 
 class PiperApi(BaseRobotApi):
@@ -142,11 +124,6 @@ class PiperApi(BaseRobotApi):
             "rz": p.rz,
         }
 
-    @robot_tool(desc="Get raw flange pose (diagnostic; prefer get_pose for task code).")
-    def get_flange_pose(self) -> dict:
-        p = self.env.get_flange_pose()
-        return {"x": p.x, "y": p.y, "z": p.z, "rx": p.rx, "ry": p.ry, "rz": p.rz}
-
     @implements(GET_HOME_POSE)
     def get_home_pose(self) -> dict:
         p = self.env.home_pose
@@ -161,7 +138,31 @@ class PiperApi(BaseRobotApi):
         }
 
     @implements(GOTO_XYZR)
-    def goto_xyzr(self, x: float, y: float, z: float, r: float | None = None) -> None:
+    def goto_xyzr(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        r: float | None = None,
+        orientation_policy: Literal["top_down"] = "top_down",
+    ) -> None:
+        """Move the TIP to ``(x, y, z[, r])`` mm/deg, base frame, tool pointing down.
+
+        ``top_down`` is the only policy this body offers, and the ``Literal`` says so, so a
+        planner reads the restriction off the tool schema instead of discovering it in motion.
+        Note what "down" means HERE: ``_TOOL_DOWN_RY = 30``, because real-machine calibration
+        found vertical unreachable at grasp height. The label is shared; the number is the
+        body's.
+
+        Adding ``preserve`` needs the general tip↔flange transform first — the conversion below
+        projects the offset with a single ``ry`` term, which is only valid because ``rx``/``ry``
+        are the calibrated constants. A live tilt needs the full rotation matrix.
+        """
+        if orientation_policy != "top_down":
+            raise ValueError(
+                f"PiperApi.goto_xyzr: this body only offers orientation_policy='top_down', got "
+                f"{orientation_policy!r}."
+            )
         if r is None:
             r = self.env.get_flange_pose().rz
         # Tilted tool (ry=_TOOL_DOWN_RY): the tip sits tool_offset_mm along the tool
@@ -216,26 +217,18 @@ class PiperApi(BaseRobotApi):
             }
         )
 
-    # The FLANGE-frame twin of get_flange_pose, and body-only for the same reason: "where the
-    # flange is" depends on how long this robot's tool happens to be, so a plan written against
-    # it does not survive being moved. Task code wants the TIP — goto_pose / goto_xyzr. This one
-    # is for bring-up, calibration and tool changes, where the flange IS the thing you mean.
-    # Not in the shared vocabulary, so the planner never sees it; SafetyRail still does.
-    @robot_tool(
-        desc="Move the FLANGE to an absolute pose (diagnostic/calibration; prefer goto_pose for task code).",
-        capability="motion.cartesian",
-        tags=["motion"],
-    )
-    def goto_flange_pose(self, pose: FlangePose) -> None:
-        if isinstance(pose, dict):
-            pose = _flange_pose_from_dict(pose)
-        logger.info("[PiperApi] goto_flange_pose -> %s", pose.as_tuple())
-        self.env.move_to_flange(pose)
+    # No flange-frame read/write here. "Where the flange is" depends on how long this
+    # robot's tool happens to be, so it was never an action — task code wants the TIP
+    # (get_pose / goto_pose / goto_xyzr). Bring-up, calibration and tool changes, where
+    # the flange IS the thing you mean, go through the Env verbs directly:
+    # ``env.get_flange_pose()`` / ``env.move_to_flange(FlangePose(...))``. Those skip
+    # SafetyRail, so the driver's own ``flange_z_min_safe`` is what holds the floor —
+    # which is where a calibration move should be checked anyway.
 
     # ============================================================  Joint
     @implements(MOVE_JOINT)
-    def move_joint(self, q: list[float]) -> None:
-        return defaults.move_joint(self, q)
+    def move_joint(self, targets: dict[str, float]) -> Any:
+        return defaults.move_joint(self, targets)
 
     # ============================================================  Gripper
     # v1 is two-state: the configured width/effort is used and width_mm / force_n are

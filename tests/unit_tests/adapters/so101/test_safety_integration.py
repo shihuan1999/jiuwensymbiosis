@@ -113,10 +113,10 @@ class TestSafetyRailMoveJointSoftLimits:
     async def test_in_limits_passes(self):
         session = _make_session()
         rail = SafetyRail(session, z_floor_mm=50.0)
-        # 5 joints, all within ARM_JOINT_ORDER limits.
+        # Named joints, all within ARM_JOINT_ORDER limits.
         ctx = FakeCtx(
             tool_name="move_joint",
-            tool_args={"q": [0.0, 0.0, 0.0, 0.0, 0.0]},
+            tool_args={"targets": {"shoulder_pan": 0.0, "elbow_flex": 0.0}},
         )
         await rail.before_tool_call(ctx)
 

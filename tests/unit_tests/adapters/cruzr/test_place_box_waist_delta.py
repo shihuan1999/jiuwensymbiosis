@@ -11,6 +11,7 @@ import pytest
 from jiuwensymbiosis.adapters.cruzr.api import CruzrApi, _rotate_arm_target
 from jiuwensymbiosis.adapters.cruzr.geometry import ArmTarget, plan_clamp_targets
 from jiuwensymbiosis.perception.object_geometry import ObjectGeometry3D
+from tests.unit_tests.adapters.cruzr import description
 
 _LIFTER0 = {"lifter_pitch_1_joint": 0.0, "lifter_pitch_2_joint": 0.0, "lifter_pitch_3_joint": 0.0}
 
@@ -30,9 +31,8 @@ def test_rotate_arm_target_rotates_pos_and_dirs():
 
 
 def _api_with_real_cfg():
-    from jiuwensymbiosis.adapters.cruzr.config import CruzrConfig
 
-    cfg = CruzrConfig()
+    cfg = description.config()
     if not Path(cfg.urdf_path).exists():
         pytest.skip("urdf not present")
     env = SimpleNamespace(cfg=cfg, low_level=None)
