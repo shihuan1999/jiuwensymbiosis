@@ -16,6 +16,7 @@ from jiuwensymbiosis.api.actions import (
     ActionSpec,
     ContractViolation,
     UnknownCapability,
+    _register,
     implements,
     planner_vocabulary,
 )
@@ -101,15 +102,21 @@ class TestSpecValidation:
         with pytest.raises(ValueError):
             ActionSpec(name="x", description="d", params=("a",), required_params=("b",))
 
-    def test_sensing_without_a_result_shape_is_rejected(self):
+    def test_sensing_without_a_result_shape_cannot_enter_the_vocabulary(self):
+        # Checked on registration, not construction: a one-off spec declared inline next
+        # to its single implementation is nobody else's contract to read.
         with pytest.raises(ValueError, match="produces a location"):
-            ActionSpec(name="x", description="d", produces_location=True)
+            _register(ActionSpec(name="x", description="d", params=(), produces_location=True))
 
     def test_a_shapeless_result_type_is_rejected_too(self):
         # ``dict`` is not None but yields no fields — the loophole that let
         # pixel_to_base_xyz claim a location it could not be read from.
         with pytest.raises(ValueError, match="no readable result shape"):
-            ActionSpec(name="x", description="d", produces_location=True, result=dict)
+            _register(ActionSpec(name="x", description="d", params=(), produces_location=True, result=dict))
+
+    def test_a_vocabulary_entry_must_state_its_params(self):
+        with pytest.raises(ValueError, match="does not state its params"):
+            _register(ActionSpec(name="x", description="d"))
 
 
 class TestImplements:
@@ -128,7 +135,7 @@ class TestImplements:
             @implements(self.SPEC)
             def _demo_action(self, a: float, b: int = 0) -> dict: ...
 
-        meta = Body._demo_action.__robot_tool__
+        meta = Body._demo_action.__tool_meta__
         assert meta.name == "_demo_action"
         assert meta.capability == "motion.base"
         assert meta.description == "demo"
@@ -149,7 +156,7 @@ class TestImplements:
             @implements(self.SPEC)
             def _demo_action(self, **kw) -> dict: ...
 
-        assert Body._demo_action.__robot_tool__.name == "_demo_action"
+        assert Body._demo_action.__tool_meta__.name == "_demo_action"
 
     def test_body_extras_are_not_advertised(self):
         """A param only this body has stays callable but unadvertised.
@@ -161,7 +168,7 @@ class TestImplements:
             @implements(self.SPEC)
             def _demo_action(self, a: float, b: int = 0, vendor_knob: float = 1.0) -> dict: ...
 
-        props = Body._demo_action.__robot_tool__.input_params["properties"]
+        props = Body._demo_action.__tool_meta__.input_params["properties"]
         assert set(props) == {"a", "b"}
         assert "vendor_knob" in inspect.signature(Body._demo_action).parameters
 
@@ -177,7 +184,7 @@ class TestImplements:
             @implements(self.SPEC)
             def _demo_action(self, a: float, b: int = 0) -> dict: ...
 
-        meta = Body._demo_action.__robot_tool__
+        meta = Body._demo_action.__tool_meta__
         assert meta.description == "demo"
         assert meta.full_description() == "demo"
 
@@ -209,6 +216,43 @@ class TestPlannerVocabulary:
         assert SEARCH_TARGET.produces_location is False
         assert SEARCH_TARGET.invalidates_locations is False   # reading a frame moves nothing
         assert "bearing_rad" in schema_from_typeddict(SEARCH_TARGET.result)["properties"]
+
+
+# Capabilities whose actions can change where the base STANDS. Module level, not a class
+# attribute: a comprehension in a class body cannot see the class namespace.
+# Deliberately excludes motion.waist / motion.lift — they move the arms relative to the
+# base, not the base, so a base-frame coordinate survives them.
+_MOVES_THE_BASE = frozenset({"motion.base", "motion.base_servo", "motion.goal"})
+
+
+class TestMovingTheBaseStalesSensing:
+    """A base-frame coordinate only means anything from the standpoint it was measured at.
+
+    An action that can drive the base must SAY so, because that one declaration is what
+    every layer keys off: ``parse_sequence`` at plan time, ``runner._location_drift`` at
+    run time, and ``BaseRobotApi.invalidate_sensing_cache`` for the api's own sensing
+    cache. An action that drives without declaring it hands the next grasp coordinates
+    measured somewhere else — and nothing anywhere would notice.
+    """
+
+    @pytest.mark.parametrize(
+        "spec", [s for s in ACTIONS.values() if s.capability in _MOVES_THE_BASE], ids=lambda s: s.name
+    )
+    def test_a_base_moving_action_stales_earlier_sensing(self, spec):
+        assert spec.invalidates_locations, (
+            f"{spec.name} is gated on {spec.capability}, so it can move where the base stands, "
+            f"but it does not stale earlier sensing. Set invalidates_locations=True."
+        )
+
+    def test_the_gate_still_names_real_capabilities(self):
+        # The check above is vacuous if a capability gets renamed out from under it.
+        assert _MOVES_THE_BASE <= KNOWN_CAPABILITIES
+        assert [s for s in ACTIONS.values() if s.capability in _MOVES_THE_BASE]
+
+    # NOT asserted here: that only these capabilities invalidate. `home` is ungated
+    # (capability=None) and a body whose home drives back to a dock WOULD move the base —
+    # so the reverse direction is a judgement about one body, not a property of the
+    # vocabulary. If such a body arrives, that is the moment to split HOME.
 
 
 class TestGraspPlaceLanesAreSymmetric:
@@ -243,3 +287,67 @@ class TestGraspPlaceLanesAreSymmetric:
             stem, _, side = name.rpartition("_for_")
             twin = f"{stem}_for_{'place' if side == 'grasp' else 'grasp'}"
             assert twin in ACTIONS[name].description, f"{name} never mentions {twin}"
+
+
+class TestGotoXyzrOrientationIsBodyDeclared:
+    """``goto_xyzr`` used to promise "the tool points down" in the shared description while
+    so101 resolved orientation from its own config (default ``preserve``, i.e. whatever tilt
+    the arm was already in) and piper commanded a calibrated 30-degree tilt. The promise was
+    prose, so nothing checked it, and a planner could not see or set the real policy. These
+    tests keep the contract honest."""
+
+    def test_the_shared_description_promises_no_orientation(self):
+        from jiuwensymbiosis.api.actions import GOTO_XYZR
+
+        assert "orientation_policy" in GOTO_XYZR.description
+        assert "the tool points down" not in GOTO_XYZR.description
+
+    def test_orientation_policy_is_a_contract_param_so_every_body_must_accept_it(self):
+        from jiuwensymbiosis.api.actions import GOTO_XYZR
+
+        assert "orientation_policy" in (GOTO_XYZR.params or ())
+        assert "orientation_policy" not in GOTO_XYZR.required_params
+
+    def test_each_body_advertises_its_own_values_not_a_shared_union(self):
+        """The enum comes from the body's own ``Literal``, so the planner reads THIS robot.
+        Pinning the exact lists would freeze today's capability — piper is expected to widen
+        beyond top_down — so what is asserted is the invariant: every body advertises a
+        non-empty enum, and the bodies are allowed to differ."""
+        from jiuwensymbiosis.adapters.piper.api import PiperApi
+        from jiuwensymbiosis.adapters.so101.api import So101Api
+
+        def enum_of(cls):
+            return cls.goto_xyzr.__tool_meta__.input_params["properties"]["orientation_policy"]["enum"]
+
+        known = {"preserve", "top_down", "grasp"}
+        for cls in (PiperApi, So101Api):
+            values = enum_of(cls)
+            assert values, f"{cls.__name__} advertises no orientation_policy at all"
+            assert set(values) <= known, f"{cls.__name__} invents a policy outside the shared set"
+        assert enum_of(PiperApi) != enum_of(So101Api), "a shared union would defeat the point"
+
+    def test_a_body_default_is_one_of_the_values_it_advertises(self):
+        """Otherwise omitting the parameter would do something the planner was never offered."""
+        import importlib
+
+        from jiuwensymbiosis.adapters.piper.api import PiperApi
+        from jiuwensymbiosis.adapters.so101.api import So101Api
+
+        for name, cls in (("piper", PiperApi), ("so101", So101Api)):
+            session = getattr(
+                importlib.import_module(f"jiuwensymbiosis.adapters.{name}"), f"build_{name}_session"
+            ).from_yaml(f"configs/{name}/{name}.yaml")
+            values = cls.goto_xyzr.__tool_meta__.input_params["properties"]["orientation_policy"]["enum"]
+            assert session.env.default_orientation_policy in values, name
+
+    def test_a_body_refuses_a_value_outside_its_own_enum(self):
+        """Refused by NOT being in this body's enum — not by being any particular word, so
+        widening piper to accept 'preserve' later leaves this test measuring the same thing."""
+        from types import SimpleNamespace
+
+        from jiuwensymbiosis.adapters.piper.api import PiperApi
+
+        api = PiperApi.__new__(PiperApi)
+        api.env = SimpleNamespace()
+        with pytest.raises(ValueError):
+            api.goto_xyzr(200.0, 0.0, 250.0, orientation_policy="not_a_policy")

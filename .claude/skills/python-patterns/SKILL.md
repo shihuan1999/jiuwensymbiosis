@@ -40,7 +40,7 @@ updated = replace(original, description="new desc")
 > jiuwensymbiosis config dataclasses (`<Feature>Config`) are intentionally
 > mutable because `from_yaml()` and runtime overrides set fields. Do not
 > force `frozen=True` onto existing config classes without auditing call
-> sites — the `@robot_tool` decorator and `build_robot_tools` rely on
+> sites — `@implements` and `build_robot_tools` rely on
 > reading config fields, not mutating them, so freezing is safe for *new*
 > pure-data types but verify per case.
 
@@ -190,9 +190,11 @@ async def stream_steps(agent):
 
 ## Decorators
 
-`@robot_tool` is the project's central decorator — it annotates methods
-with `ToolMeta` and lets `build_robot_tools` discover them via MRO. When
-writing your own cross-cutting decorators:
+`@implements(SPEC)` is the project's one action decorator — it pins a
+`ToolMeta` (the shared `ActionSpec` plus this body's call schema) to a
+method, and `build_robot_tools` discovers those via MRO. There is no
+second decorator for a body-specific tool; a method with no `ActionSpec`
+is not a tool. When writing your own cross-cutting decorators:
 
 ```python
 import functools
@@ -219,7 +221,7 @@ Follow the existing layout under `jiuwensymbiosis/`:
 jiuwensymbiosis/
   __init__.py              # Public API exports only
   agent/                   # RobotSession, build_robot_agent, RobotAgentConfig
-  api/                     # BaseRobotApi, @robot_tool, capability mixins
+  api/                     # BaseRobotApi, ActionSpec vocabulary, @implements, defaults, components
   env/                     # BaseRobotEnv, MockArmEnv, KNOWN_CAPABILITIES
   tools/                   # build_robot_tools, RobotControlTool, InProcessCodeTool
   rails/                   # SafetyRail, RecoveryRail, VisualFeedbackRail

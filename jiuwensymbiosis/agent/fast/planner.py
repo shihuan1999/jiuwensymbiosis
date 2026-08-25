@@ -34,7 +34,7 @@ from typing import Any, cast
 
 from jiuwensymbiosis.agent.cancel import CancelToken, RunCancelled, cancellable_call
 from jiuwensymbiosis.agent.fast.sequence import SequenceError, parse_sequence, qualifiers_for
-from jiuwensymbiosis.perception.scene3d import SPATIAL_RELATIONS
+from jiuwensymbiosis.contracts import SPATIAL_RELATIONS
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +73,7 @@ def format_action_contracts(action_index: Mapping[str, Any]) -> str:
 
     lines: list[str] = []
     for name in sorted(action_index):
-        meta = getattr(action_index[name], "__robot_tool__", None)
+        meta = getattr(action_index[name], "__tool_meta__", None)
         if not isinstance(meta, ToolMeta):
             lines.append(f"- {name}()")
             continue
@@ -878,7 +878,7 @@ def compile_sequence(
     Args:
         query: the user's natural-language task.
         skills_md: candidate skills as ``[{"name", "markdown"}]`` (full SKILL.md).
-        action_vocab: op names the robot exposes (the @robot_tool index keys).
+        action_vocab: op names the robot exposes (the @implements index keys).
         allowed_ops: collection used to validate the result via ``parse_sequence``.
         action_index: name → bound method; when given, 【可用动作】 shows each action's
             full contract instead of only its param names.

@@ -17,8 +17,9 @@ from jiuwensymbiosis.agent.fast import DEFAULT_REGISTRY
 from jiuwensymbiosis.agent.fast.planner import _filter_skills_md_by_capability
 
 _GRIPPER = ["motion.cartesian", "grasp.parallel", "vision.detection"]
-_DUAL_MOBILE = ["grasp.dual_arm", "motion.base", "motion.waist", "motion.lift", "vision.detection"]
-_DUAL_FIXED = ["grasp.dual_arm", "vision.detection", "vision.depth"]
+_DUAL_MOBILE = ["motion.dual_arm", "grasp.paddle", "motion.base", "motion.waist", "motion.lift",
+                "vision.detection"]
+_DUAL_FIXED = ["motion.dual_arm", "grasp.paddle", "vision.detection", "vision.depth"]
 
 _GRIPPER_ACTIONS = ("goto_xyzr", "open_gripper", "close_gripper", "get_grasp_info_simple")
 _DUAL_ACTIONS = ("dual_arm_grasp", "dual_arm_place")
@@ -65,5 +66,5 @@ def test_fixed_dual_arm_has_no_mobile_base_steps():
 def test_skills_declare_both_branches():
     for name in ("visual_pick", "visual_place"):
         md = (Path(sp.__file__).parent / name / "SKILL.md").read_text(encoding="utf-8")
-        assert "grasp.dual_arm" in md and "motion.cartesian" in md  # both end-effector branches
+        assert "motion.dual_arm" in md and "motion.cartesian" in md  # both topology branches
         assert "能力" in md

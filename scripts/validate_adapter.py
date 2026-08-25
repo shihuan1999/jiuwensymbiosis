@@ -34,18 +34,17 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
-# Single source of truth — import from the package so the validator and the
-# ``__init_subclass__`` gate in env/base.py can never drift out of sync.
-from jiuwensymbiosis.env.base import KNOWN_CAPABILITIES
-
 # Capability → contract maps, single-sourced in the package so the validator
 # (checker) and scripts/new_adapter (generator) share one definition.
 from jiuwensymbiosis.adapters._common.capability_spec import (
+    CAPABILITY_ACTIONS,
     CAPABILITY_DRIVER_MEMBERS,
     CAPABILITY_TRANSPORT_MEMBERS,
-    ACTIONS_WITH_GENERIC_DEFAULT,
-    CAPABILITY_ACTIONS,
 )
+
+# Single source of truth — import from the package so the validator and the
+# ``__init_subclass__`` gate in env/base.py can never drift out of sync.
+from jiuwensymbiosis.env.base import KNOWN_CAPABILITIES
 
 # Dedicated logger — configured in main() with a raw-message handler so the
 # report keeps its visual layout, while third-party INFO logs (e.g. openjiuwen)
@@ -451,7 +450,7 @@ def run_checks(module_str: str) -> list[CheckResult]:
             )
 
     # ====================================================================
-    # [A-13] @robot_tool capability 标签有效 ........ WARN
+    # [A-13] 动作 capability 标签有效 ........ WARN
     # ====================================================================
     if api_cls is not None and env_cls is not None:
         env_caps = set(getattr(env_cls, "capabilities", frozenset()))
@@ -460,7 +459,7 @@ def run_checks(module_str: str) -> list[CheckResult]:
             for tw in tagged_warnings:
                 results.append(("A-13", _SEVERITY_WARN, tw))
         else:
-            results.append(("A-13", _SEVERITY_INFO, "[OK] 所有 @robot_tool capability 标签有效"))
+            results.append(("A-13", _SEVERITY_INFO, "[OK] 所有动作 capability 标签有效"))
 
     # ====================================================================
     # [D-14] 驱动类满足 capability 对应的 Protocol 子集 ...... ERROR
@@ -572,13 +571,21 @@ def _find_transport_class(module_str: str) -> type | None:
     return None
 
 
-def _missing_members(cls: type, caps: set[str], contract: dict[str, list[str]]) -> list[str]:
-    """Members required by ``caps`` (via ``contract``) that ``cls`` does not expose."""
+def _missing_members(cls: type, caps: set[str], contract: dict[str, Any]) -> list[str]:
+    """Members required by ``caps`` (via ``contract``) that ``cls`` does not expose.
+
+    A tuple entry means "any ONE of these satisfies the capability" — see
+    ``CAPABILITY_DRIVER_MEMBERS`` for why ``motion.joint`` has two encodings.
+    """
     missing: list[str] = []
     for cap in sorted(caps):
         for member in contract.get(cap, []):
-            if not hasattr(cls, member) and member not in missing:
-                missing.append(member)
+            alternatives = member if isinstance(member, tuple) else (member,)
+            if any(hasattr(cls, name) for name in alternatives):
+                continue
+            label = " | ".join(alternatives)
+            if label not in missing:
+                missing.append(label)
     return missing
 
 
@@ -617,7 +624,7 @@ def _check_capability_actions(api_cls: type) -> list[tuple[str, str, str]]:
     """
     implemented: set[str] = set()
     for name in dir(api_cls):
-        meta = getattr(getattr(api_cls, name, None), "__robot_tool__", None)
+        meta = getattr(getattr(api_cls, name, None), "__tool_meta__", None)
         if meta is not None:
             implemented.add(meta.name)
     results: list[tuple[str, str, str]] = []
@@ -640,7 +647,7 @@ def _api_declared_capabilities(api_cls: type) -> set[str]:
         elif isinstance(cap, (set, frozenset, list, tuple)):
             caps.update(cap)
         for value in cls.__dict__.values():
-            meta = getattr(value, "__robot_tool__", None)
+            meta = getattr(value, "__tool_meta__", None)
             if meta is not None and meta.capability:
                 caps.add(meta.capability)
     return caps
@@ -656,20 +663,20 @@ def _api_declared_capabilities(api_cls: type) -> set[str]:
         elif isinstance(cap, (set, frozenset, list, tuple)):
             caps.update(cap)
         for value in cls.__dict__.values():
-            meta = getattr(value, "__robot_tool__", None)
+            meta = getattr(value, "__tool_meta__", None)
             if meta is not None and meta.capability:
                 caps.add(meta.capability)
     return caps
 
 
 def _check_tool_tags(api_cls: type, env_caps: set[str]) -> list[str]:
-    """Check @robot_tool methods' capability tags against env capabilities."""
+    """Check @implements methods' capability gates against env capabilities."""
     warnings = []
     for attr_name in dir(api_cls):
         obj = getattr(api_cls, attr_name, None)
         if obj is None:
             continue
-        meta = getattr(obj, "__robot_tool__", None)
+        meta = getattr(obj, "__tool_meta__", None)
         if meta is None:
             continue
         cap = getattr(meta, "capability", None)

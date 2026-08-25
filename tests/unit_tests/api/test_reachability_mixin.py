@@ -6,7 +6,7 @@ exposes no URDF, so a body can hold it without owning a URDF."""
 
 from types import SimpleNamespace
 
-from jiuwensymbiosis.api.components import Reachability
+from jiuwensymbiosis.api.reachability import Reachability
 
 
 def _Api(env):

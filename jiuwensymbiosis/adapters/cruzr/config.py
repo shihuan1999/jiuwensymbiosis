@@ -11,6 +11,7 @@ one place so the agent-facing API can stay semantic.
 from __future__ import annotations
 
 import dataclasses
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -72,7 +73,7 @@ class CruzrConfig:
     # ROS 2 environment. ``ros_workspace`` is informational for examples and
     # diagnostics; Python code expects the caller to source ROS setup files
     # before running when using real hardware.
-    ros_workspace: str = "/home/linyiqi/Cruzr_ws"
+    ros_workspace: str | None = None
     command_topic: str = "/mc/sdk/robot_command"
     state_topic: str = "/mc/sdk/robot_state"
     developer_mode_service: str = "/sys/task/developer_mode"
@@ -155,12 +156,14 @@ class CruzrConfig:
     camera_calib_path: Optional[str] = None
     base_frame: str = "base_link"
     camera_optical_frame: str = "waist_front_rgbd_color_optical_frame"
-    # Path to the Cruzr URDF used by the FK checker and future motion planning.
-    urdf_path: str = (
-        "/home/riemann/Robot/Cruzr_ws/cruzr_s2_description/cruzr_s2_description/urdf/cruzr_s2_v1/cruzr_s2_v1.urdf"
-    )
-    # Mesh package root so pinocchio+coal can resolve package:// collision meshes for self-collision checks.
-    urdf_package_dir: str = "/home/riemann/Robot/Cruzr_ws/cruzr_s2_description"
+    # Path to the Cruzr URDF used by the FK checker and motion planning, and the mesh package
+    # root pinocchio+coal resolve ``package://`` collision meshes against. Both default to
+    # None because the description is a ROS package outside this repo: no path is right on
+    # more than one machine, and a wrong one is worse than none — joint ranges and mesh
+    # lookups fail silently rather than loudly. Set them in the YAML; ``~`` and ``$VARS``
+    # are expanded, so ``~/Robot/Cruzr_ws/...`` travels between machines.
+    urdf_path: str | None = None
+    urdf_package_dir: str | None = None
     # End-effector link names for FK validation and grasp-frame construction.
     left_arm_leaf: str = "L_sixforce_link"
     right_arm_leaf: str = "R_sixforce_link"
@@ -438,6 +441,18 @@ class CruzrConfig:
     # Session metadata.
     name: str = "cruzr"
     task_prompt: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        """Expand ``~`` and ``$VARS`` in the paths that point outside this repo.
+
+        The robot description is a ROS package elsewhere on disk, so the YAML has to name an
+        absolute location. Expanding here is what lets one config file work on two machines
+        instead of hard-coding whoever committed it last.
+        """
+        for name in ("ros_workspace", "urdf_path", "urdf_package_dir"):
+            value = getattr(self, name)
+            if value:
+                setattr(self, name, str(Path(os.path.expandvars(value)).expanduser()))
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CruzrConfig":

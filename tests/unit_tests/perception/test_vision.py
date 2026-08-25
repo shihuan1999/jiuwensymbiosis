@@ -7,10 +7,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from jiuwensymbiosis.contracts import DETECTION_REASONS, GraspFailure, GraspResult
 from jiuwensymbiosis.perception.vision import (
-    DETECTION_REASONS,
-    GraspFailure,
-    GraspResult,
     _mask_centroid,
     _median_depth_window,
     apply_xy_correction,

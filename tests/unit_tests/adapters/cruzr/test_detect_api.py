@@ -52,10 +52,13 @@ def _api(env, *, calib_path=None):
     return api
 
 
-def test_detect_tool_is_exposed():
+def test_detect_is_a_debug_view_not_a_tool():
+    """``detect`` shows what the detector saw, for a human at a bring-up script. The
+    plannable answer is ``locate_for_grasp``, so it is deliberately not emitted."""
     api = _api(_env_with(_frames()))
     names = {m["name"] for m in list_tool_meta(api)}
-    assert "detect" in names
+    assert "detect" not in names
+    assert callable(api.detect)
 
 
 def test_detect_success_with_live_k_and_identity_extrinsic(tmp_path):
@@ -114,7 +117,6 @@ def test_detect_no_extrinsics_keeps_2d():
 def test_unimplemented_vision_stubs_not_exposed():
     api = _api(_env_with(_frames()))
     names = {m["name"] for m in list_tool_meta(api)}
-    assert "detect" in names
     assert "get_image" in names
     assert "pixel_to_base_xyz" in names
     assert "get_grasp_info_simple" not in names

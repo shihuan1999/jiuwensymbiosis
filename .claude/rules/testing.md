@@ -68,7 +68,7 @@ async def test_tool_emits_for_capability():
 ## Assertions and Coverage
 
 - Use descriptive assertion messages for non-obvious conditions.
-- New public API changes (new `@robot_tool`, new mixin method, new env
+- New public API changes (new `ActionSpec`, new `@implements` binding, new env
   property) require corresponding test updates.
 - When behavior changes are user-visible, update `examples/` and `docs/`
   alongside tests.
@@ -79,6 +79,6 @@ async def test_tool_emits_for_capability():
 - Run a single file: `pytest tests/unit_tests/tools/test_build_robot_tools.py`
 - Filter by name: `pytest -k "test_capabilities"`
 - Run the full suite (incl. integration, usually skipped): `pytest`
-- Adapter smoke test (runtime, every `@robot_tool`):
-  `python scripts/smoke_test_adapter.py`
+- Adapter smoke test (runtime, every action):
+  `python scripts/smoke_test_adapter.py --module jiuwensymbiosis.adapters.piper`
 - Adapter static check: `python scripts/validate_adapter.py --module jiuwensymbiosis.adapters.my_robot`

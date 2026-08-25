@@ -6,8 +6,8 @@
 Nothing here imports an adapter. The body declares its capabilities and supplies
 the three genuinely body-specific pieces — a calibrated frame, a detector, and the
 dual-arm/lifter actuation — then inherits everything else: 3-D scene sensing from
-``_Scene3DBody`` and the search sweep, face-normal squaring and approach
-convergence from ``_ApproachBody``. A plan written for one dual-arm body running
+the shared 3-D sensing and the search sweep, face-normal squaring and approach
+convergence from ``Approach``. A plan written for one dual-arm body running
 here unchanged is what makes those layers body-agnostic in fact, not just in
 intent.
 
@@ -33,18 +33,17 @@ from jiuwensymbiosis.api.actions import (
     APPROACH_FOR_PLACE,
     DUAL_ARM_GRASP,
     DUAL_ARM_PLACE,
+    LIFT_TO_CLEARANCE,
     LOCATE_FOR_GRASP,
     LOCATE_FOR_PLACE,
-    SEARCH_TARGET,
-    LIFT_TO_CLEARANCE,
     NAVIGATE_RELATIVE,
     ROTATE_BASE,
+    SEARCH_TARGET,
     SET_LIFT_POSE,
     TURN_WAIST,
     implements,
 )
 from jiuwensymbiosis.api.base import BaseRobotApi
-from jiuwensymbiosis.api.components import Approach, Scene3D
 from jiuwensymbiosis.env.base import BaseRobotEnv, RobotObservation
 from jiuwensymbiosis.perception.frame import CameraFrame
 from jiuwensymbiosis.utils.geometry import make_transform
@@ -98,7 +97,8 @@ class MockDualArmEnv(BaseRobotEnv):
             # Its one camera is bolted to the base — but the base turns, so it can look
             # around. Searching needs a view it can aim, not a second kind of sensor.
             "vision.search",
-            "grasp.dual_arm",
+            "motion.dual_arm",
+            "grasp.paddle",
         }
     )
     name = "mock_dual_arm"
@@ -264,44 +264,45 @@ class MockDualArmApi(BaseRobotApi):
     so a plan compiled for cruzr means the same thing here.
     """
 
+    # Marker: the end-effector axis, which no action advertises (see CruzrApi).
+    capability = {"grasp.paddle"}
+
     def __init__(self, env: MockDualArmEnv) -> None:
         super().__init__(env)
         self.env: MockDualArmEnv = env
         # Held, not inherited — this file is the complete list of what the body offers.
-        self._scene = Scene3D(self)
-        self._nav = Approach(self)
-        # Read by Scene3D's detector hook default — no override needed.
+        # Read by the shared detector hook default (perception/scene3d.py) — no override needed.
         self._seg_fn = env.segment
         self.calls: list[str] = []
 
     @implements(LOCATE_FOR_GRASP)
     def locate_for_grasp(self, object_name: str = "box", reference: str | None = None,
                          relation: str = "on") -> dict:
-        return self._scene.locate_for_grasp(object_name, reference, relation)
+        return defaults.locate_for_grasp(self, object_name, reference, relation)
 
     @implements(LOCATE_FOR_PLACE)
     def locate_for_place(self, object_name: str = "table", reference: str | None = None,
                          relation: str = "on") -> dict:
-        return self._scene.locate_for_place(object_name, reference, relation)
+        return defaults.locate_for_place(self, object_name, reference, relation)
 
     @implements(ANALYZE_SCENE)
     def analyze_scene(self, object_name: str = "box") -> dict:
-        return self._scene.analyze_scene(object_name)
+        return defaults.analyze_scene(self, object_name)
 
     @implements(SEARCH_TARGET)
     def search_target(self, object_name: str = "box", reference: str | None = None,
                       relation: str = "on") -> dict:
-        return self._nav.search_target(object_name, reference, relation)
+        return defaults.search_target(self, object_name, reference, relation)
 
     @implements(APPROACH_FOR_GRASP)
     def approach_for_grasp(self, object_name: str = "box", reference: str | None = None,
                            relation: str = "on") -> dict:
-        return self._nav.approach_for_grasp(object_name, reference, relation)
+        return defaults.approach_for_grasp(self, object_name, reference, relation)
 
     @implements(APPROACH_FOR_PLACE)
     def approach_for_place(self, object_name: str = "table", reference: str | None = None,
                            relation: str = "on") -> dict:
-        return self._nav.approach_for_place(object_name, reference, relation)
+        return defaults.approach_for_place(self, object_name, reference, relation)
 
     @implements(NAVIGATE_RELATIVE)
     def navigate_relative(self, dx_m: float, dy_m: float = 0.0, dyaw_rad: float = 0.0) -> dict:

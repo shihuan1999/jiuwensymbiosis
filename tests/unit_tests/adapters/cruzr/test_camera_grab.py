@@ -13,8 +13,8 @@ import numpy as np
 import pytest
 
 from jiuwensymbiosis.adapters.cruzr import lowlevel as camera_mod
-from jiuwensymbiosis.adapters.cruzr.lowlevel import CruzrCamera
 from jiuwensymbiosis.adapters.cruzr.config import CruzrConfig
+from jiuwensymbiosis.adapters.cruzr.lowlevel import CruzrCamera
 
 
 def _output_dir_from_cmd(cmd):
@@ -180,8 +180,8 @@ def test_cruzr_stereo_rectification_shape():
 
 
 def test_lowlevel_grab_frames_delegates_to_camera():
-    from jiuwensymbiosis.perception.frame import CameraFrame
     from jiuwensymbiosis.adapters.cruzr.lowlevel import CruzrLowLevel
+    from jiuwensymbiosis.perception.frame import CameraFrame
 
     ll = CruzrLowLevel.__new__(CruzrLowLevel)  # 跳过 __init__（不连 ROS）
     ll._camera_obj = None
@@ -239,7 +239,9 @@ def test_lowlevel_head_frame_falls_back_to_joint_fk(monkeypatch):
 
 def test_grab_parses_tf_base_cam(tmp_path, monkeypatch):
     import json
+
     import numpy as np
+
     from jiuwensymbiosis.adapters.cruzr import lowlevel as cam_mod
 
     out = tmp_path
@@ -318,8 +320,8 @@ def test_grab_head_builds_head_cmd_and_returns_rgb(monkeypatch):
 
 
 def test_lowlevel_grab_frames_head_passthrough():
-    from jiuwensymbiosis.perception.frame import CameraFrame
     from jiuwensymbiosis.adapters.cruzr.lowlevel import CruzrLowLevel
+    from jiuwensymbiosis.perception.frame import CameraFrame
 
     ll = CruzrLowLevel.__new__(CruzrLowLevel)
     ll._camera_obj = None

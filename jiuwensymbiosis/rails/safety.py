@@ -16,9 +16,10 @@ Currently checks:
 - ``motion.cartesian`` — Z floor: explicit ``z_floor_mm``, else the env's
   ``z_min_safe``; XY bounds: explicit ``xy_bounds_mm``, else the env's
   ``workspace_bounds`` (unless ``enforce_xy_from_env=False``).
-- ``motion.joint`` — joint soft limits on ``move_joint(q)``: explicit
-  ``joint_limits``, else the env's. Each rejected branch (missing q / wrong
-  type / wrong length / non-finite / out of range) gets its own message.
+- ``motion.joint`` — joint soft limits on ``move_joint(q)`` and on
+  ``move_named_joint(joint_name, position_rad)``: explicit ``joint_limits``, else the
+  env's. Each rejected branch (missing q / wrong type / wrong length / non-finite /
+  out of range) gets its own message.
 - ``motion.base`` — per-command translation / turn cap from the env's
   ``base_step_limits``, so a hallucinated "drive 50 m" never reaches the wheels.
 - ``motion.lift`` — lifter joint range from the env's ``lift_limits``.
@@ -39,6 +40,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+from collections.abc import Mapping
 from typing import Any, cast
 
 from jiuwensymbiosis.agent.abstractions import AgentRail
@@ -49,10 +51,10 @@ logger = logging.getLogger(__name__)
 # Capability → the tools whose policy that capability switches on. Adding a mobile
 # body means declaring its capabilities, not editing a tool-name list here.
 _CAPABILITY_WATCH_TOOLS: dict[str, frozenset[str]] = {
-    # goto_flange_pose is a body-only entry (it speaks the FLANGE frame, so it never enters the
-    # shared vocabulary) — but it drives the arm, so it is watched exactly like the others.
-    "motion.cartesian": frozenset({"goto_xyzr", "goto_pose", "goto_flange_pose"}),
-    "motion.joint": frozenset({"move_joint"}),
+    "motion.cartesian": frozenset({"goto_xyzr", "goto_pose"}),
+    # move_named_joint drives ONE joint to an absolute angle — the same hardware reach as
+    # move_joint, and the only way a plan can say "raise the arm", so it is checked too.
+    "motion.joint": frozenset({"move_joint", "move_named_joint"}),
     "motion.base": frozenset({"navigate_relative", "rotate_base", "drive_arc"}),
     "motion.lift": frozenset({"set_lift_pose"}),
     "motion.waist": frozenset({"turn_waist"}),
@@ -197,6 +199,9 @@ class SafetyRail(AgentRail):
 
         if tool_name == "move_joint":
             self._check_joint_limits(tool_name, args)
+            return
+        if tool_name == "move_named_joint":
+            self._check_named_joint(tool_name, args)
             return
         if tool_name in _BASE_TOOLS:
             self._check_base_step(tool_name, args)
@@ -427,47 +432,85 @@ class SafetyRail(AgentRail):
         return cast("dict[str, tuple[float, float]] | None", limits)
 
     def _check_joint_limits(self, tool_name: str, args: dict[str, Any]) -> None:
-        """Validate a ``move_joint(q)`` call before it reaches the env.
+        """Validate a ``move_joint(targets)`` call before it reaches the env.
 
-        Distinct error messages per failure so the LLM doesn't misread "length
-        mismatch" as "lower a joint angle".
+        ``targets`` maps joint NAME to absolute position, so this is the per-name range check
+        ``move_named_joint`` already ran, applied to every entry — one encoding, one check.
+        Distinct messages per failure so the LLM does not misread "unknown joint" as "angle
+        out of range". A joint the body states no limit for passes the range check, the same
+        "no range stated → no range check" rule the rest of this rail follows.
         """
-        q = args.get("q")
-        if q is None:
-            reason = "missing required joint vector q"
+        targets = args.get("targets")
+        if targets is None:
+            reason = "missing required joint targets"
             self._notify_reject(tool_name, reason)
             raise ValueError(f"SafetyRail: refusing {tool_name}: {reason}.")
-        if not isinstance(q, (list, tuple)):
-            reason = f"q must be a list or tuple, got {type(q).__name__}"
+        if not isinstance(targets, Mapping):
+            reason = f"targets must be a mapping of joint name to position, got {type(targets).__name__}"
             self._notify_reject(tool_name, reason)
             raise ValueError(f"SafetyRail: refusing {tool_name}: {reason}.")
-
-        limits = self._resolve_joint_limits()
-        names: list[str] = list(limits.keys()) if limits is not None else []
-        if limits is not None and len(q) != len(names):
-            reason = f"q has {len(q)} joints but limits has {len(names)}"
+        if not targets:
+            reason = "targets is empty — name at least one joint to move"
             self._notify_reject(tool_name, reason)
             raise ValueError(f"SafetyRail: refusing {tool_name}: {reason}.")
 
-        for i, raw in enumerate(q):
+        limits = self._resolve_joint_limits() or {}
+        for name, raw in targets.items():
+            if not isinstance(name, str) or not name:
+                reason = f"joint name must be a non-empty string, got {name!r}"
+                self._notify_reject(tool_name, reason)
+                raise ValueError(f"SafetyRail: refusing {tool_name}: {reason}.")
             try:
                 v = float(raw)
             except (TypeError, ValueError):
-                reason = f"{self._joint_label(names, i)} is not a number: {raw!r}"
+                reason = f"{name} is not a number: {raw!r}"
                 self._notify_reject(tool_name, reason)
                 raise ValueError(f"SafetyRail: refusing {tool_name}: {reason}.") from None
             if not math.isfinite(v):
-                label = self._joint_label(names, i)
-                reason = f"{label} is non-finite: {raw!r}"
+                reason = f"{name} is non-finite: {raw!r}"
                 self._notify_reject(tool_name, reason)
                 raise ValueError(f"SafetyRail: refusing {tool_name}: {reason}.")
-            if limits is not None:
-                lo, hi = limits[names[i]]
-                if not float(lo) <= v <= float(hi):
-                    label = self._joint_label(names, i)
-                    reason = f"{label}={v} out of limits [{float(lo)}, {float(hi)}]"
-                    self._notify_reject(tool_name, reason)
-                    raise ValueError(f"SafetyRail: refusing {tool_name}: {reason}.")
+            bounds = limits.get(name)
+            if bounds is None:
+                continue
+            lo, hi = bounds
+            if not float(lo) <= v <= float(hi):
+                reason = f"{name}={v} out of limits [{float(lo)}, {float(hi)}]"
+                self._notify_reject(tool_name, reason)
+                raise ValueError(f"SafetyRail: refusing {tool_name}: {reason}.")
+
+    def _check_named_joint(self, tool_name: str, args: dict[str, Any]) -> None:
+        """Validate a ``move_named_joint(joint_name, position_rad)`` call before dispatch.
+
+        A joint the body states no limit for is passed through, the same "no range stated →
+        no range check" rule the rest of this rail follows: inventing a limit the hardware
+        never declared would reject reachable poses.
+        """
+        name = args.get("joint_name")
+        if not isinstance(name, str) or not name:
+            reason = f"joint_name must be a non-empty string, got {name!r}"
+            self._notify_reject(tool_name, reason)
+            raise ValueError(f"SafetyRail: refusing {tool_name}: {reason}.")
+        try:
+            v = float(args.get("position_rad"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            reason = f"position_rad is not a number: {args.get('position_rad')!r}"
+            self._notify_reject(tool_name, reason)
+            raise ValueError(f"SafetyRail: refusing {tool_name}: {reason}.") from None
+        if not math.isfinite(v):
+            reason = f"{name} target is non-finite: {v!r}"
+            self._notify_reject(tool_name, reason)
+            raise ValueError(f"SafetyRail: refusing {tool_name}: {reason}.")
+
+        limits = self._resolve_joint_limits() or {}
+        bounds = limits.get(name)
+        if bounds is None:
+            return
+        lo, hi = bounds
+        if not float(lo) <= v <= float(hi):
+            reason = f"{name}={v} out of limits [{float(lo)}, {float(hi)}]"
+            self._notify_reject(tool_name, reason)
+            raise ValueError(f"SafetyRail: refusing {tool_name}: {reason}.")
 
     @staticmethod
     def _joint_label(names: list[str], i: int) -> str:

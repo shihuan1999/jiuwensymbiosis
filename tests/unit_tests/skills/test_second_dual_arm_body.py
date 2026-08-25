@@ -24,6 +24,7 @@ from jiuwensymbiosis.agent.fast import DEFAULT_REGISTRY, planner
 from jiuwensymbiosis.agent.fast.planner import _filter_skills_md_by_capability
 from jiuwensymbiosis.agent.fast.runner import run_sequence
 from jiuwensymbiosis.agent.fast.sequence import parse_sequence
+from jiuwensymbiosis.motion import approach
 from jiuwensymbiosis.tools.robot_control_tool import _build_action_index
 from tests.mocks import mock_dual_arm
 from tests.mocks.mock_dual_arm import MockDualArmSession, WorldBox
@@ -162,7 +163,7 @@ def test_a_body_with_no_aimable_camera_searches_by_turning_itself():
 
     assert s.api.locate_for_grasp("crate")["ok"] is False   # nothing in the current view
 
-    out = s.api._nav.sweep_for_bearing("crate")
+    out = approach._sweep_for_bearing(s.api, "crate")
 
     assert out["found"] is True
     assert out["exhaustive"] is True                        # the whole circle was covered
@@ -174,7 +175,7 @@ def test_a_sweep_that_covered_the_circle_is_not_asked_to_turn_round_again():
     """``face_by_sweep`` adds a 180° re-scan for bodies whose look-around only covers their
     own facing. A body that already swept the full circle must not pay for it twice."""
     s = MockDualArmSession([WorldBox("crate", (1400.0, 0.0, 300.0), (400.0, 500.0, 600.0))])
-    out = s.api._nav.sweep_for_bearing("nothing_like_this")
+    out = approach._sweep_for_bearing(s.api, "nothing_like_this")
 
     assert out["found"] is False
     assert out["exhaustive"] is True
@@ -194,7 +195,7 @@ def test_finding_the_target_ends_the_search_and_hands_over_a_measurement():
     s = MockDualArmSession([behind])
 
     out = approach.face_by_sweep(
-        s.api._nav, s.api.locate_for_grasp, "crate",
+        s.api, s.api.locate_for_grasp, "crate",
         result_key="detection", not_found_reason="object_not_found",
     )
 

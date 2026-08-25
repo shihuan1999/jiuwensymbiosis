@@ -4,8 +4,9 @@ from pathlib import Path
 import pytest
 
 from jiuwensymbiosis.kinematics.urdf_chain import parse_chain
+from tests.unit_tests.adapters.cruzr import description
 
-URDF = "/home/riemann/Robot/Cruzr_ws/cruzr_s2_description/cruzr_s2_description/urdf/cruzr_s2_v1/cruzr_s2_v1.urdf"
+URDF = description.URDF
 
 
 @pytest.mark.skipif(not Path(URDF).exists(), reason="urdf not present")
@@ -40,11 +41,12 @@ def test_fixed_joint_origin_preserved():
 
 def test_parse_chain_records_urdf_path_and_leaf():
     from pathlib import Path
+
     import pytest
-    from jiuwensymbiosis.adapters.cruzr.config import CruzrConfig
+
     from jiuwensymbiosis.kinematics.urdf_chain import parse_chain
 
-    cfg = CruzrConfig()
+    cfg = description.config()
     if not Path(cfg.urdf_path).exists():
         pytest.skip("urdf not present")
     chain = parse_chain(cfg.urdf_path, "base_link", cfg.left_arm_leaf)

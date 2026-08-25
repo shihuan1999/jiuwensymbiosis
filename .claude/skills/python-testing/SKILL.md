@@ -213,8 +213,8 @@ Two scripts complement unit tests when working on adapters:
 # Static: every adapter exposes the expected 6 files + symbols
 python scripts/validate_adapter.py --module jiuwensymbiosis.adapters.piper
 
-# Runtime: every @robot_tool is callable + JSON-serializable, using MockEnv
-python scripts/smoke_test_adapter.py
+# Runtime: every @implements action is callable + JSON-serializable, on a stub driver
+python scripts/smoke_test_adapter.py --module jiuwensymbiosis.adapters.piper
 ```
 
 Run both before claiming an adapter change is done.

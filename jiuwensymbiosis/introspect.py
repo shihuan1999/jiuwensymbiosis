@@ -76,7 +76,7 @@ def action_contracts(session: Any) -> list[dict[str, Any]]:
     index = _build_action_index(session.api, env=session.env)
     out = []
     for name in sorted(index):
-        meta = getattr(index[name], "__robot_tool__", None)
+        meta = getattr(index[name], "__tool_meta__", None)
         if isinstance(meta, ToolMeta):
             out.append(_contract(meta))
     return out

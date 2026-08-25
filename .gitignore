@@ -1,5 +1,7 @@
 **__pycache__**
-**_cache**
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 *.pyc
 logs/
 *.local.yaml

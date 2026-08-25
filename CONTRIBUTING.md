@@ -191,7 +191,7 @@ git push origin feat/<short-description>
 - 选型：碰 serial/CAN/socket / 真相机 / 检测子进程 → integration；单函数 / 组件（`api/components.py`）/ rail 隔离 → unit（用 `MockEnv` / `MockApi`）；改 capability gating 或 tool emission → 在 `tests/unit_tests/api/` 与 `tests/unit_tests/tools/` 补测。
 - `pytest` + `asyncio_mode = "auto"`（无需 `@pytest.mark.asyncio` 模板）；`pytest-mock` 可用，优先 `mocker` fixture；测试类命名 `Test<Feature>`。
 - 凭据：库代码无真实凭据面，保持如此；测试 LLM 用离线 mock 模型（`build_mock_model()`，来自 `jiuwensymbiosis.agent.mock_model`），通过 `RobotAgentConfig(model=build_mock_model())` 传入 `build_robot_agent`，禁硬编码真实硬件端点。
-- 新公共 API（新 `@robot_tool` / `@implements` 绑定 / env 属性）需对应测试更新；用户可见行为变更需同步更新 `examples/` 与 `docs/`。
+- 新公共 API（新 `ActionSpec` / `@implements` 绑定 / env 属性）需对应测试更新；用户可见行为变更需同步更新 `examples/` 与 `docs/`。
 
 运行（用 Makefile 目标，默认走 conda 环境 `jiuwensymbiosis`）：
 
@@ -204,7 +204,7 @@ pytest tests/unit_tests/tools/test_build_robot_tools.py  # 单文件
 pytest -k "test_capabilities"                            # 按名过滤
 
 # adapter 相关（脚本，非 make 目标）
-python scripts/smoke_test_adapter.py                                          # adapter 运行时冒烟
+python scripts/smoke_test_adapter.py --module jiuwensymbiosis.adapters.piper  # adapter 运行时冒烟
 python scripts/validate_adapter.py --module jiuwensymbiosis.adapters.<name>   # adapter 静态检查
 ```
 
@@ -244,7 +244,7 @@ make test-all
 
 # 5.（按需）adapter 改动 → 脚本冒烟（非 make 目标）
 python scripts/validate_adapter.py --module jiuwensymbiosis.adapters.<name>
-python scripts/smoke_test_adapter.py
+python scripts/smoke_test_adapter.py --module jiuwensymbiosis.adapters.piper
 python examples/run_task.py --config configs/piper/piper.yaml --mock \
   --max-iter 1 --no-visual-feedback --workspace /tmp/jiuwensymbiosis-smoke \
   --query "把黑色盒子放到白色盒子上面"  # Agent 接线冒烟（--mock 仅 piper：MockArmEnv + 离线模型）
@@ -278,7 +278,7 @@ git push origin <branch>
 
 提交前自检：是否需要同步文档？
 
-- **用户可见行为变更**（新 `@robot_tool`、新 `@implements` 绑定、新 env 属性、capability 增减、CLI/配置项变化）→ 同步更新 `examples/`、`docs/`，并视情况更新 `AGENTS.md` 与 `CLAUDE.md` 的相关章节。
+- **用户可见行为变更**（新 `ActionSpec`、新 `@implements` 绑定、新 env 属性、capability 增减、CLI/配置项变化）→ 同步更新 `examples/`、`docs/`，并视情况更新 `AGENTS.md` 与 `CLAUDE.md` 的相关章节。
 - **新 adapter** → 更新 `AGENTS.md` "Source Tree Layout"，并同步更新 `docs/zh/tutorial/02-build-first-adapter.md` 及相关 How-to/Reference。
 - **新安全/物理安全相关** → 复核 `.claude/rules/security.md` 与 `skills/security-review` 是否需要补充。
 - 深参考手册从 [`docs/README.md`](docs/README.md) 进入，按 Tutorial、How-to、Reference、Explanation 分类查读。

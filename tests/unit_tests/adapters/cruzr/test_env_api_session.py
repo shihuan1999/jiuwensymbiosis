@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from jiuwensymbiosis.adapters.cruzr.api import CruzrApi
 from jiuwensymbiosis.adapters.cruzr.config import CruzrConfig
 from jiuwensymbiosis.adapters.cruzr.env import CruzrEnv
@@ -25,8 +27,8 @@ class _FakeLowLevel:
         self.calls.append(("home", kwargs))
         return {"ok": True, **kwargs}
 
-    def move_joint_blocking(self, *args, **kwargs):
-        self.calls.append(("move_joint_blocking", args, kwargs))
+    def move_joints_blocking(self, *args, **kwargs):
+        self.calls.append(("move_joints_blocking", args, kwargs))
         return {"ok": True}
 
     def get_joint_positions(self):
@@ -54,33 +56,40 @@ class TestCruzrEnv:
         obs = env.get_observation()
         assert obs.extra["joint_positions"]["L_shoulder_pitch_joint"] == 0.0
 
+    def test_home_refuses_instead_of_calling_the_bring_up_primitive(self):
+        # driver.home(arm=...) moves ONE shoulder-pitch joint — answering the safe-posture
+        # contract with it would sweep the arms across a leaned-forward torso.
+        env = _connected_env()
+        with pytest.raises(NotImplementedError, match="CruzrApi.home"):
+            env.home()
+        assert env.low_level.calls == []
+
 
 class TestCruzrApi:
     def test_tool_methods_are_exposed(self):
         api = CruzrApi(_connected_env())
         names = {m["name"] for m in list_tool_meta(api)}
-        assert "raise_left_arm" in names
-        assert "raise_right_arm" in names
-        assert "lower_left_arm" in names
-        assert "lower_right_arm" in names
-        assert "raise_arm" in names
-        # 不再暴露 move_joint：共享动作指整组关节向量，而本体驱动只接受单个肩关节值。
-        # 单关节需求由 move_named_joint 承担（说清楚它做什么）。
-        assert "move_joint" not in names
+        # move_joint 现在按「关节名 -> 位置」寻址，省略的关节保持不动——这对一台
+        # 双臂 + 腰 + 升降、没有规范下标序的本体是有意义的，所以它也实现这条共享动作。
+        # 词表不再为了迁就本体而分叉成两个名字（见 tests/unit_tests/test_vocabulary_forks.py）。
+        assert "move_joint" in names
         assert "move_named_joint" in names
 
-    def test_raise_left_arm_dispatches_to_lowlevel(self):
-        env = _connected_env()
-        api = CruzrApi(env)
-        result = api.raise_left_arm()
-        assert result["ok"] is True
-        assert env.low_level.calls[0] == ("raise_arm_blocking", {"arm": "left", "return_home": True})
+    def test_raising_an_arm_is_move_named_joint_not_a_cruzr_only_tool(self):
+        """"抬左臂"就是把一个具名关节开到某个角度——共享词表已经能说这件事，
+        本体专有工具说的是同一件事，却只在这台机器人上成立。"""
+        names = {m["name"] for m in list_tool_meta(CruzrApi(_connected_env()))}
+        assert not {"raise_left_arm", "raise_right_arm", "lower_left_arm", "lower_right_arm", "raise_arm"} & names
 
     def test_move_named_joint_dispatches(self):
+        """Through ``move_joints_blocking``: it is the encoding this body speaks, and the only
+        one that can carry ``ramp_duration_s``. The old union-typed ``move_joint_blocking``
+        silently mapped a bare 1-element list onto the default arm's shoulder — exactly the
+        drift the shared vocabulary exists to prevent — and is gone."""
         env = _connected_env()
         api = CruzrApi(env)
         api.move_named_joint("L_shoulder_pitch_joint", 0.5)
-        assert env.low_level.calls[0][0] == "move_joint_blocking"
+        assert env.low_level.calls[0][0] == "move_joints_blocking"
         assert env.low_level.calls[0][1][0] == {"L_shoulder_pitch_joint": 0.5}
 
 
@@ -100,10 +109,10 @@ class TestCruzrVisionWiring:
         assert "vision.camera" in env.capabilities
         assert "vision.depth" in env.capabilities
 
-    def test_detect_tool_exposed_via_session(self):
+    def test_vision_actions_exposed_via_session(self):
         session = build_cruzr_session.from_dict({"name": "cruzr_vis"})
         names = {m["name"] for m in list_tool_meta(session.api)}
-        assert "detect" in names
+        assert "locate_for_grasp" in names
 
     def test_api_gets_calib_path_from_cfg(self):
         session = build_cruzr_session.from_dict({"camera_calib_path": "/tmp/c.json"})

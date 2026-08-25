@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import pytest
 
-from jiuwensymbiosis.perception.scene3d import SPATIAL_RELATIONS, extent_of, relation_holds
+from jiuwensymbiosis.contracts import SPATIAL_RELATIONS
+from jiuwensymbiosis.perception.scene3d import extent_of, relation_holds
 
 # One table, and on it a hat with a box right next to it (mm, base frame).
 TABLE = {

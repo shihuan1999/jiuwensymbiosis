@@ -12,23 +12,11 @@ driver returns a ``CameraFrame`` and reuses ``project_to_base``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, TypedDict
+from typing import Optional
 
 import numpy as np
 
 from jiuwensymbiosis.utils.geometry import apply_transform, pixel_and_depth_to_camera_xyz
-
-
-class BasePoint(TypedDict):
-    """A single base-frame point in millimetres — what a pixel reprojection returns.
-
-    Declared next to :func:`project_to_base` (same rule as ``perception/scene3d.py``)
-    so the shape a planner is promised and the dict actually built cannot drift.
-    """
-
-    x: float
-    y: float
-    z: float
 
 
 def project_to_base(

@@ -7,9 +7,10 @@ All checks shell out with ``PYTHONPATH=<repo_root>`` and ``cwd=<repo_root>`` so
 they always exercise *this* repo (robust even when the editable install points
 elsewhere) and see the freshly written adapter package.
 
-``run_smoke`` connects the (mock) env first, then calls ``smoke_test_api`` — the
-plain ``smoke_test_adapter`` CLI deliberately does NOT connect (real hardware
-would block), so an offline mock adapter only goes green once connected.
+``run_smoke`` connects the (mock) env first, then calls ``smoke_test_api``. The
+plain ``smoke_test_adapter`` CLI cannot connect (a real env would open a bus) so
+it binds a stub driver instead; a generated adapter's mock env connects for real,
+which is stricter — it exercises the generated ``connect`` path too.
 """
 
 from __future__ import annotations

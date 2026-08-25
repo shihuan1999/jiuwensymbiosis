@@ -19,7 +19,12 @@ the same frames the pipeline consumes.
 
 from __future__ import annotations
 
-from jiuwensymbiosis.api.decorators import robot_tool
+from jiuwensymbiosis.api.actions import (
+    ANALYZE_SCENE,
+    GET_GRASP_INFO_SIMPLE,
+    PIXEL_TO_BASE_XYZ,
+    implements,
+)
 from jiuwensymbiosis.perception.vision import detect_and_centroid
 from jiuwensymbiosis.utils.geometry import (
     apply_transform,
@@ -60,14 +65,9 @@ class SceneMockApi(MockApi):
         self._grasp_z_offset_mm = grasp_z_offset_mm
         self._place_z_offset_mm = place_z_offset_mm
 
-    @robot_tool(
-        desc="Detect object_name in the scene and return grasp/place geometry. "
-        "Runs the real detect_and_centroid + pinhole back-projection against the "
-        'mock scene. Returns {"ok": bool, "object": str, "position": [x,y,z]_mm, '
-        '"grasp_z": float, "grasp_position": [x,y,z]_mm, "place_z": float, '
-        '"place_position": [x,y,z]_mm, "score": float, "pixel_uv": [u,v], "depth_m": float}.',
-        produces_location=True,
-    )
+    # The real specs, not look-alikes: this mock stands in for a body, so it must be
+    # gated and validated exactly as one (contract text and schema come from the vocabulary).
+    @implements(GET_GRASP_INFO_SIMPLE)
     def get_grasp_info_simple(self, object_name: str) -> dict:
         self._call_log.append(f"get_grasp_info_simple({object_name!r})")
         scene = self._scene
@@ -106,10 +106,7 @@ class SceneMockApi(MockApi):
             "depth_m": depth_m,
         }
 
-    @robot_tool(
-        desc="Pixel (u,v) at depth_m → base-frame XYZ in mm via the mock camera model.",
-        produces_location=True,
-    )
+    @implements(PIXEL_TO_BASE_XYZ)
     def pixel_to_base_xyz(self, u: float, v: float, depth_m: float) -> dict:
         self._call_log.append(f"pixel_to_base_xyz({u},{v},{depth_m})")
         scene = self._scene
@@ -117,7 +114,7 @@ class SceneMockApi(MockApi):
         xyz = apply_transform(scene.tf_base_cam, p_cam)
         return {"x": float(xyz[0]), "y": float(xyz[1]), "z": float(xyz[2])}
 
-    @robot_tool(desc="Scene analysis grounded on object_name. Returns detection counts + top scores.")
+    @implements(ANALYZE_SCENE)
     def analyze_scene(self, object_name: str | None = None) -> dict:
         target = object_name or ""
         rgb = self._scene.render_rgb()

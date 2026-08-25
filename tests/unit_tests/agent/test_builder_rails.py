@@ -30,7 +30,7 @@ class TestRailRegistry:
         assert recovery.required_flags == ["enable_recovery"]
         assert recovery.any_capabilities == [
             "motion.cartesian", "motion.joint", "motion.base",
-            "grasp.suction", "grasp.parallel", "grasp.dual_arm",
+            "grasp.suction", "grasp.parallel", "motion.dual_arm",
         ]
 
     @pytest.mark.parametrize(

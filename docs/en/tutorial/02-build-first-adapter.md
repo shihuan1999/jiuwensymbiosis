@@ -176,6 +176,9 @@ class ScaraEnv(BaseRobotEnv):
         pose = self.low_level.get_pose()
         return RobotObservation(pose={"x": pose.x, "y": pose.y, "z": pose.z, "r": pose.rz})
 
+    def home(self) -> None:
+        self._require_cartesian().home()
+
     @property
     def z_min_safe(self) -> float:
         return self._cfg.z_min_safe_mm
@@ -189,31 +192,51 @@ class ScaraEnv(BaseRobotEnv):
         return self.low_level.tool_offset_mm if self.low_level is not None else 0.0
 ```
 
-`BaseRobotEnv` supplies the common `home`, `get_flange_pose`, `move_to_flange`, `set_end_effector`, and
-`grab_rgb` delegations. The Env only adds lifecycle, observation, and configuration-backed safety properties.
+`BaseRobotEnv` supplies the common `get_flange_pose`, `move_to_flange`, `set_end_effector`, and `grab_rgb`
+delegations. The Env adds lifecycle, observation, configuration-backed safety properties — and `home`, which is
+abstract: every body states its own safe posture, so an arm delegates to the driver while a mobile body writes
+its own sequence.
 
 ## 5. Compose the Api
 
 ```python
+from jiuwensymbiosis.api import defaults
+from jiuwensymbiosis.api.actions import (
+    ACTIVATE_SUCTION,
+    GET_HOME_POSE,
+    GET_POSE,
+    GOTO_XYZR,
+    implements,
+)
 from jiuwensymbiosis.api.base import BaseRobotApi
-from jiuwensymbiosis.api.decorators import robot_tool
-from jiuwensymbiosis.api.mixins import MotionMixin, SuctionMixin
 
 
-class ScaraApi(MotionMixin, SuctionMixin, BaseRobotApi):
-    @robot_tool(desc="Get the current tip pose in mm/deg.")
+class ScaraApi(BaseRobotApi):
+    # Nothing body-specific: forward to the shared implementation.
+    @implements(GOTO_XYZR)
+    def goto_xyzr(self, x: float, y: float, z: float, r: float | None = None) -> None:
+        return defaults.goto_xyzr(self, x, y, z, r)
+
+    @implements(ACTIVATE_SUCTION)
+    def activate_suction(self) -> dict:
+        return defaults.activate_suction(self)
+
+    # Body-specific: the driver reports `rz`, the SCARA vocabulary says `r`.
+    @implements(GET_POSE)
     def get_pose(self) -> dict:
         pose = self.env.get_flange_pose()
         return {"x": pose.x, "y": pose.y, "z": pose.z, "r": pose.rz}
 
-    @robot_tool(desc="Get the configured home pose.")
+    @implements(GET_HOME_POSE)
     def get_home_pose(self) -> dict:
         pose = self.env.home_pose
         return {"x": pose.x, "y": pose.y, "z": pose.z, "r": pose.rz}
 ```
 
-The Api inherits `home`, `goto_xyzr`, suction control, and movement helpers. The overrides above only adapt the
-driver's `rz` field to the SCARA-facing `r` convention.
+Every method binds one entry of the shared action vocabulary, so the name, capability gate, and effects come from
+`api/actions.py` rather than from this class. Where the body has nothing of its own to say, the body forwards to
+`api.defaults`; where it does — the `rz`/`r` field name above — it writes the body out in full. `ScaraApi` declares no
+capabilities directly: `BaseRobotApi.capabilities` derives them from the specs its methods implement.
 
 ## 6. Assemble the Session
 

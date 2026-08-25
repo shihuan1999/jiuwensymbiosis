@@ -7,7 +7,7 @@
 
 name: cruzr
 adapter: cruzr          # 通用 runner（jiuwensymbiosis-run）据此从注册表建 session；--robot 可覆盖
-ros_workspace: /home/riemann/Robot/Cruzr_ws
+ros_workspace: "~/Robot/Cruzr_ws"
 ros_backend: auto
 
 # agent: 执行/护栏声明（RobotAgentConfig 字段）。SafetyRail 按本体能力派生策略，替双臂本体
@@ -70,8 +70,12 @@ env:
       waist_camera_info_topic: /sensor/camera/waist_front_rgbd/color/info
       nav_python: /home/riemann/.local/bin/cruzr_ros_python
       camera_calib_path: configs/cruzr/cruzr_camera_calib.json
-      # URDF 路径（FK / IK）。
-      urdf_path: /home/riemann/Robot/Cruzr_ws/cruzr_s2_description/cruzr_s2_description/urdf/cruzr_s2_v1/cruzr_s2_v1.urdf
+      # 机器人描述（ROS 包，在本仓之外）。`~` 与 `$VAR` 会被展开，所以同一份配置
+      # 可以在不同机器上用；工作区不在 ~/Robot/Cruzr_ws 时改这两行即可。
+      # urdf_path 供 FK / IK；urdf_package_dir 是 package:// 碰撞网格的根，
+      # 自碰撞检查依赖它——不配的话会静默失效。
+      urdf_path: "~/Robot/Cruzr_ws/cruzr_s2_description/cruzr_s2_description/urdf/cruzr_s2_v1/cruzr_s2_v1.urdf"
+      urdf_package_dir: "~/Robot/Cruzr_ws/cruzr_s2_description"
       # 末端执行器链接名（双臂）。
       left_arm_leaf: L_sixforce_link
       right_arm_leaf: R_sixforce_link

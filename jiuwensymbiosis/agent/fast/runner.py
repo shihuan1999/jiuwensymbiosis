@@ -7,7 +7,7 @@ Executes an ordered ``list[ActionStep]`` (produced once by the skill-selection
 LLM, see ``fast_path_single_source_design.md``) against a live session. It is
 **task-agnostic** — it knows nothing about pick/place/carry/push; it only knows:
 
-  * how to call any ``@robot_tool`` action by name (the same ``_build_action_index``
+  * how to call any ``@implements`` action by name (the same ``_build_action_index``
     the agent's ``robot_control`` uses), so whatever a robot/skill exposes runs;
   * how to evaluate a step's symbolic params against a variable environment
     (config constants + detection bindings) via ``sequence.resolve_params``;
@@ -40,13 +40,15 @@ from jiuwensymbiosis.agent.fast.sequence import (
     ActionStep,
     LoopStep,
     normalize_detection,
+    referenced_binding_names,
     resolve_params,
 )
 from jiuwensymbiosis.api.decorators import ToolMeta
+from jiuwensymbiosis.api.memory import ExecutionMemory
 from jiuwensymbiosis.api.state import contradicted_requirements
 from jiuwensymbiosis.api.world_state import WorldState, current_tokens
 from jiuwensymbiosis.rails.recovery import read_holding_payload, recover_session
-from jiuwensymbiosis.tools.robot_control_tool import _build_action_index
+from jiuwensymbiosis.tools.robot_control_tool import _build_action_index, record_action
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +228,15 @@ def _prescan(session: Any, steps: list[ActionStep]) -> dict[str, dict[str, Any]]
     objects the sequence names. Only ``track_detect`` reads this cache: the
     eye-to-hand ``track_grasp`` drives from absolute base-frame coordinates
     each tick and never consults a home-pose snapshot, so it is excluded here.
+
+    These calls go straight to the api rather than through the executor, so they
+    record into ``ExecutionMemory`` here: they home the body and sense positions like
+    any other step, and a sensing the memory never hears about leaves it looking empty
+    to ``_location_drift``, which reads emptiness as "everything was invalidated".
+    Deliberately NOT recorded: the same detection run from a ``BackgroundTracker`` tick
+    (``track_detect`` / ``track_grasp``), which fires at ``detect_hz`` — that is a
+    control loop sampling, not a step the plan took, and folding it in would churn the
+    memory at servo rate.
     """
     api = session.api
     names: list[str] = []
@@ -239,12 +250,14 @@ def _prescan(session: Any, steps: list[ActionStep]) -> dict[str, dict[str, Any]]
         return cache
     try:
         api.home()
+        record_action(api, api.home, {}, None)
     except Exception as exc:  # noqa: BLE001 - pre-scan home() is best-effort
         logger.warning("[runner] pre-scan: home() failed: %s", exc)
     for n in names:
         det = _detect_once(api, n)
         if det is not None:
             cache[n] = det
+            record_action(api, api.get_grasp_info_simple, {"object_name": n}, det)
             logger.info("[runner] pre-scan cached %r at home: pos=%s", n, det.get("position"))
         else:
             logger.warning("[runner] pre-scan: %r not detected at home (will retry live)", n)
@@ -591,6 +604,12 @@ def direct_executor(api_or_index: Any) -> Executor:
     """A no-rails executor that calls api methods directly (mock / tests).
 
     Accepts an api object or a prebuilt ``{op: method}`` index.
+
+    No rails, but it still records into ``ExecutionMemory``: skipping that would make
+    this the one dispatch path where a base move stales the planner's locations but not
+    the api's sensing cache, so a mock run and a railed run would disagree about whether
+    a location exists. The api comes off the bound method, since an index carries no
+    reference back to it.
     """
     idx = api_or_index if isinstance(api_or_index, Mapping) else _build_action_index(api_or_index)
 
@@ -602,6 +621,9 @@ def direct_executor(api_or_index: Any) -> Executor:
             result = fn(**params)
         except Exception as exc:  # noqa: BLE001 - convert op failure to structured result
             return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+        api = getattr(fn, "__self__", None)
+        if api is not None:
+            record_action(api, fn, params, result)
         ok = result.get("ok", True) if isinstance(result, dict) else True
         return {"ok": ok, "result": result}
 
@@ -887,28 +909,70 @@ def _op_contracts(session: Any, action_index: Mapping[str, Callable[..., Any]] |
         return {}
     metas = {}
     for name, fn in index.items():
-        meta = getattr(fn, "__robot_tool__", None)
+        meta = getattr(fn, "__tool_meta__", None)
         if isinstance(meta, ToolMeta):
             metas[name] = meta
     return metas
 
 
-def _drift(step: ActionStep, metas: Mapping[str, ToolMeta], session: Any) -> str | None:
-    """Why the measured world contradicts this step's pre-conditions, or ``None``.
+def _drift(step: ActionStep, metas: Mapping[str, ToolMeta], session: Any, env: Mapping[str, Any]) -> str | None:
+    """Why the world contradicts this step's pre-conditions, or ``None``.
 
-    Only a *contradiction* counts, never a token the body simply cannot report —
-    see ``contradicted_requirements``. So this fires when the world really has
-    moved away from the plan's assumption (the payload was dropped, something was
-    grasped out of band), not when we merely do not know.
+    Two independent pre-conditions, the same two the plan-time validator checks:
+    robot self-state, and whether the sensed position the step acts on is still
+    current. Only a *contradiction* counts in either — never a fact we merely do
+    not know.
     """
     meta = metas.get(step.op)
-    if meta is None or not meta.requires:
+    if meta is None:
+        return None
+    return _self_state_drift(step, meta, session) or _location_drift(step, meta, session, env)
+
+
+def _self_state_drift(step: ActionStep, meta: ToolMeta, session: Any) -> str | None:
+    """Why the measured self-state contradicts this step's ``requires``, or ``None``.
+
+    Never fires on a token the body simply cannot report — see
+    ``contradicted_requirements``. So this catches the world having really moved away
+    from the plan's assumption (the payload was dropped, something was grasped out of
+    band), not our not knowing.
+    """
+    if not meta.requires:
         return None
     tokens = current_tokens(session)
     unmet = contradicted_requirements(tokens, meta.requires)
     if not unmet:
         return None
     return f"{step.op} requires {list(unmet)}, but the robot is measurably {sorted(tokens)}"
+
+
+def _location_drift(step: ActionStep, meta: ToolMeta, session: Any, env: Mapping[str, Any]) -> str | None:
+    """Why the sensing this step acts on is gone, or ``None``.
+
+    The plan-time twin is ``sequence._check_location_need``: an action declaring
+    ``consumes_location`` that names no source reads the api's sensing cache, so it
+    needs *some* current sensing to act on. ``ExecutionMemory`` owns that cache's
+    freshness (``api/memory.py``), and it is a ledger of what was dispatched rather
+    than a reading off a body — an empty one is knowledge, not ignorance, so the step
+    is certain to come back empty-handed. Plan time cannot see this: it validates the
+    order as written, while an invalidating action can reach the robot here that the
+    plan never contained (a re-plan's remainder, a recovery retreat, a body that
+    drives itself into range).
+
+    A step that NAMES its source is deliberately left alone: that value is already
+    resolved in the runner's bindings, and a compound op which binds a result without
+    a location-producing contract (``track_detect``) would make an empty memory look
+    like staleness we cannot prove.
+    """
+    if not meta.consumes_location:
+        return None
+    memory = getattr(getattr(session, "api", None), "memory", None)
+    if not isinstance(memory, ExecutionMemory) or memory.locations:
+        return None
+    for value in step.params.values():
+        if referenced_binding_names(value) or (isinstance(value, str) and value in env):
+            return None
+    return f"{step.op} acts on a sensed position, but every earlier sensing has been invalidated"
 
 
 def _request_replan(replan: Replanner, session: Any, why: str, out: list[dict], state: dict) -> list | None:
@@ -956,9 +1020,10 @@ def run_sequence(
             ops run through the agent's rails. Defaults to a direct executor
             (built from ``action_index`` or ``session.api``) for mock / tests.
         action_index: legacy — used only to build the default direct executor.
-        replan: called when the measured state contradicts the next step's
-            ``requires``; returns a replacement remainder. Omit it and the drift
-            check is skipped entirely (no cost, today's behaviour).
+        replan: called when the world contradicts the next step's pre-conditions —
+            its ``requires`` measurably false, or the sensing it acts on invalidated
+            since the plan was written; returns a replacement remainder. Omit it and
+            the drift check is skipped entirely (no cost, today's behaviour).
         max_replans: cap on re-plans per run. Past it, drift is logged and the
             step dispatched anyway — a plan we cannot improve still beats none.
 
@@ -995,7 +1060,7 @@ def run_sequence(
     ok_all = True
     while pending:
         step = pending[0]
-        why = _drift(step, metas, session) if isinstance(step, ActionStep) else None
+        why = _drift(step, metas, session, env) if isinstance(step, ActionStep) else None
         if why is not None and replans < max_replans:
             # replan is set whenever metas is
             fresh = _request_replan(replan, session, why, out, state)  # type: ignore[arg-type]

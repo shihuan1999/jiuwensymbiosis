@@ -9,7 +9,7 @@ resolution, detection binding, gripper-occlusion bookkeeping, failure retreat â€
 is tested deterministically. ``track_detect`` end-to-end (servo threads) is
 covered by the mock smoke script.
 
-A custom ``action_index`` is passed so no ``@robot_tool`` plumbing is needed; the
+A custom ``action_index`` is passed so no action-index plumbing is needed; the
 runner is task-agnostic, so the ops are just whatever the index provides.
 """
 
@@ -25,7 +25,10 @@ from jiuwensymbiosis.agent.fast.realtime.binding import ServoBinding
 from jiuwensymbiosis.agent.fast.realtime.mask_tracking import MaskTargetFilter, MaskTrackingConfig, MaskTrackingState
 from jiuwensymbiosis.agent.fast.realtime.servo import ServoConfig, ServoResult
 from jiuwensymbiosis.agent.fast.runner import SkillExecConfig, run_sequence
-from jiuwensymbiosis.agent.fast.sequence import parse_sequence
+from jiuwensymbiosis.agent.fast.sequence import TRACK_DETECT, ActionStep, parse_sequence
+from jiuwensymbiosis.api.actions import GET_GRASP_INFO_SIMPLE, implements
+from jiuwensymbiosis.api.base import BaseRobotApi
+from jiuwensymbiosis.env.mock import MockArmEnv
 
 
 class _FakeApi:
@@ -40,7 +43,7 @@ class _FakeApi:
     def home(self):
         self.calls.append(("home",))
 
-    def goto_xyzr(self, x, y, z, r=None):
+    def goto_xyzr(self, x, y, z, r=None, orientation_policy="top_down"):
         self._n_goto += 1
         if self.fail_goto_at is not None and self._n_goto == self.fail_goto_at:
             raise RuntimeError("EXCEEDS_LIMIT")
@@ -106,6 +109,52 @@ def _index(api):
 
 
 _GRASP_OBJ = {"box": {"ok": True, "position": [250.0, 90.0, 70.0], "grasp_z": 50.0, "place_z": 80.0, "score": 0.9}}
+
+
+class TestPrescanRecordsWhatItDid:
+    """The pre-scan homes the body and senses positions before the first step dispatches.
+
+    It calls the api directly rather than through the executor, so nothing else is in a
+    position to record it. A sensing the memory never hears about leaves the memory
+    looking empty to ``_location_drift``, which reads emptiness as "every earlier
+    sensing was invalidated" â€” a re-plan asked for on the strength of a reading we
+    actually have.
+    """
+
+    class _Api(BaseRobotApi):
+        def __init__(self, env, *, found: bool = True) -> None:
+            super().__init__(env)
+            self.found = found
+
+        @implements(GET_GRASP_INFO_SIMPLE)
+        def get_grasp_info_simple(self, object_name: str) -> dict:
+            if not self.found:
+                return {"ok": False, "reason": "not_found"}
+            return {"ok": True, "position": [120.0, 0.0, 40.0], "grasp_z": 40.0}
+
+    def _prescan(self, *, found: bool = True, object_name: str = "banana"):
+        api = self._Api(MockArmEnv(), found=found)
+        session = types.SimpleNamespace(api=api, env=api.env)
+        steps = [ActionStep(op=TRACK_DETECT, params={"object_name": object_name}, bind="banana")]
+        cache = runner_module._prescan(session, steps)
+        return api, cache
+
+    def test_a_prescanned_sensing_reaches_the_memory(self):
+        api, cache = self._prescan()
+        assert "banana" in cache
+        record = api.memory.get("banana")
+        assert record is not None, "the pre-scan sensed a position the memory never heard about"
+        assert record.op == "get_grasp_info_simple"
+
+    def test_the_prescan_home_reaches_the_memory(self):
+        api, _ = self._prescan()
+        assert "body.home" in api.memory.self_state
+
+    def test_a_miss_establishes_nothing(self):
+        # Same rule as every other dispatch: only a successful action tells us anything.
+        api, cache = self._prescan(found=False)
+        assert cache == {}
+        assert api.memory.locations == {}
 
 
 def _tracking_config(**kwargs):

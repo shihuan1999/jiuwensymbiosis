@@ -2,22 +2,23 @@
 import pytest
 
 import jiuwensymbiosis.adapters.cruzr.geometry as lifter_mod
-from jiuwensymbiosis.adapters.cruzr.geometry import GraspPlan
-from jiuwensymbiosis.kinematics.ik import IKResult
 from jiuwensymbiosis.adapters.cruzr.geometry import (
     LIFTER_JOINTS,
+    GraspPlan,
     level_config,
     search_lifter_for_box,
     search_lifter_for_place,
 )
+from jiuwensymbiosis.kinematics.ik import IKResult
 from jiuwensymbiosis.perception.object_geometry import ObjectGeometry3D
+from tests.unit_tests.adapters.cruzr import description
 
 P1, P2, P3 = LIFTER_JOINTS
 
 
 # ---- level_config: pure math (no URDF, fast) -------------------------------
 
-_URDF = "/home/riemann/Robot/Cruzr_ws/cruzr_s2_description/cruzr_s2_description/urdf/cruzr_s2_v1/cruzr_s2_v1.urdf"
+_URDF = description.URDF
 
 
 def test_lower_torso_lifter_descends_vertically():
@@ -26,8 +27,8 @@ def test_lower_torso_lifter_descends_vertically():
     from pathlib import Path
     if not Path(_URDF).exists():
         pytest.skip("urdf not present")
+    from jiuwensymbiosis.adapters.cruzr.geometry import _shoulder_pos, lower_torso_lifter
     from jiuwensymbiosis.kinematics.urdf_chain import parse_chain
-    from jiuwensymbiosis.adapters.cruzr.geometry import lower_torso_lifter, _shoulder_pos
 
     L = parse_chain(_URDF, "base_link", "L_sixforce_link")
     # Start from a realistic grasp-adapted (leaned) pose — the case dual_arm_place hits.

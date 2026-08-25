@@ -18,8 +18,8 @@ import pytest
 from jiuwensymbiosis.agent.fast import planner
 from jiuwensymbiosis.agent.fast.sequence import SequenceError, parse_sequence, qualifiers_for
 from jiuwensymbiosis.agent.run import _blocked_access
+from jiuwensymbiosis.api.actions import ActionSpec, implements
 from jiuwensymbiosis.api.base import BaseRobotApi
-from jiuwensymbiosis.api.decorators import robot_tool
 from jiuwensymbiosis.env.base import BaseRobotEnv, RobotObservation
 from jiuwensymbiosis.tools.robot_control_tool import _build_action_index
 
@@ -35,6 +35,8 @@ class _Env(BaseRobotEnv):
 
     def disconnect(self) -> None: ...
 
+    def home(self) -> None: ...
+
     def get_observation(self) -> RobotObservation:
         return RobotObservation(pose={}, joints=[])
 
@@ -42,18 +44,18 @@ class _Env(BaseRobotEnv):
 class _Api(BaseRobotApi):
     capability = {"vision.detection", "grasp.parallel"}
 
-    @robot_tool(desc="measure a thing", capability="vision.detection", produces_location=True,
-                planner_visible=True)
+    @implements(ActionSpec(name="locate", description="measure a thing", capability="vision.detection",
+                           produces_location=True))
     def locate(self, object_name: str, reference: str | None = None, relation: str = "on") -> dict:
         return {"ok": True, "position": [0.0, 0.0, 0.0]}
 
-    @robot_tool(desc="take hold", capability="grasp.parallel", requires=["payload.clear"],
-                provides=["payload.held"], planner_visible=True)
+    @implements(ActionSpec(name="grasp", description="take hold", capability="grasp.parallel",
+                           requires=("payload.clear",), provides=("payload.held",)))
     def grasp(self) -> dict:
         return {"ok": True}
 
-    @robot_tool(desc="put down", capability="grasp.parallel", requires=["payload.held"],
-                provides=["payload.clear"], planner_visible=True)
+    @implements(ActionSpec(name="place", description="put down", capability="grasp.parallel",
+                           requires=("payload.held",), provides=("payload.clear",)))
     def place(self) -> dict:
         return {"ok": True}
 

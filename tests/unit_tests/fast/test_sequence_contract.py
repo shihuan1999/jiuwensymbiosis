@@ -14,53 +14,58 @@ from __future__ import annotations
 import pytest
 
 from jiuwensymbiosis.agent.fast.sequence import SequenceError, parse_sequence
-from jiuwensymbiosis.api.decorators import robot_tool
+from jiuwensymbiosis.api.actions import ActionSpec, implements
 
 
 class _Body:
     """A body exposing one action per contract shape the validator reasons about."""
 
-    @robot_tool(desc="sense where something is", produces_location=True)
+    @implements(ActionSpec(name="detect", description="sense where something is", produces_location=True))
     def detect(self, object_name: str) -> dict: ...
 
-    @robot_tool(
-        desc="drive up to the sensed thing", consumes_location=True, produces_location=True, invalidates_locations=True
-    )
+    @implements(ActionSpec(
+        name="approach", description="drive up to the sensed thing",
+        consumes_location=True, produces_location=True, invalidates_locations=True,
+    ))
     def approach(self) -> dict: ...
 
-    @robot_tool(desc="drive the base", invalidates_locations=True)
+    @implements(ActionSpec(name="drive", description="drive the base", invalidates_locations=True))
     def drive(self, dx_m: float) -> dict: ...
 
-    @robot_tool(desc="grip", requires=["payload.clear"], provides=["payload.held"])
+    @implements(ActionSpec(
+        name="grip", description="grip", requires=("payload.clear",), provides=("payload.held",),
+    ))
     def grip(self) -> dict: ...
 
-    @robot_tool(desc="release", provides=["payload.clear"])
+    @implements(ActionSpec(name="release", description="release", provides=("payload.clear",)))
     def release(self) -> dict: ...
 
-    @robot_tool(desc="go to coordinates", invalidates=["body.home"])
+    @implements(ActionSpec(name="goto", description="go to coordinates", invalidates=("body.home",)))
     def goto(self, x: float, y: float, z: float) -> dict: ...
 
     # Takes the sensed thing by name, the way dual_arm_grasp(target) does — a body that
     # declares no param cannot legally be handed one (see TestDeclaredParamsOnly).
-    @robot_tool(desc="press it", consumes_location=True)
+    @implements(ActionSpec(name="press", description="press it", consumes_location=True))
     def press(self, target: str | None = None) -> dict: ...
 
-    @robot_tool(
-        desc="sense with a declared result shape",
+    @implements(ActionSpec(
+        name="detect_typed",
+        description="sense with a declared result shape",
         produces_location=True,
-        returns={"type": "object", "properties": {"position": {"type": "array"}, "grasp_z": {"type": "number"}}},
-    )
+        result={"type": "object", "properties": {"position": {"type": "array"}, "grasp_z": {"type": "number"}}},
+    ))
     def detect_typed(self, object_name: str) -> dict: ...
 
     # Reports a DIRECTION, not a position: readable data, but nothing a
     # consumes_location step may act on.
-    @robot_tool(
-        desc="report which way something lies",
-        returns={"type": "object", "properties": {"bearing_rad": {"type": "number"}}},
-    )
+    @implements(ActionSpec(
+        name="bearing",
+        description="report which way something lies",
+        result={"type": "object", "properties": {"bearing_rad": {"type": "number"}}},
+    ))
     def bearing(self, object_name: str) -> dict: ...
 
-    @robot_tool(desc="turn by an angle", invalidates_locations=True)
+    @implements(ActionSpec(name="turn", description="turn by an angle", invalidates_locations=True))
     def turn(self, dyaw_rad: float) -> dict: ...
 
 
@@ -353,13 +358,13 @@ class TestQualifierEnforced:
     @staticmethod
     def _index():
         class Fake:
-            @robot_tool(name="locate_for_grasp", desc="d", capability="vision.detection",
-                        produces_location=True)
+            @implements(ActionSpec(name="locate_for_grasp", description="d",
+                                   capability="vision.detection", produces_location=True))
             def locate_for_grasp(self, object_name: str = "box", reference: str = "",
                                  relation: str = "on") -> dict:
                 return {}
 
-            @robot_tool(name="analyze_scene", desc="d", capability="vision.detection")
+            @implements(ActionSpec(name="analyze_scene", description="d", capability="vision.detection"))
             def analyze_scene(self, object_name: str = "box") -> dict:
                 return {}
 

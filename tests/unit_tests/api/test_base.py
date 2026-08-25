@@ -6,14 +6,13 @@
 from __future__ import annotations
 
 from jiuwensymbiosis.api import defaults
-from jiuwensymbiosis.api.actions import GET_IMAGE, GET_POSE, GOTO_XYZR, implements
+from jiuwensymbiosis.api.actions import GET_IMAGE, GET_POSE, GOTO_XYZR, ActionSpec, implements
 from jiuwensymbiosis.api.base import BaseRobotApi
-from jiuwensymbiosis.api.decorators import robot_tool
 from jiuwensymbiosis.env.mock import MockArmEnv
 
 
 class SimpleApi(BaseRobotApi):
-    @robot_tool
+    @implements(ActionSpec(name="my_tool", description="a body's own one-off action"))
     def my_tool(self) -> dict:
         return {"ok": True}
 
@@ -26,7 +25,8 @@ class MotionVisionApi(BaseRobotApi):
         return defaults.get_pose(self)
 
     @implements(GOTO_XYZR)
-    def goto_xyzr(self, x: float, y: float, z: float, r: float | None = None) -> None:
+    def goto_xyzr(self, x: float, y: float, z: float, r: float | None = None,
+                  orientation_policy: str = "top_down") -> None:
         self.env.move(x, y, z, r)
 
     @implements(GET_IMAGE)

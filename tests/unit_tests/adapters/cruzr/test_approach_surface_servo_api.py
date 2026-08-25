@@ -85,7 +85,7 @@ def _api(senses, *, enabled=True, **cfg_over):
     api.locate_for_place = lambda object_name="table", reference=None, relation="on": next(it)  # type: ignore[method-assign]
     # approach_* now folds the search-and-face pass in front of the drive loop. These tests
     # exercise the DRIVE geometry, so mark a surface as already sensed — the same thing a
-    # real face pass would leave behind — and the search is skipped (see _ApproachBody).
+    # real face pass would leave behind — and the search is skipped (see Approach).
     api._last_surface = {"ok": True}
     return api, env
 

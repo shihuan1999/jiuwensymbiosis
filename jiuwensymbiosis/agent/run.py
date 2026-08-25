@@ -232,7 +232,10 @@ def _perceive_scene(
                 "nearest_mm": min((obj.get("distance_mm") for obj in rejected
                                    if isinstance(obj.get("distance_mm"), (int, float))), default=None),
             })
-    has_reach = "planning.reachability" in getattr(api, "capabilities", frozenset())
+    # The intersection, not the api alone: the judge lives on the Api and the URDF it reads
+    # lives on the Env, so either half missing means the body cannot actually answer.
+    from jiuwensymbiosis.tools.builder import _effective_capabilities
+    has_reach = "planning.reachability" in _effective_capabilities(api, getattr(session, "env", None))
     looked_for = [*scanned_t, *scanned_r]
     if not objects and not refs:
         # Nothing found. Still report WHAT WAS LOOKED FOR: "we scanned for apple and drawer and saw
@@ -260,9 +263,16 @@ def _perceive_scene(
         # "open it from here" vs "drive up to it first".
         for obj in (*objects, *refs):
             try:
-                obj["reachable"] = bool(api.check_reachable(obj))
+                verdict = api.check_reachable(obj)
             except Exception as exc:  # noqa: BLE001 - precheck is best-effort
                 logger.debug("[fast] reachability precheck failed: %s", exc)
+                continue
+            # None means the judge could not decide (no URDF, no IK solution attempted) —
+            # OMIT the field rather than writing False. ``bool(None)`` would tell the planner
+            # every object is out of reach, which is the framework's "unknown is never false"
+            # rule broken on the one field that decides whether to drive up to something.
+            if verdict is not None:
+                obj["reachable"] = bool(verdict)
     objects.sort(key=lambda obj: obj.get("distance_mm", float("inf")))
     refs.sort(key=lambda obj: obj.get("distance_mm", float("inf")))
     scene: dict[str, Any] = {"count": len(objects), "objects": objects}
@@ -476,12 +486,31 @@ def run_fast_task(
 
         The interruption reason goes into the task text so the planner works around
         what went wrong instead of re-deriving the sequence that just stopped fitting.
+
+        The SCENE is re-perceived here, not reused. ``check_reachable`` answers "from where
+        the body is standing NOW", and the commonest trigger for a re-plan is that the body
+        moved — so reusing the pre-run annotations would hand the planner reachability
+        computed at a base pose that no longer exists, exactly when it has changed. The same
+        goes for ``blocked_access``: whether something is still in the way is a fact about
+        the present. One extra detection pass is the price; a plan built on a stale scene is
+        the alternative.
         """
+        fresh_kwargs = dict(plan_kwargs)
+        try:
+            scene_now = _perceive_scene(
+                session, intent.get("targets") or [], intent.get("references") or [],
+                intent.get("grounding") or {},
+            )
+        except Exception as exc:  # a failed look must not sink the re-plan
+            logger.warning("[fast] re-perception failed, re-planning on the pre-run scene: %s", exc)
+        else:
+            fresh_kwargs["scene"] = scene_now
+            fresh_kwargs["blocked_access"] = _blocked_access(scene_now, intent.get("grounding") or {})
         again = plan_task(
             f"{query}\n\n（执行中断：{why}。请依据【当前状态】重新规划剩余动作。）",
             world_block=measured.as_prompt_block(),
             world_tokens=sorted(measured.tokens) or None,
-            **plan_kwargs,
+            **fresh_kwargs,
         )
         logger.info("[fast] re-planned at %s-tier → %d steps", again.tier, len(again.sequence))
         return parse_sequence(again.sequence, allowed_ops=action_index, special_ops=special_ops,

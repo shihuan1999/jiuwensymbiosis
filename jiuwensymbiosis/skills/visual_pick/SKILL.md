@@ -14,7 +14,7 @@ invalidates_locations: true
 同时满足：
 
 1. 用户指令含"把 X 抓起来 / 夹住 / 吸住 / 拿起来"等抓取意图，X 可由一段文本（颜色 / 形状 / 品类…）描述。
-2. `api.capabilities` 含 `vision.detection`，且含**至少一种抓取能力**：`grasp.parallel` / `grasp.suction` / `grasp.dual_arm`。
+2. `api.capabilities` 含 `vision.detection`，且含**至少一种抓取能力**（`grasp.*` 轴）：`grasp.parallel` / `grasp.suction` / `grasp.paddle`。
 3. 已注册 `robot_control`；当前末端**空载**。
 
 任务若还要把物体放到某处：**先用本 skill 抓起，再 chain 调用 `visual_place`**，两者解耦。
@@ -31,7 +31,12 @@ invalidates_locations: true
 |---|---|---|---|
 | `grasp.parallel` | `get_grasp_info_simple` | `close_gripper` | `open_gripper` |
 | `grasp.suction` | `get_grasp_info_simple` | `activate_suction` | `deactivate_suction` |
-| `grasp.dual_arm` | `locate_for_grasp` | `dual_arm_grasp` | `dual_arm_place` |
+| `motion.dual_arm` | `locate_for_grasp` | `dual_arm_grasp` | `dual_arm_place` |
+
+> **两个轴**：`motion.*` 说这个本体**能动什么**（决定调哪个动作），`grasp.*` 说它**能握住什么**
+> （决定能拿什么样的物体）。协同双臂用哪种末端——夹板 `grasp.paddle`、每臂一只夹爪
+> `grasp.parallel`——**不改变调用的动作名**：协同是同一件事，接触方式由本体自己实现。
+
 
 会移动的本体（`motion.base`）另有一个占位符：
 
@@ -104,7 +109,7 @@ fast 编译器会另外给出本次机器人可用的【特殊动作】。这些
 
 以上选择规则属于本 skill 的抓取策略；其它 skill 是否使用这些特殊动作，只能以各自 SKILL.md 为准。
 
-### 支 B — 双臂（`grasp.dual_arm`）
+### 支 B — 协同双臂（`motion.dual_arm`）
 
 `<抓取>` 是复合动作（对位 → 夹紧 → 力确认打包成一步），**自动使用最近一次成功检测的结果**——检测步跑完直接调它，几何字段不必回传，参数省略即可。`<释放>` 属于 visual_place，不在本 skill 出现。
 
@@ -159,6 +164,6 @@ fast 编译器会另外给出本次机器人可用的【特殊动作】。这些
 - ❌ 跳过 `home` 直接检测（支 A）：相机基线不稳、深度噪声大。
 - ❌ 在本 skill 末尾释放：物体会掉回原位，visual_place 拿到空末端。
 - ❌ 把放置点动作写进本 skill：放置是 visual_place 的职责。
-- ❌ 双臂（`grasp.dual_arm`）有底盘时在 `<搜索并驱近目标>` 前面加 `<检测目标>`/bind"先检测目标"：目标常在远处、grounded 核验必失败即退出，搜索永不执行。有底盘只靠 `<搜索并驱近目标>`，`<抓取>` 自动用其检测。
+- ❌ 协同双臂（`motion.dual_arm`）有底盘时在 `<搜索并驱近目标>` 前面加 `<检测目标>`/bind"先检测目标"：目标常在远处、grounded 核验必失败即退出，搜索永不执行。有底盘只靠 `<搜索并驱近目标>`，`<抓取>` 自动用其检测。
 - ❌ 失败后不判断载荷就释放或重复 home：已持物时释放会丢件，也会制造与 RecoveryRail 重复的多余动作。
 - ❌ 输出不在你能力/动作清单内的动作（含未列入【特殊动作】清单的 `track_grasp`/`track_detect`）。

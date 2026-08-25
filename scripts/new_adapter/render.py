@@ -75,7 +75,7 @@ def _mixin_names(spec: Spec) -> list[str]:
 
     Every ACTION is generated as an explicit ``@implements(SPEC)`` method, so the
     produced file is its own capability list. The two remaining components in
-    ``CAPABILITY_COMPONENT`` (``_Scene3DBody`` / ``_ApproachBody``) are shared
+    the shared implementations reached through ``api/defaults.py`` are
     *algorithms* that only run once a body supplies their hooks — a calibrated frame,
     a detector, a base that can drive. A fresh skeleton has none of that, and the
     wizard cannot build a mobile body at all, so inheriting either would hand the
@@ -91,7 +91,7 @@ def _mixin_names(spec: Spec) -> list[str]:
 _GENERIC_FORWARDERS: dict[str, tuple[str, str, str]] = {
     "get_home_pose": ("", "", "dict"),
     "move_direction": ("direction: str, distance_mm: float", "direction, distance_mm", "dict"),
-    "move_joint": ("q: list[float]", "q", "None"),
+    "move_joint": ("targets: dict[str, float]", "targets", "Any"),
     "activate_suction": ("", "", "dict"),
     "deactivate_suction": ("", "", "dict"),
     "open_gripper": ("width_mm: float = 80.0", "width_mm", "dict"),
@@ -397,7 +397,7 @@ def _config_optional_fields(spec: Spec) -> str:
             _indent(
                 """
                 # ============== 关节软限位 [选填-仅 motion.joint] ==============
-                # 单位须与 move_joint(q) 一致。
+                # 单位须与 move_joint 的 targets 一致。
                 joint_limits: Optional[dict[str, tuple[float, float]]] = None
                 """,
                 4,
@@ -827,9 +827,20 @@ def _env_joint_limits_prop(spec: Spec) -> str:
         @joint_limits.setter
         def joint_limits(self, _: Optional[dict[str, tuple[float, float]]]) -> None:
             raise AttributeError(f"{type(self).__name__}.joint_limits is read-only (read from config)")
+
+        # Joint names in driver-vector order: the shared ``move_joint`` action addresses joints
+        # by NAME and the driver takes a vector, so this is the ordering between them. Rename
+        # these to your vendor's own names — and keep ``joint_limits``' keys in step.
+        @property
+        def joint_names(self) -> Optional[list[str]]:
+            return __JOINT_NAMES__
+
+        @joint_names.setter
+        def joint_names(self, _: Optional[list[str]]) -> None:
+            raise AttributeError(f"{type(self).__name__}.joint_names is read-only")
         """,
-        8,
-    )
+        4,
+    ).replace("__JOINT_NAMES__", repr([f"J{i + 1}" for i in range(spec.dof)]))
 
 
 def render_env(spec: Spec) -> str:
@@ -916,6 +927,13 @@ def render_env(spec: Spec) -> str:
         __CAMERA_OBSERVATION__
                 return RobotObservation(pose=pose, rgb=rgb, depth=depth)
 
+            # ---------------------------------------------------- safe posture
+            def home(self) -> None:
+                """Return the body to its safe home posture (blocking). REQUIRED —
+                ``home`` is the one unconditional action, so every body states its own.
+                """
+                self._require_cartesian().home()
+
             # ----------------------------------------------- safety boundaries
             @property
             def z_min_safe(self) -> float:
@@ -964,7 +982,7 @@ def _api_imports(spec: Spec, mixins: list[str], tilted: bool, action_specs: list
         lines += ["import math", ""]
     lines += [
         "from types import SimpleNamespace",
-        "from typing import Any, Optional",
+        "from typing import Any, Literal, Optional",
         "",
         "from jiuwensymbiosis.api import defaults",
         "from jiuwensymbiosis.api.actions import (",
@@ -1146,8 +1164,16 @@ def render_api(spec: Spec) -> str:
                 return {{{", ".join(get_items)}}}
 
             @implements(GOTO_XYZR)
-            def goto_xyzr(self, x: float, y: float, z: float, r: Optional[float] = None) -> None:
-                """Move tip to target. tip↔flange geometry stays in the api layer."""
+            def goto_xyzr(self, x: float, y: float, z: float, r: Optional[float] = None,
+                          orientation_policy: Literal["top_down"] = "top_down") -> None:
+                """Move tip to target. tip↔flange geometry stays in the api layer.
+
+                TODO: add "preserve" (keep the live tilt) once the tip↔flange conversion below
+                stops assuming a fixed orientation. The Literal is what tells a planner which
+                policies THIS body accepts, so widen it only when the body really honours them.
+                """
+                if orientation_policy != "top_down":
+                    raise ValueError(f"goto_xyzr: only 'top_down' is implemented, got {{orientation_policy!r}}")
                 tool_off = self.env.tool_offset_mm
                 if r is None:
         __R_DEFAULT__
@@ -1313,7 +1339,7 @@ def render_yaml(spec: Spec) -> str:
         lines += [
             "",
             "# ---- 关节软限位 [选填-仅 motion.joint] ----",
-            "# 单位须与 move_joint(q) 一致；键顺序 = q 索引顺序 (按 J1/J2/... 写)。",
+            "# 单位须与 move_joint 的 targets 一致；键即关节名，顺序 = 驱动向量的索引顺序。",
             "# 限位值以官方手册为准，示例仅为占位。未配置则 SafetyRail 跳过越限检查。",
             "# joint_limits:",
             "#   J1: [-360.0, 360.0]",
@@ -1440,7 +1466,7 @@ def render_config_joint_ik(spec: Spec) -> str:
         __CONNECTION_FIELDS__
 
             # ==================== 运动学关节 [必填] ====================
-            # 不含夹爪；顺序即 move_joint(q) / FK / IK 的顺序。
+            # 不含夹爪；顺序即驱动向量 / FK / IK 的顺序，也是 joint_names 的顺序。
             arm_joint_names: list[str] = field(default_factory=lambda: {_joint_names_literal(spec)})
             home_joints_deg: list[float] = field(default_factory=lambda: {_home_zeros_literal(spec)})
             joint_limits: Optional[dict[str, tuple[float, float]]] = None
@@ -1795,6 +1821,13 @@ def render_env_joint_ik(spec: Spec) -> str:
         __EFFECTOR_EXTRA__
                 return RobotObservation(pose=pose, joints=joints, rgb=rgb, depth=depth, extra=extra)
 
+            # ---------------------------------------------------- safe posture
+            def home(self) -> None:
+                """Return the body to its safe home posture (blocking). REQUIRED —
+                ``home`` is the one unconditional action, so every body states its own.
+                """
+                self._require_cartesian().home()
+
             # ----------------------------------------------- safety boundaries
             @property
             def z_min_safe(self) -> float:
@@ -1828,6 +1861,16 @@ def render_env_joint_ik(spec: Spec) -> str:
             @joint_limits.setter
             def joint_limits(self, _: Any) -> None:
                 raise AttributeError(f"{{type(self).__name__}}.joint_limits is read-only (from config)")
+
+            # Arm joint names in vector order — what the named ``move_joint`` action addresses,
+            # and the ordering the Env converts to the driver's vector with.
+            @property
+            def joint_names(self) -> Optional[list]:
+                return list(self._cfg.arm_joint_names)
+
+            @joint_names.setter
+            def joint_names(self, _: Any) -> None:
+                raise AttributeError(f"{{type(self).__name__}}.joint_names is read-only (from config)")
 
             # -------------------------------------------- robot body constants
             @property
@@ -1863,7 +1906,7 @@ def _api_imports_joint_ik(mixins: list[str], action_specs: list[str]) -> str:
         "from __future__ import annotations",
         "",
         "from types import SimpleNamespace",
-        "from typing import Any, Optional",
+        "from typing import Any, Literal, Optional",
         "",
         "from jiuwensymbiosis.api import defaults",
         "from jiuwensymbiosis.api.actions import (",
@@ -1881,8 +1924,14 @@ def _api_goto_joint_ik(spec: Spec) -> str:
     return _indent(
         f'''
         @implements(GOTO_XYZR)
-        def goto_xyzr(self, x: float, y: float, z: float, r: Optional[float] = None) -> None:
-            """Position-first Cartesian move; the local IK handles posture."""
+        def goto_xyzr(self, x: float, y: float, z: float, r: Optional[float] = None,
+                      orientation_policy: Literal["top_down"] = "top_down") -> None:
+            """Position-first Cartesian move; the local IK handles posture.
+
+            TODO: add "preserve" (keep the live tilt) — the pose below hard-codes rx/ry.
+            """
+            if orientation_policy != "top_down":
+                raise ValueError(f"goto_xyzr: only 'top_down' is implemented, got {{orientation_policy!r}}")
             if r is None:
                 r = getattr(self.env.get_flange_pose(), "rz", 0.0)
             pose = SimpleNamespace(x=float(x), y=float(y), z=float(z), rx=180.0, ry=0.0, rz=float(r))
@@ -1976,7 +2025,7 @@ def render_yaml_joint_ik(spec: Spec) -> str:
         f'connection: "{spec.connection}"',
         *_yaml_connection_lines(spec),
         "",
-        "# ---- 运动学关节 (不含夹爪; 顺序=move_joint/FK/IK 顺序) [必填] ----",
+        "# ---- 运动学关节 (不含夹爪; 顺序=驱动向量/FK/IK 顺序) [必填] ----",
         f"arm_joint_names: [{', '.join(repr(n) for n in spec.arm_joint_names)}]",
         f"home_joints_deg: [{', '.join('0.0' for _ in range(spec.joint_count))}]",
         "# joint_limits: (单位=度; 键须与 arm_joint_names 一致; 不填则跳过越限检查)",

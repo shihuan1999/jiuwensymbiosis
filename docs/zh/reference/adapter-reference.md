@@ -86,6 +86,7 @@ eye-to-hand Protocol。
 | `connect()` | 打开硬件连接，必须幂等 |
 | `disconnect()` | 释放硬件，任何状态调用都应安全 |
 | `get_observation()` | 最佳努力快照，瞬时传感器缺口不应导致整次调用失败 |
+| `home()` | 回到本体的安全姿态；`home` 是唯一无条件动作，不允许由笛卡尔默认代劳，故声明为抽象方法 |
 
 `RobotObservation` 字段：
 
@@ -112,7 +113,6 @@ Env 属性：
 
 | Env 动词 | Driver 目标 |
 |---|---|
-| `home()` | `driver.home()` |
 | `get_flange_pose()` | `driver.get_pose()` |
 | `move_to_flange(pose)` | `driver.move_to_pose_blocking(pose)` |
 | `move_joint(q)` | `driver.move_joint_blocking(q)` |

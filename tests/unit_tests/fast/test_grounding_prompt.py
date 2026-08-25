@@ -56,15 +56,15 @@ _SEQ = [{"op": "locate", "params": {"object_name": "carton", "reference": "cabin
 
 @pytest.mark.parametrize("tier", ["compile", "compose"])
 def test_both_tiers_are_shown_the_qualifiers(monkeypatch, tier):
+    from jiuwensymbiosis.api.actions import ActionSpec, implements
     from jiuwensymbiosis.api.base import BaseRobotApi
-    from jiuwensymbiosis.api.decorators import robot_tool
     from jiuwensymbiosis.tools.robot_control_tool import _build_action_index
 
     class _Api(BaseRobotApi):
         capability = {"vision.detection"}
 
-        @robot_tool(desc="measure", capability="vision.detection", produces_location=True,
-                    planner_visible=True)
+        @implements(ActionSpec(name="locate", description="measure", capability="vision.detection",
+                               produces_location=True))
         def locate(self, object_name: str, reference: str | None = None, relation: str = "on") -> dict:
             return {"ok": True}
 

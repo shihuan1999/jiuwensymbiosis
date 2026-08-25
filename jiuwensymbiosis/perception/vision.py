@@ -28,67 +28,11 @@ import os
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+from typing import Any
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Result type contract for vision / grasp detection.
-#
-# Adapters and the LLM both read these dicts; pinning the reason strings as a
-# constant (and the shapes as TypedDicts) gives both sides a stable contract
-# instead of free-form strings that silently drift (``detector_unavailable``
-# vs ``no_detection`` etc.). ``detect_and_centroid`` and the default eye-in-hand
-# helpers emit only reasons from this set; ``no_camera`` is the adapter-level
-# reason (the frame grab returned None before detection ran).
-# ---------------------------------------------------------------------------
-DETECTION_REASONS = frozenset(
-    {
-        "no_camera",
-        "no_detection",
-        "empty_mask",
-        "no_valid_depth",
-        "detector_unavailable",
-    }
-)
-
-DetectionReason = Literal[
-    "no_camera",
-    "no_detection",
-    "empty_mask",
-    "no_valid_depth",
-    "detector_unavailable",
-]
-
-
-class GraspFailure(TypedDict):
-    """Failure shape returned by grasp/detection tools."""
-
-    ok: Literal[False]
-    reason: DetectionReason
-    object: str
-
-
-class GraspResult(TypedDict, total=False):
-    """Success shape returned by ``get_grasp_info_simple``.
-
-    ``total=False`` because not every caller populates every field (e.g. some
-    adapters omit ``place_z``). ``ok`` is the one always-present key.
-    """
-
-    ok: Literal[True]
-    object: str
-    position: list  # [x, y, z]_mm
-    grasp_z: float
-    grasp_position: list  # [x, y, z]_mm
-    place_z: float
-    place_position: list  # [x, y, z]_mm
-    score: float
-    pixel_uv: list  # [u, v]
-    depth_m: float
-
 
 # Single shared counter so artifacts from multiple sessions don't stomp
 # each other. Resets to 1 on each fresh Python process.

@@ -61,6 +61,60 @@ def current_tokens(session: Any) -> frozenset[str]:
     return frozenset(believed | observed)
 
 
+def _with_reachability(locations: list[dict[str, Any]], api: Any) -> list[dict[str, Any]]:
+    """Annotate each sensed location with whether the body can reach it FROM WHERE IT IS NOW.
+
+    This is the channel that stays fresh — it is re-read on every re-plan, unlike the pre-run
+    scene — so without this the planner's up-to-date positions carried no reach information at
+    all and its reach-annotated positions were stale. A verdict of ``None`` means the judge
+    could not decide, and the key is then OMITTED: unknown is not "out of reach".
+    """
+    if "planning.reachability" not in (getattr(api, "capabilities", None) or frozenset()):
+        return locations
+    for loc in locations:
+        position = loc.get("position_mm")
+        if not position:
+            continue
+        try:
+            verdict = api.check_reachable({"position": position})
+        except Exception as exc:
+            logger.debug("[world_state] check_reachable(%s) failed: %s", loc.get("referent"), exc)
+            continue
+        if verdict is not None:
+            loc["reachable"] = bool(verdict)
+    return locations
+
+
+def _safe_attr(obj: Any, name: str) -> Any:
+    """Read an optional env property without letting a body's getter sink the snapshot."""
+    try:
+        return getattr(obj, name, None)
+    except Exception as exc:
+        logger.debug("[world_state] %s unreadable: %s", name, exc)
+        return None
+
+
+def _reach_prior(api: Any) -> dict[str, Any] | None:
+    """The body's URDF reach model, when it has one. ``None`` = it cannot say."""
+    if "planning.reachability" not in (getattr(api, "capabilities", None) or frozenset()):
+        return None
+    try:
+        prior = api.describe_reach()
+    except Exception as exc:
+        logger.debug("[world_state] describe_reach failed: %s", exc)
+        return None
+    return prior if isinstance(prior, dict) else None
+
+
+# What each goto_xyzr orientation policy means, spelled out in the prompt: the policy NAME
+# alone does not tell a planner that "preserve" will not point the tool down.
+_ORIENTATION_HINTS = {
+    "preserve": "沿用当前倾角，不会自动朝下；要朝下必须显式传 top_down",
+    "top_down": "工具朝下",
+    "grasp": "本体标定的抓取倾角",
+}
+
+
 @dataclass(frozen=True)
 class WorldState:
     """A snapshot of the robot and its surroundings, for planning."""
@@ -69,6 +123,19 @@ class WorldState:
     locations: list[dict[str, Any]] = field(default_factory=list)
     pose: dict[str, Any] | None = None
     joints: list[float] | None = None
+    # "deg" / "rad" / None. Carried beside the numbers because the numbers alone are
+    # ambiguous: 1.5 is a nudge in degrees and 86 degrees in radians.
+    joint_units: str | None = None
+    # Which orientation_policy goto_xyzr applies when the caller omits it. The tool schema
+    # can only say "there is a default" — implements() runs before any config exists.
+    default_orientation_policy: str | None = None
+    # The body's reach envelope, so a plan can be built inside it instead of being bounced
+    # off SafetyRail one step at a time. workspace_bounds/z_min_safe are the CONFIG-stated
+    # Cartesian box (a fixed arm has one; a mobile body does not); reach_prior is the
+    # URDF-derived reach model, for bodies that ship a URDF. Either may be absent.
+    workspace_bounds: tuple[float, float, float, float] | None = None
+    z_min_safe: float | None = None
+    reach_prior: dict[str, Any] | None = None
     extra: dict[str, Any] = field(default_factory=dict)
     capabilities: tuple[str, ...] = ()
 
@@ -97,9 +164,14 @@ class WorldState:
         caps = tuple(sorted(getattr(env, "capabilities", None) or ()))
         return cls(
             tokens=tokens,
-            locations=memory.describe()["locations"],
+            locations=_with_reachability(memory.describe()["locations"], api),
             pose=pose,
             joints=joints,
+            joint_units=getattr(env, "joint_units", None),
+            default_orientation_policy=getattr(env, "default_orientation_policy", None),
+            workspace_bounds=_safe_attr(env, "workspace_bounds"),
+            z_min_safe=_safe_attr(env, "z_min_safe"),
+            reach_prior=_reach_prior(api),
             extra=extra,
             capabilities=caps,
         )
@@ -111,6 +183,11 @@ class WorldState:
             "locations": self.locations,
             "pose": self.pose,
             "joints": self.joints,
+            "joint_units": self.joint_units,
+            "default_orientation_policy": self.default_orientation_policy,
+            "workspace_bounds": list(self.workspace_bounds) if self.workspace_bounds else None,
+            "z_min_safe": self.z_min_safe,
+            "reach_prior": self.reach_prior,
             "extra": self.extra,
             "capabilities": list(self.capabilities),
         }
@@ -128,12 +205,33 @@ class WorldState:
             pose = ", ".join(f"{k}={float(v):.0f}" for k, v in self.pose.items() if isinstance(v, (int, float)))
             if pose:
                 lines.append(f"位姿：{pose}")
+        envelope: list[str] = []
+        if self.workspace_bounds:
+            xmin, ymin, xmax, ymax = self.workspace_bounds
+            envelope.append(f"XY 可达框 x∈[{xmin:.0f},{xmax:.0f}] y∈[{ymin:.0f},{ymax:.0f}]mm")
+        if self.z_min_safe is not None:
+            envelope.append(f"Z 下限 {self.z_min_safe:.0f}mm")
+        if envelope:
+            # Stated at plan time so a target outside it is never planned, instead of being
+            # rejected by SafetyRail one step into the run.
+            lines.append("工作范围：" + "，".join(envelope) + "（超出即被安全护栏拒绝，请在范围内规划）")
+        if self.reach_prior:
+            lines.append(f"可达模型：{self.reach_prior}")
+        if self.default_orientation_policy:
+            hint = _ORIENTATION_HINTS.get(self.default_orientation_policy, "")
+            suffix = f"（{hint}）" if hint else ""
+            lines.append(f"goto_xyzr 省略 orientation_policy 时用：{self.default_orientation_policy}{suffix}")
         if self.joints:
-            lines.append("关节：" + ", ".join(f"{float(j):.2f}" for j in self.joints))
+            # Name the unit, or say it is unknown — never let a bare number imply one.
+            unit = self.joint_units or "单位未声明"
+            lines.append(f"关节({unit})：" + ", ".join(f"{float(j):.2f}" for j in self.joints))
         for loc in self.locations:
             pos = loc.get("position_mm")
             pos_s = f"[{', '.join(f'{float(c):.0f}' for c in pos)}]mm" if isinstance(pos, (list, tuple)) else "?"
-            lines.append(f"已感知 {loc['referent']}：{pos_s}（{loc['sensed_by']}，{loc['age_s']}s 前）")
+            reach = loc.get("reachable")
+            # Only stated when the body could actually decide; absent means unknown.
+            reach_s = "" if reach is None else ("，当前位置够得着" if reach else "，当前位置够不着，需先移动过去")
+            lines.append(f"已感知 {loc['referent']}：{pos_s}（{loc['sensed_by']}，{loc['age_s']}s 前{reach_s}）")
         if not lines:
             return ""
         return "【当前状态】\n" + "\n".join(f"  {line}" for line in lines) + "\n\n"

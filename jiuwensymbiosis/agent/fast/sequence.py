@@ -12,7 +12,7 @@ detection results between steps internally.
 This module is the contract between the LLM (producer) and the runner
 (consumer). It defines:
 
-  * ``ActionStep`` — one step: an ``op`` (a ``@robot_tool`` action name, or the
+  * ``ActionStep`` — one step: an ``op`` (an ``@implements`` action name, or the
     compound real-time op ``track_detect``) + ``params`` (literals or symbolic
     expressions) + optional ``bind`` for detection steps.
   * ``parse_sequence`` — validate a raw ``list[dict]`` (the LLM output) into
@@ -52,7 +52,7 @@ from jiuwensymbiosis.api.state import (
     missing_requirements,
 )
 
-# Compound real-time ops implemented by the runner (not raw @robot_tool actions).
+# Compound real-time ops implemented by the runner (not raw @implements actions).
 TRACK_DETECT = "track_detect"
 TRACK_GRASP = "track_grasp"
 KNOWN_SPECIAL_OPS = frozenset({TRACK_DETECT, TRACK_GRASP})
@@ -262,7 +262,7 @@ def _op_metas(allowed_ops: Any) -> dict[str, ToolMeta]:
         return {}
     metas: dict[str, ToolMeta] = {}
     for name, fn in allowed_ops.items():
-        meta = getattr(fn, "__robot_tool__", None)
+        meta = getattr(fn, "__tool_meta__", None)
         if isinstance(meta, ToolMeta):
             metas[name] = meta
     return metas
@@ -314,7 +314,7 @@ class ActionStep:
     """One step of an action sequence.
 
     Attributes:
-        op: action name — a ``@robot_tool`` action (``home``, ``goto_xyzr``,
+        op: action name — an ``@implements`` action (``home``, ``goto_xyzr``,
             ``open_gripper``, ``close_gripper``, ``get_grasp_info_simple``, …) or
             the compound ``track_detect``.
         params: keyword args for the action. Values are literals (number/str) or

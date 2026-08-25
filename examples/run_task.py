@@ -108,7 +108,8 @@ def _build_session(args: argparse.Namespace, raw: dict[str, Any]) -> RobotSessio
                 return self.env.home_pose
 
             @implements(GOTO_XYZR)
-            def goto_xyzr(self, x: float, y: float, z: float, r: float | None = None) -> None:
+            def goto_xyzr(self, x: float, y: float, z: float, r: float | None = None,
+                          orientation_policy: str = "top_down") -> None:
                 """移动到指定坐标 (x, y, z, r)。"""
                 self.env.move(x, y, z, r)
 

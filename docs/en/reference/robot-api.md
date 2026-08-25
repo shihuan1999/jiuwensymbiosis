@@ -26,11 +26,13 @@ Subclasses implement:
 connect() -> None
 disconnect() -> None
 get_observation() -> RobotObservation
+home() -> None
 ```
 
-Optional lifecycle hooks are `reset()` and `emergency_stop()`. The base class supplies default delegations for
-`home`, `get_flange_pose`, `move_to_flange`, `move_joint`, `set_end_effector`, and `grab_rgb` when the low-level driver
-satisfies the corresponding Protocol.
+`home` is abstract because it backs the one unconditional action: a Cartesian default would smuggle
+`motion.cartesian` into bodies the capability gate cannot stop. Optional lifecycle hooks are `reset()` and
+`emergency_stop()`. The base class supplies default delegations for `get_flange_pose`, `move_to_flange`,
+`move_joint`, `set_end_effector`, and `grab_rgb` when the low-level driver satisfies the corresponding Protocol.
 
 Common contract properties include:
 
@@ -73,23 +75,20 @@ implements `analyze_scene()` only when it needs that optional higher-level tool.
 
 The source of truth is `jiuwensymbiosis.env.base.KNOWN_CAPABILITIES`.
 
-## `@robot_tool`
+## `@implements(SPEC)`
 
 ```python
-robot_tool(
-    _func=None,
-    *,
-    name=None,
-    desc=None,
-    capability=None,
-    input_params=None,
-    tags=None,
-)
+implements(spec: ActionSpec) -> Callable   # api/actions.py
 ```
 
-The decorator attaches `ToolMeta` to an unbound method. When omitted, the name comes from the function name, the
-description from the first docstring line, and the JSON input schema from type annotations and defaults. An adapter
-override inherits the Mixin metadata unless it redecorates the method.
+The one way a method becomes a tool. It attaches a `ToolMeta` holding `spec` plus `input_params`, the call schema
+derived from this body's signature (filtered to `spec.params`, refined by `spec.param_schema`). Every contract field
+— description, capability, tags, requires / provides / invalidates, location freshness — is read back off the spec,
+so an implementation has no channel for saying something the vocabulary does not.
+
+A signature that cannot accept a parameter the spec promises raises `ContractViolation` at import time.
+
+Bring-up, calibration and debug views are **not** actions: leave them undecorated and drive them from `scripts/`.
 
 ## Tool generation
 

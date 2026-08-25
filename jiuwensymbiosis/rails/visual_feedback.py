@@ -82,7 +82,7 @@ class VisualFeedbackRail(AgentRail):
     Args:
         session: The ``RobotSession`` (must expose ``.env``).
         watch_tools: Tool *names* that always trigger frame capture, regardless of tags.
-        trigger_tags: ``robot_tool`` tags that trigger capture
+        trigger_tags: ``ActionSpec`` tags that trigger capture
             (default: motion + grasp).
         directive_text: Short instruction appended next to the image.
         max_frames_per_invoke: Cap to avoid context blow-up on long episodes.
@@ -209,7 +209,7 @@ class VisualFeedbackRail(AgentRail):
         if api is None:
             return False
         method = getattr(api, effective_name, None)
-        meta = getattr(method, "__robot_tool__", None)
+        meta = getattr(method, "__tool_meta__", None)
         if meta is None:
             return False
         return bool(set(meta.tags) & self.trigger_tags)

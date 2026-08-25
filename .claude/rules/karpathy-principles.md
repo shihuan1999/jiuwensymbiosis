@@ -58,7 +58,7 @@ When your changes create orphans:
 - Remove imports/variables/functions that YOUR changes made unused.
 - Don't remove pre-existing dead code unless asked.
 
-In jiuwensymbiosis context: capability mixins and their `@robot_tool` methods
+In jiuwensymbiosis context: the shared `ActionSpec` vocabulary and its `@implements` methods
 are tightly coupled across MRO — changes to one mixin may affect tool
 emission for every adapter that mixes it in. Stay focused; every changed line
 should trace directly to the user's request.
@@ -85,7 +85,8 @@ For multi-step tasks, state a brief plan:
 
 In jiuwensymbiosis context: use `pytest tests/unit_tests/` for fast deterministic
 verification (no hardware/GPU). Use `python scripts/validate_adapter.py` and
-`python scripts/smoke_test_adapter.py` to verify adapter compatibility. Use
+`python scripts/smoke_test_adapter.py --module <adapter>` to verify adapter
+compatibility. Use
 `python examples/piper_pick_demo.py --mock` for an end-to-end smoke run
 without real hardware or LLM. Return the verification result to the user.
 

@@ -17,9 +17,15 @@ They live in one object because one hook maintains both: every dispatch calls
 Belief is corrected by observation wherever the env can actually measure the
 thing (see ``WorldState``); it is a starting point, not the last word.
 
-This replaces per-adapter private caches (a ``_last_detection`` /
-``_last_surface`` pair and friends): the bookkeeping is identical for every body,
-and only the framework knows the action contracts that drive it.
+This owns **whether a reading is still valid**, for every body: the bookkeeping is
+identical everywhere and only the framework knows the action contracts that drive
+it. It does not replace the api's ``last_detection`` / ``last_surface`` cache,
+which still holds the sensing *payload* a grasp/place step consumes — that cache
+keeps two role-separated slots (object vs support surface) which ``locations``,
+keyed by referent, cannot express. The two stay consistent because one hook drives
+both: the dispatch layer clears the cache exactly when it invalidates these
+locations (``tools/robot_control_tool.py:_stale_sensing_cache`` →
+``BaseRobotApi.invalidate_sensing_cache``). Do not add a second invalidation site.
 
 **Only successful actions count.** A detection that ran and returned
 ``ok=False`` establishes nothing, so a later step that needs a location finds

@@ -119,8 +119,9 @@ class TestSo101EnvCapabilities:
                 "motion.joint",
                 "grasp.parallel",
                 "motion.servo",
-                # Ships a URDF → the generic reach judge applies.
-                "planning.reachability",
+                # planning.reachability is NOT here: it is derived from shipping a URDF +
+                # arm_chains (BaseRobotEnv.effective_capabilities), and this Env exposes
+                # neither — so the judge could only ever have answered "unknown".
             }
         )
 
@@ -141,7 +142,6 @@ class TestSo101EnvReadOnlyProperties:
     @pytest.mark.parametrize(
         "prop,val",
         [
-            ("low_level", None),
             ("z_min_safe", 50.0),
             ("workspace_bounds", (0.0, 0.0, 100.0, 100.0)),
             ("joint_limits", None),
@@ -153,6 +153,26 @@ class TestSo101EnvReadOnlyProperties:
         env = _make_env()
         with pytest.raises(AttributeError, match="read-only"):
             setattr(env, prop, val)
+
+
+class TestSo101EnvLowLevelBinding:
+    """``low_level`` is bindable exactly once — the seam a smoke test or simulator uses.
+
+    The invariant is not "never settable" but "connect/disconnect owns rebinding": a driver
+    may be bound while none is, and never swapped out from under a bound one.
+    """
+
+    def test_binds_while_unbound(self):
+        env = _make_env()
+        driver = object()
+        env.low_level = driver
+        assert env.low_level is driver
+
+    def test_refuses_to_rebind_once_bound(self):
+        env = _make_env()
+        env.low_level = object()
+        with pytest.raises(AttributeError, match="already bound"):
+            env.low_level = object()
 
 
 class TestSo101EnvJointLimits:
@@ -219,7 +239,7 @@ class TestSo101EnvObservation:
 
 # ====================================================================== API
 class TestSo101ApiStructure:
-    def test_api_has_robot_tool_methods(self):
+    def test_api_has_action_methods(self):
         expected = [
             "home",
             "get_pose",
@@ -233,7 +253,7 @@ class TestSo101ApiStructure:
         for name in expected:
             method = getattr(So101Api, name, None)
             assert method is not None, f"So101Api.{name} not found"
-            assert hasattr(method, "__robot_tool__"), f"So101Api.{name} missing @robot_tool"
+            assert hasattr(method, "__tool_meta__"), f"So101Api.{name} missing @implements"
 
     def test_vision_methods_present(self):
         """Milestone B: the body declares the vision actions itself, off its own calibration."""
@@ -268,21 +288,21 @@ class TestSo101ApiStructure:
     def test_open_gripper_advertises_the_shared_contract(self):
         # The shared action declares width_mm; this body accepts and ignores it. The CONTRACT
         # calls it a hint, so no per-body caveat is needed and one skill drives either gripper.
-        meta = So101Api.open_gripper.__robot_tool__
+        meta = So101Api.open_gripper.__tool_meta__
         assert set(meta.input_params["properties"]) == {"width_mm"}
         assert "HINT" in meta.description
 
     def test_close_gripper_advertises_the_shared_contract(self):
-        meta = So101Api.close_gripper.__robot_tool__
+        meta = So101Api.close_gripper.__tool_meta__
         assert set(meta.input_params["properties"]) == {"force_n"}
         assert "HINT" in meta.description
 
-    def test_private_fast_tracking_hook_is_not_a_robot_tool(self):
+    def test_private_fast_tracking_hook_is_not_an_action(self):
         assert hasattr(So101Api, "get_grasp_tracking_sample")
-        assert not hasattr(So101Api.get_grasp_tracking_sample, "__robot_tool__")
+        assert not hasattr(So101Api.get_grasp_tracking_sample, "__tool_meta__")
 
     def test_goto_pose_input_params_exposes_nested_pose(self):
-        meta = So101Api.goto_pose.__robot_tool__
+        meta = So101Api.goto_pose.__tool_meta__
         top = meta.input_params
         assert top.get("type") == "object"
         assert top.get("required") == ["pose"]
@@ -377,8 +397,8 @@ class TestSo101ApiDelegates:
         assert api.is_grasp_confirmed({"ok": False, "state": "contact"}) is False
         assert api.is_grasp_confirmed(None) is False
 
-    def test_grasp_confirmation_hook_is_not_a_robot_tool(self):
-        assert not hasattr(So101Api.is_grasp_confirmed, "__robot_tool__")
+    def test_grasp_confirmation_hook_is_not_an_action(self):
+        assert not hasattr(So101Api.is_grasp_confirmed, "__tool_meta__")
 
     def test_open_gripper_ignores_width_mm(self):
         api, env, _driver = _build_api()
@@ -477,8 +497,12 @@ class TestSo101ApiDelegates:
         assert "home" in driver.log
 
     def test_move_joint_reaches_driver(self):
+        """Named in, vector out — the Env converts via ARM_JOINT_ORDER-keyed joint_limits."""
         api, _env, driver = _build_api()
-        api.move_joint([1.0, 2.0, 3.0, 4.0, 5.0])
+        api.move_joint({
+            "shoulder_pan": 1.0, "shoulder_lift": 2.0, "elbow_flex": 3.0,
+            "wrist_flex": 4.0, "wrist_roll": 5.0,
+        })
         assert ("joint", [1.0, 2.0, 3.0, 4.0, 5.0]) in driver.log
 
     def test_move_direction_routes_so101pose_not_namespace(self):

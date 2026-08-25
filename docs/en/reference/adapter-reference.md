@@ -90,6 +90,7 @@ Abstract methods:
 | `connect()` | Open hardware; idempotent |
 | `disconnect()` | Release hardware; safe in every state |
 | `get_observation()` | Best-effort snapshot; transient sensor gaps do not fail the whole call |
+| `home()` | Return the body to its safe posture; abstract because `home` is the one unconditional action, so no Cartesian default may stand in for it |
 
 `RobotObservation` fields:
 
@@ -116,7 +117,6 @@ Inherited delegation:
 
 | Env verb | Driver target |
 |---|---|
-| `home()` | `driver.home()` |
 | `get_flange_pose()` | `driver.get_pose()` |
 | `move_to_flange(pose)` | `driver.move_to_pose_blocking(pose)` |
 | `move_joint(q)` | `driver.move_joint_blocking(q)` |

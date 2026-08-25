@@ -9,6 +9,7 @@ import math
 
 from jiuwensymbiosis.adapters.cruzr.api import CruzrApi
 from jiuwensymbiosis.adapters.cruzr.config import CruzrConfig
+from jiuwensymbiosis.motion import approach
 
 
 class _LL:
@@ -43,8 +44,8 @@ def _api_with_senses(senses):
     api = CruzrApi(env)
     it = iter(senses)
     api.locate_for_place = lambda object_name="table": next(it)   # type: ignore[method-assign]
-    api._nav.look_for = lambda object_name="table", on=None, camera=None: {"ok": True, "found": False,  # type: ignore[method-assign]
-                                                              "reason": "no_detection", "image_h": 100, "image_w": 200}
+    _miss = {"ok": True, "found": False, "reason": "no_detection", "image_h": 100, "image_w": 200}
+    api.look_for = lambda object_name="table", on=None, camera=None: _miss  # type: ignore[method-assign]
     api.set_head = lambda yaw_rad, pitch_rad: {"ok": True}       # type: ignore[method-assign]
     return api, env
 
@@ -59,7 +60,7 @@ _NF = {"ok": False, "reason": "no_detection"}
 def test_acquire_in_view_does_not_turn():
     # surface centred ahead, already in view → acquire + cache, no rotation, no head scan, no spin.
     api, env = _api_with_senses([_ok(1000.0, 50.0)])
-    out = api._nav._face_surface("table")
+    out = approach._face_surface(api, "table")
     assert out["ok"] and out["status"] == "acquired"
     assert out["turned_rad"] == 0.0
     assert env.low_level.nav_calls == []          # never rotated
@@ -70,7 +71,7 @@ def test_offcentre_surface_in_view_does_not_align_turn():
     # Centroid facing removed: an off-centre surface already in view is acquired + cached WITHOUT a
     # rotate — approach_for_place owns all base alignment. The bearing is still reported for info.
     api, env = _api_with_senses([_ok(1000.0, 500.0)])
-    out = api._nav._face_surface("table")
+    out = approach._face_surface(api, "table")
     assert out["ok"] and out["status"] == "acquired"
     assert math.isclose(out["bearing_rad"], math.atan2(500.0, 1000.0), rel_tol=1e-6)
     assert env.low_level.spin_started == 0
@@ -82,7 +83,7 @@ def test_not_found_after_panscan_and_180_fails_safe():
     # pan-scan miss) → fail safe; caller must not blind-place. The ONLY base motion is the single
     # 180° fallback (no continuous spin).
     api, env = _api_with_senses([_NF])
-    out = api._nav._face_surface("table")
+    out = approach._face_surface(api, "table")
     assert out["ok"] is False and out["reason"] == "surface_not_found"
     assert out.get("note") == "panscan_exhausted"
     assert env.low_level.spin_started == 0

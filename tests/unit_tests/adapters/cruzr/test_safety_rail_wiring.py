@@ -18,6 +18,7 @@ from jiuwensymbiosis.adapters.cruzr.env import CruzrEnv
 from jiuwensymbiosis.adapters.cruzr.geometry import LIFTER_LIMITS
 from jiuwensymbiosis.rails.safety import SafetyRail
 from tests.helpers import FakeCtx
+from tests.unit_tests.adapters.cruzr import description
 
 
 class _Session:
@@ -75,15 +76,61 @@ class TestLiftPolicy:
             await rail.before_tool_call(ctx)
 
 
+class TestNamedJointRangeIsEnforced:
+    """``move_named_joint`` is how a plan says "raise the arm", so it is the one joint verb
+    Cruzr actually exposes — and it is only guarded if the body states a range. A bug that
+    left ``joint_limits`` unset disabled this check silently, which is what these tests
+    exist to catch.
+
+    The range is injected rather than read off the URDF: what is under test here is the RAIL
+    WIRING, which must be verifiable on a machine that has no Cruzr description checked out.
+    That the URDF itself yields limits is ``test_urdf_limits_are_read`` below, and that
+    ``Chain.limits()`` returns a mapping at all is covered deterministically in
+    ``tests/unit_tests/kinematics/test_urdf_chain.py``.
+    """
+
+    @pytest.fixture
+    def rail_with_range(self):
+        env = CruzrEnv(CruzrConfig())
+        env.joint_limits = {"waist_yaw_joint": (-1.5, 1.5)}
+        return SafetyRail(_Session(env))
+
+    async def test_in_range_target_passes(self, rail_with_range):
+        args = {"joint_name": "waist_yaw_joint", "position_rad": 0.0}
+        await rail_with_range.before_tool_call(FakeCtx(tool_name="move_named_joint", tool_args=args))
+
+    async def test_out_of_range_is_rejected(self, rail_with_range):
+        args = {"joint_name": "waist_yaw_joint", "position_rad": 2.5}
+        with pytest.raises(ValueError, match="out of limits"):
+            await rail_with_range.before_tool_call(FakeCtx(tool_name="move_named_joint", tool_args=args))
+
+    async def test_joint_the_body_states_no_limit_for_passes(self, rail_with_range):
+        """Same "no range stated → no range check" rule the rest of the rail follows."""
+        args = {"joint_name": "not_a_cruzr_joint", "position_rad": 99.0}
+        await rail_with_range.before_tool_call(FakeCtx(tool_name="move_named_joint", tool_args=args))
+
+    @description.requires_description
+    def test_urdf_limits_are_read(self):
+        """Cruzr's own description really does state the ranges the rail above enforces.
+
+        Needs the description checked out, so it skips elsewhere — the config no longer
+        carries a default path, because a wrong one fails more quietly than none.
+        """
+        limits = CruzrEnv(CruzrConfig(urdf_path=description.URDF)).joint_limits
+        assert limits, "no joint_limits → move_named_joint would dispatch unchecked"
+        assert "waist_yaw_joint" in limits
+
+
 class TestUnconstrainedVerbsStillDispatch:
-    """Cruzr declares no base / waist envelope, and ``joint_limits`` stays unset.
-    Absent limits mean "no range check" — the rail must not turn that into a refusal,
-    or enabling it would break real-hardware behaviour."""
+    """Cruzr declares no base / waist envelope. Absent limits mean "no range check" — the
+    rail must not turn that into a refusal, or enabling it would break real-hardware
+    behaviour. (``move_joint`` is not on this list: Cruzr both states joint limits and never
+    implements that action — a bare list has no meaning across two arms plus a waist and a
+    lifter, which is why the body exposes ``move_named_joint`` instead.)"""
 
     @pytest.mark.parametrize(
         ("tool_name", "tool_args"),
         [
-            ("move_joint", {"q": [0.4]}),
             ("navigate_relative", {"dx_m": 1.5, "dy_m": 0.0, "dyaw_rad": 0.3}),
             ("rotate_base", {"dyaw_rad": 3.0}),
             ("drive_arc", {"radius_m": 0.8, "dyaw_rad": 1.1}),
