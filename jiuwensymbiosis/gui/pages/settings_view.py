@@ -41,8 +41,4 @@ class SettingsView:
             ui.input(value=workspace, on_change=lambda e: on_workspace_change(e.value)).classes("w-full").props(
                 "outlined dense"
             )
-            ui.label("任务的执行记录(可在「历史」页回看)保存在此目录,一般无需改动。").classes("text-gray-500 text-sm")
-            ui.separator()
-            with ui.row().classes("items-center gap-2"):
-                ui.label("界面语言:")
-                ui.label("简体中文")
+            ui.label("一般无需改动。").classes("text-gray-500 text-sm")

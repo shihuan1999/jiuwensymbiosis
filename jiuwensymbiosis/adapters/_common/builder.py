@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from jiuwensymbiosis.agent.session import RobotSession
 
@@ -104,8 +104,22 @@ def make_detector_sidecar(cfg_attr: str = "detector"):
     return _build
 
 
+class ConfigFactory(Protocol):
+    """The config-class contract a session builder needs: both loaders.
+
+    Typing ``cfg_cls`` as a bare ``type`` hid these from the checker, so every
+    call to them had to be silenced one by one.
+    """
+
+    def from_yaml(self, path: str | Path) -> Any:
+        pass
+
+    def from_dict(self, data: dict[str, Any]) -> Any:
+        pass
+
+
 def make_builder(
-    cfg_cls: type,
+    cfg_cls: ConfigFactory,
     env_cls: type,
     api_cls: type,
     *,
@@ -132,16 +146,19 @@ def make_builder(
       decorate: Optional final-pass callback for storing things on the session.
 
     Returns a callable ``build(cfg)`` that also exposes ``.from_yaml(path)``
-    and ``.from_dict(dict)`` as attributes.
+    and ``.from_dict(dict)`` as attributes. All three take ``include_sidecars``
+    (default True); passing False builds the same env/api without starting any
+    sidecar, which is how calibration connects hardware without paying the
+    detector subprocess's GPU model load.
     """
 
-    def _session_from_cfg(cfg: Any) -> RobotSession:
+    def _session_from_cfg(cfg: Any, *, include_sidecars: bool = True) -> RobotSession:
         env = env_cls(cfg)
         api_kwargs = _resolve_api_kwargs(api_kwargs_from_cfg, cfg)
         api = api_cls(env, **api_kwargs)
 
         sidecar_starters: list[Callable[[], Any]] = []
-        if sidecar_builders:
+        if include_sidecars and sidecar_builders:
             for build in sidecar_builders:
                 cm_or_lambda = build(cfg)
                 if cm_or_lambda is None:
@@ -165,21 +182,21 @@ def make_builder(
             decorate(session, cfg)
         return session
 
-    def build(cfg: Any) -> RobotSession:
+    def build(cfg: Any, *, include_sidecars: bool = True) -> RobotSession:
         """Build a session directly from an in-memory config object."""
-        return _session_from_cfg(cfg)
+        return _session_from_cfg(cfg, include_sidecars=include_sidecars)
 
-    def from_yaml(path: str | Path) -> RobotSession:
+    def from_yaml(path: str | Path, *, include_sidecars: bool = True) -> RobotSession:
         """Build a session from a YAML config file at ``path``."""
-        # cfg_cls is a config dataclass w/ from_yaml classmethod (factory contract)
-        return _session_from_cfg(cfg_cls.from_yaml(path))  # type: ignore[attr-defined]
+        return _session_from_cfg(cfg_cls.from_yaml(path), include_sidecars=include_sidecars)
 
-    def from_dict(data: dict[str, Any]) -> RobotSession:
+    def from_dict(data: dict[str, Any], *, include_sidecars: bool = True) -> RobotSession:
         """Build a session from an in-memory config ``dict``."""
-        # cfg_cls is a config dataclass w/ from_dict classmethod (factory contract)
-        return _session_from_cfg(cfg_cls.from_dict(data))  # type: ignore[attr-defined]
+        return _session_from_cfg(cfg_cls.from_dict(data), include_sidecars=include_sidecars)
 
-    # function-attribute attachment pattern; mypy can't model fn.__dict__
+    # A function carrying its loaders, deliberately not a class — see
+    # tests/unit_tests/adapters/common/test_builder.py:TestBuilderSignature.
+    # mypy cannot model fn.__dict__, so the two attachments stay silenced.
     build.from_yaml = from_yaml  # type: ignore[attr-defined]
     build.from_dict = from_dict  # type: ignore[attr-defined]
     return build

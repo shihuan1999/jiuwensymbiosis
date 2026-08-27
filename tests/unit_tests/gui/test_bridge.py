@@ -243,3 +243,55 @@ async def test_robot_control_is_unwrapped_in_step_label(session):
     start = next(d for k, d in emitter.events if k == "start")
     assert start["tool"] == "close_gripper"
     assert start["label"] == "闭合夹爪抓取"
+
+
+class _EmitterSF(_Emitter):
+    """Emitter that also records the step_frame event (detection overlay)."""
+
+    def step_frame(self, idx: int, rgb: Any) -> None:
+        self.events.append(("step_frame", {"index": idx}))
+
+
+class _FakeApi:
+    def __init__(self, overlay: Any) -> None:
+        self._ov = overlay
+
+    def pop_last_detection_overlay(self) -> Any:
+        ov = self._ov
+        self._ov = None
+        return ov
+
+
+class _FakeSession:
+    def __init__(self, api: Any) -> None:
+        self.api = api
+        self.env = None
+
+
+async def test_detection_tool_pins_overlay_frame_after_finish():
+    """检测步:叠加图必须在 step_finished 之后发,才能覆盖该步默认快照并钉到该步。"""
+    import numpy as np
+
+    emitter = _EmitterSF()
+    rail = UIBridgeRail(emitter, _FakeSession(_FakeApi(np.zeros((4, 4, 3), dtype=np.uint8))))
+    ctx = _Ctx(
+        _Inputs("get_grasp_info_simple", {"object_name": "box"}, tool_result={"ok": True, "position": [1, 2, 3]})
+    )
+
+    await rail.before_tool_call(ctx)
+    await rail.after_tool_call(ctx)
+
+    assert [e[0] for e in emitter.events] == ["start", "narration", "finish", "step_frame"]
+    sf = next(d for k, d in emitter.events if k == "step_frame")
+    assert sf["index"] == 1
+
+
+async def test_detection_tool_without_overlay_emits_no_step_frame():
+    emitter = _EmitterSF()
+    rail = UIBridgeRail(emitter, _FakeSession(_FakeApi(None)))
+    ctx = _Ctx(_Inputs("get_grasp_info_simple", {"object_name": "box"}, tool_result={"ok": True}))
+
+    await rail.before_tool_call(ctx)
+    await rail.after_tool_call(ctx)
+
+    assert [e[0] for e in emitter.events] == ["start", "narration", "finish"]

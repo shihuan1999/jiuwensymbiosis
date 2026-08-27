@@ -14,6 +14,7 @@ Covers:
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -189,6 +190,37 @@ class TestSo101EnvJointLimits:
         # Fresh dict each access (stable indexing even if source dict order drifts).
         assert limits1 == limits2
         assert limits1 is not limits2
+
+
+class TestSo101EnvHandGuiding:
+    def test_forwards_the_flag_to_the_driver(self):
+        # A real class, not a MagicMock: runtime_checkable isinstance resolves
+        # members with getattr_static, which cannot see synthesised mock attributes.
+        class _Driver:
+            calls: list[bool] = []
+
+            def hand_guiding(self, *, include_end_effector: bool = False):
+                self.calls.append(include_end_effector)
+                return nullcontext()
+
+        env = _make_env()
+        driver = _Driver()
+        env._inner = driver
+
+        env.hand_guiding(include_end_effector=True)
+
+        assert driver.calls == [True]
+
+    def test_driver_without_the_port_is_rejected_by_name(self):
+        env = _make_env()
+        env._inner = SimpleNamespace()
+
+        with pytest.raises(NotImplementedError, match="HandGuidingDriver"):
+            env.hand_guiding()
+
+    def test_disconnected_env_is_rejected(self):
+        with pytest.raises(RuntimeError, match="not connected"):
+            _make_env().hand_guiding()
 
 
 class TestSo101EnvObservation:
@@ -560,3 +592,21 @@ class TestToolEmission:
         assert "get_grasp_info_simple" in names
         assert "pixel_to_base_xyz" in names
         assert "analyze_scene" in names
+
+
+class TestSo101ReverseProjection:
+    """_project_base_to_pixel marks the true grasp point on the GUI overlay."""
+
+    def test_round_trips_pixel_through_base(self):
+        api, _env, _driver = _build_api()
+        u, v, depth = 300.0, 200.0, 0.5
+        base = api.pixel_to_base_xyz(u, v, depth)
+        uv = api._project_base_to_pixel([base["x"], base["y"], base["z"]])
+        assert uv is not None
+        assert uv[0] == pytest.approx(u, abs=1e-6)
+        assert uv[1] == pytest.approx(v, abs=1e-6)
+
+    def test_none_when_point_behind_camera(self):
+        api, _env, _driver = _build_api()
+        # tf_base_cam = eye → base z<=0 ⇒ camera-frame z<=0 ⇒ not projectable.
+        assert api._project_base_to_pixel([10.0, 20.0, -5.0]) is None

@@ -33,6 +33,7 @@ from typing import Any
 from jiuwensymbiosis.agent.abstractions import Tool, ToolCard, ToolOutput
 from jiuwensymbiosis.api.decorators import ToolMeta
 from jiuwensymbiosis.api.memory import ExecutionMemory, action_succeeded
+from jiuwensymbiosis.errors import error_code
 
 logger = logging.getLogger(__name__)
 
@@ -213,9 +214,14 @@ class RobotControlTool(Tool):
                 error=f"bad params for '{action}': {exc}",
             )
         except Exception as exc:  # noqa: BLE001 - convert to ToolOutput
+            # ``ToolOutput.error`` is a plain string, so a coded failure would lose its
+            # code here; park it in ``data`` (kept on failures too) for callers that
+            # dispatch this tool directly, e.g. the fast path's ability executor.
+            code = error_code(exc)
             return ToolOutput(
                 success=False,
                 error=f"{type(exc).__name__}: {exc}",
+                data={"action": action, "error_code": code} if code else None,
             )
 
     async def stream(self, inputs: dict[str, Any], **kwargs: Any) -> AsyncIterator[Any]:

@@ -58,6 +58,18 @@ python -m jiuwensymbiosis.gui        # or the console script: jiuwensymbiosis-gu
 #   so no pywebview/WebKitGTK). No extra system libs needed. The GUI does a startup
 #   pre-check (jiuwensymbiosis/gui/preflight.py) and prints the exact package to
 #   install (pip install -e ".[gui]") instead of crashing with a raw traceback.
+#   「工具」 page hosts task-agnostic tools: 感知测试 (click-to-reproject),
+#   手眼标定 (the four-step calibration wizard; needs pip install -e ".[calib]"),
+#   and 硬件控制 (release torque, hand-pose the arm, restore — gated on the driver
+#   implementing HandGuidingDriver; see "Hand Guiding" below).
+#   「运行」 page has 回到起始位: after a run, drive the arm back to the joints it
+#   was at when that run connected.
+
+# Hand-eye calibration CLI (same workflows the GUI wizard drives)
+jiuwensymbiosis-calibrate-hand-eye --config <runtime.yaml> --collect-poses tmp/wp.npz
+jiuwensymbiosis-calibrate-hand-eye --config <runtime.yaml> --auto tmp/wp.npz --dry-run
+jiuwensymbiosis-calibrate-hand-eye --replay <stations.npz> [--config <runtime.yaml>]
+#   Exit codes: 0 published (or dry-run OK), 1 error, 2 preflight, 3 REVIEW/candidate.
 
 # Lint / format / type-check (tools not installed by default; install: pip install ruff mypy)
 ruff format .           # format (Black-compatible drop-in)
@@ -170,6 +182,53 @@ New robot types follow this pattern under `jiuwensymbiosis/adapters/<name>/`:
 Template at `templates/xxx_adapter/`. Validate statically with `scripts/validate_adapter.py`; smoke-test runtime behavior (every action callable + JSON-serializable, driven by a stub driver) with
 `scripts/smoke_test_adapter.py --module <adapter>`.
 
+### Hand Guiding (release torque so a human can pose the arm)
+
+`HandGuidingDriver` (`env/protocol.py`) is an **optional** driver protocol, sibling to
+`SuctionDriver` / `GripperDriver`: `hand_guiding(*, include_end_effector=False)` returns a
+context manager that drops torque on entry and restores it on exit. Restoring must
+resynchronise the motion targets with where the human actually left the robot **before**
+re-energising, or the servos snap back to the pre-release goal; failing that raises
+`HandGuidingRecoveryError` (the one failure the operator has to react to physically).
+
+`include_end_effector=False` releases the arm only — calibration teaching relies on it to keep
+the board clamped in the gripper. `True` releases everything, so whatever it holds will drop.
+
+Consumers probe support with `isinstance(env.low_level, HandGuidingDriver)`, never by body
+name. `So101Env.hand_guiding()` is a convenience passthrough. Calibration's own
+`ManualGuidance` / `GuidanceHold` ports (`calibration/domain/ports.py`) stay
+calibration-owned and delegate down to this driver protocol — the Env deliberately does **not**
+satisfy them (`tests/unit_tests/calibration/test_adapter_conformance.py`).
+
+### Hand-Eye Calibration Subsystem
+
+`jiuwensymbiosis/calibration/` is a layered, body-agnostic subsystem consumed by both the
+CLI (`scripts/calibrate/`) and the GUI wizard. Dependency direction is one-way: calibration
+may import core, core must not import calibration (enforced by
+`tests/unit_tests/calibration/test_dependency_direction.py`; `gui/` is an exempt *consumer*
+that must still keep its imports lazy).
+
+```
+domain/       models · ports (hardware Protocols) · solver · quality · trajectory
+workflows/    collect → execute → publication / replay / preflight / profile
+artifacts/    self-describing waypoint + station archives; artifact publication
+adapters/     per-body wrappers exposing CALIBRATION_ADAPTER_SPEC
+integration/  adapter discovery (by naming convention) + reload-smoke validator
+```
+
+Three entry points, all headless (they log; they never print or prompt except through an
+injectable `prompt_fn`): `collect_waypoints` / `execute_calibration` / `replay_calibration`.
+
+**Publication is fail-closed**: only ACCEPT *plus* a reload smoke test through the adapter's
+own runtime loader publishes a formal schema-2 artifact. Anything else lands in a
+`.candidate.json` REVIEW report that the runtime loader will not load. Never hand-promote a
+candidate — that bypasses both the quality gates and the loader round-trip.
+
+Adding a body to calibration = one wrapper module under `calibration/adapters/` exposing
+`CALIBRATION_ADAPTER_SPEC`, plus (for the GUI wizard) one entry in
+`gui/data/calibration_profiles.yaml` declaring its trajectory space and calibration-time
+limit relaxations.
+
 ### Visual Perception Pipeline
 
 Detection runs as a subprocess (GroundingDINO + SAM2) via `perception/detector_sidecar.py`. `RobotSession` manages lifecycle. The body-agnostic `perception/` package provides the shared pipeline: `detector_client.init_detector()`, `vision.detect_and_centroid()`, `vision.apply_xy_correction()`, `object_geometry` (mask → 3D extent), and `scene3d` (the detect → centroid → project → correct → geometry chain behind `Scene3DMixin`).
@@ -198,6 +257,8 @@ jiuwensymbiosis/          # Main package
     so101/                # SO-101 5-DoF arm (gripper + eye-to-hand camera)
     cruzr/                # Cruzr mobile dual-arm (base + lifter + waist + paddle grasp)
     _common/              # Shared adapter utilities (builder, detector, vision, calibration)
+  calibration/            # Body-agnostic hand-eye calibration subsystem (see above)
+  gui/                    # NiceGUI browser UI; pages/ + per-tool engines (run/perception/calibration)
   serving/                # Visual perception server subprocess (GroundingDINO + SAM2)
   contracts.py            # Action result shapes + the spatial-relation set. Owned by no layer
                           #   (api/ promises them, perception/ + motion/ build them) and imports

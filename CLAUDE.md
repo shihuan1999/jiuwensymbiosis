@@ -16,7 +16,7 @@ files. **Skills** (longer, on-demand reference manuals) live in
 
 | File | Scope | When it loads |
 |---|---|---|
-| `karpathy-principles.md` | Coding behavior (think / simplify / surgical / goal-driven) | Always (`alwaysApply: true`) |
+| `karpathy-principles.md` | Coding behavior (think / simplify / surgical / goal-driven) | Session start (no `paths`) |
 | `code-style.md` | Python style, formatting, naming, imports, async safety | `jiuwensymbiosis/**/*.py` |
 | `security.md` | Credentials, **physical safety**, proxy hygiene, dependency review | `jiuwensymbiosis/**/*.py`, `configs/**/*.yaml` |
 | `testing.md` | Test location, mock-hardware pattern, async tests, running | `tests/**/*.py` |

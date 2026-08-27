@@ -310,3 +310,22 @@ class TestDefaultEyeInHandHelpers:
         assert abs(result["x"]) < 1e-6
         assert abs(result["y"]) < 1e-6
         assert abs(result["z"] - 500.0) < 1e-6
+
+class TestGraspDebugIndex:
+    """Each run gets its own output dir, so the artifact index resets to 1
+    whenever the target directory changes — every run's folder starts at det_001."""
+
+    def test_index_resets_on_dir_change(self):
+        import itertools
+        from pathlib import Path
+
+        import jiuwensymbiosis.perception.vision as vision
+
+        vision._GRASP_DEBUG_COUNTER = itertools.count(1)
+        vision._GRASP_DEBUG_COUNTER_DIR = None
+        run_a = Path("/tmp/run-a/grasp_debug")
+        run_b = Path("/tmp/run-b/grasp_debug")
+        assert vision._next_grasp_index(run_a) == 1
+        assert vision._next_grasp_index(run_a) == 2
+        assert vision._next_grasp_index(run_b) == 1  # new run dir → reset
+        assert vision._next_grasp_index(run_b) == 2

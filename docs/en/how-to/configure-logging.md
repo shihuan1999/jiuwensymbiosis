@@ -159,8 +159,9 @@ root.handlers
 ```
 
 This ownership model makes reconfiguration idempotent and lets `log_dir` change without deleting host logging setup.
-Piper command logging remains independent: disable it with `JIUWEN_PIPER_CMD_LOG=0` or change its root with
-`JIUWEN_PIPER_CMD_LOG_DIR` (`JIUWEN_CMD_LOG_DIR` remains a compatibility fallback).
+Per-run motion artifacts live in their own directory, one per run: `<motion_log_dir>/<stamp>/` holds the Piper
+`commands.log` and the `grasp_debug/` detection dumps side by side. Set the root with `agent.motion_log_dir`
+(default `./jiuwen_motion_log`); disable the Piper command log with `JIUWEN_PIPER_CMD_LOG=0`.
 
 ## 4. Related files
 

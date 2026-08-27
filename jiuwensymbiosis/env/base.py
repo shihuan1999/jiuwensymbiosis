@@ -70,6 +70,13 @@ KNOWN_CAPABILITIES: frozenset[str] = frozenset(
     }
 )
 
+# Capabilities NEITHER side declares: each derives its own half (the Api "do I hold a
+# judge", the Env "do I ship the model it reads" — see ``effective_capabilities``), and
+# the intersection is the answer. So an api-only derived capability is that mechanism
+# working, not a body that forgot to declare something, and the session's capability
+# mismatch alarm skips them.
+DERIVED_CAPABILITIES = frozenset({"planning.reachability"})
+
 
 @dataclass
 class RobotObservation:

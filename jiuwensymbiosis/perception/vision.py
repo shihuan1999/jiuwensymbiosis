@@ -25,7 +25,6 @@ import itertools
 import json
 import logging
 import os
-import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -34,13 +33,20 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Single shared counter so artifacts from multiple sessions don't stomp
-# each other. Resets to 1 on each fresh Python process.
+# Per-run detection index. Each run gets its own output directory (see
+# jiuwensymbiosis.utils.logging.current_run_dir), so the counter resets to 1
+# whenever the target directory changes — every run's artifacts number from 001.
 _GRASP_DEBUG_COUNTER = itertools.count(1)
+_GRASP_DEBUG_COUNTER_DIR: Path | None = None
 
-# Per-process stamp so the default debug dir lands under a unique subdir
-# each time the demo is launched. Computed once at module import.
-_RUN_STAMP = time.strftime("%Y-%m-%d_%H-%M-%S")
+
+def _next_grasp_index(debug_dir: Path) -> int:
+    """Next 1-based artifact index for ``debug_dir``; resets when the dir changes."""
+    global _GRASP_DEBUG_COUNTER, _GRASP_DEBUG_COUNTER_DIR
+    if debug_dir != _GRASP_DEBUG_COUNTER_DIR:
+        _GRASP_DEBUG_COUNTER = itertools.count(1)
+        _GRASP_DEBUG_COUNTER_DIR = debug_dir
+    return next(_GRASP_DEBUG_COUNTER)
 
 
 def _run_detect_pick_best(
@@ -424,6 +430,125 @@ def apply_xy_correction(
 
 
 # ---------------------------------------------------------------------------
+# Top-surface grasp point (opt-in; default off).
+#
+# The default pipeline picks ONE pixel (the mask centroid) and reads its depth,
+# which for an oblique/side camera view lands on the middle of the object's
+# visible FRONT face — a top-down gripper then collides with the top of the
+# object. The helpers below instead project the WHOLE mask to a base-frame point
+# cloud and model the object as a yaw-only bounding box (flat on the table, free
+# rotation about base +Z): the top face height ``z_top`` and the top region's
+# horizontal centre / short-axis yaw are viewpoint-independent. The result stands
+# in for the adapter's projected ``xyz_raw`` as ``[centre_x, centre_y, z_top]`` so
+# every downstream correction / offset keeps its exact meaning.
+# ---------------------------------------------------------------------------
+
+
+def _erode_mask_bool(mask: np.ndarray, px: int) -> np.ndarray:
+    """4-connectivity binary erosion by ``px`` pixels (pure numpy, no scipy/cv2).
+
+    Peels the mask boundary where SAM2 edges and RealSense depth edges are least
+    reliable, so boundary flyers don't contaminate the point cloud.
+    """
+    m = np.asarray(mask, dtype=bool)
+    for _ in range(max(0, int(px))):
+        padded = np.pad(m, 1, mode="constant", constant_values=False)
+        m = padded[1:-1, 1:-1] & padded[:-2, 1:-1] & padded[2:, 1:-1] & padded[1:-1, :-2] & padded[1:-1, 2:]
+    return m
+
+
+def mask_pixels_and_depths(
+    best: dict,
+    depth_img_m: np.ndarray,
+    *,
+    erode_px: int = 2,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return ``(us, vs, depths_m)`` for valid depth pixels inside the (eroded) mask.
+
+    The detector mask may be a different resolution than the depth image; it is
+    nearest-neighbour resampled to the depth grid (matching the centroid path's
+    same-grid assumption) so the returned pixel coords index the depth image (and
+    the image-resolution intrinsics) directly. Pixels with non-positive or
+    non-finite depth are dropped.
+    """
+    mask = np.asarray(best["mask"], dtype=bool)
+    depth = np.asarray(depth_img_m)
+    dep_h, dep_w = depth.shape[:2]
+    mask_h, mask_w = mask.shape[:2]
+    if (mask_h, mask_w) != (dep_h, dep_w):
+        row_idx = np.minimum(np.arange(dep_h) * mask_h // dep_h, mask_h - 1)
+        col_idx = np.minimum(np.arange(dep_w) * mask_w // dep_w, mask_w - 1)
+        mask = mask[np.ix_(row_idx, col_idx)]
+    mask = _erode_mask_bool(mask, erode_px)
+    ys, xs = np.nonzero(mask)
+    if xs.size == 0:
+        empty = np.empty(0, dtype=np.float64)
+        return empty, empty.copy(), empty.copy()
+    depths = depth[ys, xs]
+    valid = (depths > 0) & np.isfinite(depths)
+    return xs[valid].astype(np.float64), ys[valid].astype(np.float64), depths[valid].astype(np.float64)
+
+
+def select_top_surface_grasp(
+    points_base_mm: np.ndarray,
+    *,
+    band_mm: float = 15.0,
+    top_percentile: float = 90.0,
+    min_points: int = 30,
+) -> dict[str, float] | None:
+    """Yaw-only bounding box of a base-frame object point cloud → top-surface grasp.
+
+    Models the object as a box lying flat on the table with free rotation about
+    base +Z. Returns ``{"x", "y", "z_top", "rz", "width_mm", "n_points"}`` (mm /
+    deg), or ``None`` when there are too few points to trust (caller then falls
+    back to the centroid path). Steps:
+
+      1. Robust Z outlier rejection (MAD) so a few RealSense flyers can't lift
+         ``z_top``.
+      2. ``z_top`` = ``top_percentile`` of Z (robust "highest" surface).
+      3. Fit the horizontal box on the TOP BAND (``z >= z_top - band_mm``) when it
+         has enough points, else the whole cloud: centre = robust median XY, yaw =
+         PCA short-axis (parallel-jaw closes across the short dimension), width =
+         extent along that short axis.
+    """
+    pts = np.asarray(points_base_mm, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 3 or pts.shape[0] < min_points:
+        return None
+
+    z = pts[:, 2]
+    med = float(np.median(z))
+    mad = float(np.median(np.abs(z - med)))
+    if mad > 0.0:
+        pts = pts[np.abs(z - med) <= 5.0 * 1.4826 * mad]
+        if pts.shape[0] < min_points:
+            return None
+        z = pts[:, 2]
+
+    z_top = float(np.percentile(z, top_percentile))
+    band = pts[z >= z_top - float(band_mm)]
+    obb_pts = band if band.shape[0] >= min_points else pts
+    xy = obb_pts[:, :2]
+
+    centre = np.median(xy, axis=0)
+    centred = xy - centre
+    cov = np.cov(centred.T)
+    # eigh → ascending eigenvalues; smallest-variance eigenvector is the short axis.
+    _evals, evecs = np.linalg.eigh(np.atleast_2d(cov))
+    minor = evecs[:, 0]
+    rz = float(np.degrees(np.arctan2(minor[1], minor[0])))
+    proj_minor = centred @ minor
+    width_mm = float(proj_minor.max() - proj_minor.min())
+    return {
+        "x": float(centre[0]),
+        "y": float(centre[1]),
+        "z_top": z_top,
+        "rz": rz,
+        "width_mm": width_mm,
+        "n_points": int(obb_pts.shape[0]),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Default eye-in-hand implementations.
 #
 # ``get_grasp_info_simple`` / ``pixel_to_base_xyz`` cannot have a *generic*
@@ -580,28 +705,18 @@ def default_get_grasp_info_simple(
 def _default_debug_dir() -> Path:
     """Resolve where ``dump_grasp_debug`` writes artifacts.
 
-    Resolution order (first match wins):
-      1. ``$JIUWEN_GRASP_DEBUG_DIR`` (verbatim) — explicit user override.
-      2. ``$JIUWEN_MOTION_LOG_RUN_DIR/grasp_debug`` — current motion-log run.
-      3. ``$JIUWEN_GRASP_DEBUG_ROOT/<run-stamp>`` — legacy explicit root.
-      4. ``$JIUWEN_CMD_LOG_DIR/<run-stamp>/grasp_debug``.
-      5. ``./jiuwen_motion_log/<run-stamp>/grasp_debug``.
-
-    The ``<run-stamp>`` is computed once at module import (``YYYY-MM-DD_HH-MM-SS``)
-    so every invocation of the demo gets its own subdirectory, with detections
-    accumulating in order inside it. Previous runs are NOT overwritten.
+    Defaults to ``<per-run dir>/grasp_debug`` — the run directory established at
+    ``RobotSession.connect()`` and shared with the command log (see
+    ``jiuwensymbiosis.utils.logging.current_run_dir``). ``$JIUWEN_GRASP_DEBUG_DIR``
+    (verbatim) overrides it for ad-hoc debugging. Detections accumulate in order
+    inside the dir and number from ``001`` per run.
     """
     explicit = os.environ.get("JIUWEN_GRASP_DEBUG_DIR")
     if explicit:
         return Path(explicit)
-    motion_run_dir = os.environ.get("JIUWEN_MOTION_LOG_RUN_DIR")
-    if motion_run_dir:
-        return Path(motion_run_dir) / "grasp_debug"
-    legacy_root = os.environ.get("JIUWEN_GRASP_DEBUG_ROOT")
-    if legacy_root:
-        return Path(legacy_root) / _RUN_STAMP
-    motion_root = os.environ.get("JIUWEN_CMD_LOG_DIR", "./jiuwen_motion_log")
-    return Path(motion_root) / _RUN_STAMP / "grasp_debug"
+    from jiuwensymbiosis.utils.logging import current_run_dir
+
+    return current_run_dir() / "grasp_debug"
 
 
 def _save_raw_and_depth(
@@ -729,6 +844,36 @@ def _annotate_slot_core(pil_img, draw, extra: dict, rejected: bool, box_color: t
     return pil_img, draw
 
 
+def annotate_detection_overlay(
+    rgb: np.ndarray,
+    best: dict,
+    *,
+    centroid_uv: tuple[float, float],
+    grasp_uv: tuple[float, float] | None = None,
+) -> np.ndarray:
+    """Return an RGB copy with mask + bbox + centroid (yellow) + grasp point (magenta).
+
+    Diagnostic overlay for the GUI's per-step image: the detector box + its
+    mask-centroid crosshair (reusing the same drawing as the debug dump), plus a
+    distinct magenta marker at the actual grasp point when ``grasp_uv`` is given
+    (in top-surface mode this differs from the mask centroid). Requires Pillow;
+    raises ``ImportError`` if unavailable, so callers must guard.
+    """
+    from PIL import Image, ImageDraw
+
+    pil = _composite_red_mask(Image.fromarray(np.asarray(rgb)).convert("RGB"), best["mask"])
+    draw = ImageDraw.Draw(pil)
+    _annotate_detection(draw, best, centroid_uv, False, (0, 255, 0))
+    if grasp_uv is not None:
+        gx, gy = int(round(float(grasp_uv[0]))), int(round(float(grasp_uv[1])))
+        rad = 8
+        draw.ellipse([gx - rad, gy - rad, gx + rad, gy + rad], outline=(255, 0, 255), width=3)
+        draw.line([gx - rad - 5, gy, gx + rad + 5, gy], fill=(255, 0, 255), width=2)
+        draw.line([gx, gy - rad - 5, gx, gy + rad + 5], fill=(255, 0, 255), width=2)
+        draw.text((gx + rad + 3, gy + 2), "grasp", fill=(255, 0, 255))
+    return np.asarray(pil)
+
+
 def dump_grasp_debug(
     *,
     rgb: np.ndarray,
@@ -766,7 +911,7 @@ def dump_grasp_debug(
         debug_dir = _default_debug_dir()
     try:
         debug_dir.mkdir(parents=True, exist_ok=True)
-        idx = next(_GRASP_DEBUG_COUNTER)
+        idx = _next_grasp_index(debug_dir)
         _save_raw_and_depth(rgb, depth_img, debug_dir, idx)
 
         # Red translucent mask + status-coloured box + yellow centroid marker —

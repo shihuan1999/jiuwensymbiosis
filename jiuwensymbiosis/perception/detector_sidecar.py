@@ -23,6 +23,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 from jiuwensymbiosis.agent.cancel import CancelToken
+from jiuwensymbiosis.errors import DetectorStartError
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +106,7 @@ def detector_subprocess(
 
     try:
         if not _wait_for_port(host, port, startup_timeout_s, cancel_token=cancel_token):
-            raise RuntimeError(f"detector server did not start on {host}:{port} within {startup_timeout_s}s")
+            raise DetectorStartError(f"detector server did not start on {host}:{port} within {startup_timeout_s}s")
         logger.info("detector ready at %s:%d (pid=%d)", host, port, proc.pid)
         yield proc
     finally:

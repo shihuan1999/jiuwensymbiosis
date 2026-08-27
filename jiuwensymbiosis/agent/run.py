@@ -340,6 +340,8 @@ def _resolve_fast_special_ops(
     caps: frozenset[str] | set[str],
     api: Any,
     env: Any,
+    *,
+    enabled: bool = True,
 ) -> frozenset[str]:
     """Derive the authorized fast-path special ops from session capabilities.
 
@@ -347,7 +349,13 @@ def _resolve_fast_special_ops(
     ``api.servo_to_tip`` OR ``env.servo_to_flange`` (it falls back to the env
     verb). Requiring both would wrongly disable tracking for an adapter that
     only implements the env sink.
+
+    ``enabled`` is the ``RobotAgentConfig.enable_fast_special_ops`` switch: when
+    False the runner-owned servo ops are withheld regardless of capabilities, so
+    the fast path compiles to plain per-op steps only.
     """
+    if not enabled:
+        return frozenset()
     has_grasp = bool(caps & {"grasp.parallel", "grasp.suction"})
     binding_available = callable(getattr(api, "get_pose", None)) and (
         callable(getattr(api, "servo_to_tip", None)) or callable(getattr(env, "servo_to_flange", None))
@@ -418,7 +426,7 @@ def run_fast_task(
     skills_md = DEFAULT_REGISTRY.skills_markdown()
 
     caps = set(getattr(session.env, "capabilities", frozenset()))
-    special_ops = _resolve_fast_special_ops(caps, session.api, session.env)
+    special_ops = _resolve_fast_special_ops(caps, session.api, session.env, enabled=config.enable_fast_special_ops)
 
     # ① LLM① parse the task → structured intent (targets); ② perceive the scene
     # (no LLM, reuses the standing detector) so ③ the compiler (LLM②) plans from

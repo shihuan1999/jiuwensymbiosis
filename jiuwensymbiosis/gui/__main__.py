@@ -6,6 +6,9 @@
 先做代理卫生(必须在导入 openjiuwen 之前),再预检图形界面依赖,最后启动浏览器界面。
 预检失败时用 tkinter 弹图形对话框(纯标准库),这样即使没有终端窗口(如从应用菜单/
 桌面图标启动),用户也能看到"缺什么、怎么装"的提示。
+
+``--no-browser``:只起服务器、不开浏览器。供「重启」的接替进程使用(见
+``app.spawn_replacement``),原标签页自会重连刷新,不必再开一个。
 """
 
 from __future__ import annotations
@@ -160,7 +163,7 @@ def main() -> int:
     try:
         from jiuwensymbiosis.gui.app import run
 
-        return run()
+        return run(show="--no-browser" not in sys.argv[1:])
     except Exception as exc:  # 启动失败要弹窗告知,而非静默/裸崩
         import traceback
 

@@ -32,7 +32,7 @@ import inspect
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 # Capability → contract maps, single-sourced in the package so the validator
 # (checker) and scripts/new_adapter (generator) share one definition.
@@ -103,7 +103,7 @@ def _import_or_none(name: str) -> Any:
         return None
 
 
-def _find_class(module: Any, base_class: type) -> Optional[type]:
+def _find_class(module: Any, base_class: type) -> type | None:
     for _, obj in inspect.getmembers(module, inspect.isclass):
         if obj is base_class:
             continue
@@ -164,7 +164,7 @@ def run_checks(module_str: str) -> list[CheckResult]:
             )
             return results
 
-    mod_path = _resolve_module_path(module_str)
+    _ = _resolve_module_path(module_str)
 
     # --- Collect all classes from the module tree ---
     # Adapters are typically organized as packages with config.py, env.py, api.py, session.py
@@ -183,7 +183,7 @@ def run_checks(module_str: str) -> list[CheckResult]:
             (
                 "IMPORT",
                 _SEVERITY_ERROR,
-                f"Unable to import any submodule. Missing hardware dependencies? " f"Failed: {', '.join(failed_subs)}",
+                f"Unable to import any submodule. Missing hardware dependencies? Failed: {', '.join(failed_subs)}",
             )
         )
         return results
@@ -225,8 +225,8 @@ def run_checks(module_str: str) -> list[CheckResult]:
     # Priority: classes with BOTH from_yaml AND from_dict > dataclasses
     cfg_cls = None
     for cls, _ in all_cls:
-        has_yaml = hasattr(cls, "from_yaml") and callable(getattr(cls, "from_yaml"))
-        has_dict = hasattr(cls, "from_dict") and callable(getattr(cls, "from_dict"))
+        has_yaml = hasattr(cls, "from_yaml") and callable(cls.from_yaml)
+        has_dict = hasattr(cls, "from_dict") and callable(cls.from_dict)
         if has_yaml and has_dict:
             cfg_cls = cls
             break
@@ -299,8 +299,8 @@ def run_checks(module_str: str) -> list[CheckResult]:
     # [C-02] Config has from_yaml / from_dict ........ ERROR
     # ====================================================================
     if cfg_cls is not None:
-        has_from_yaml = hasattr(cfg_cls, "from_yaml") and callable(getattr(cfg_cls, "from_yaml"))
-        has_from_dict = hasattr(cfg_cls, "from_dict") and callable(getattr(cfg_cls, "from_dict"))
+        has_from_yaml = hasattr(cfg_cls, "from_yaml") and callable(cfg_cls.from_yaml)
+        has_from_dict = hasattr(cfg_cls, "from_dict") and callable(cfg_cls.from_dict)
         if not has_from_yaml or not has_from_dict:
             missing = []
             if not has_from_yaml:
@@ -332,8 +332,7 @@ def run_checks(module_str: str) -> list[CheckResult]:
                 (
                     "E-04",
                     _SEVERITY_ERROR,
-                    f"Env.capabilities 包含未知能力: {sorted(unknown)}。"
-                    f"请先添加到 KNOWN_CAPABILITIES (env/base.py:35)",
+                    f"Env.capabilities 包含未知能力: {sorted(unknown)}。请先添加到 KNOWN_CAPABILITIES (env/base.py:35)",
                 )
             )
         else:
@@ -406,7 +405,7 @@ def run_checks(module_str: str) -> list[CheckResult]:
                 (
                     "A-09",
                     _SEVERITY_INFO,
-                    f"Env 声明了无 Mixin 的标记能力: {sorted(marker_caps)} " f"(正常现象，不影响运行)",
+                    f"Env 声明了无 Mixin 的标记能力: {sorted(marker_caps)} (正常现象，不影响运行)",
                 )
             )
         else:
@@ -419,8 +418,7 @@ def run_checks(module_str: str) -> list[CheckResult]:
         empty_caps = _check_capability_actions(api_cls)
         if empty_caps:
             items = [f"{cap}（{reason}）" for cap, _s, reason in empty_caps]
-            results.append(
-                ("A-10", _SEVERITY_WARN, f"以下能力已声明但无任何动作实现: {'; '.join(items)}"))
+            results.append(("A-10", _SEVERITY_WARN, f"以下能力已声明但无任何动作实现: {'; '.join(items)}"))
         else:
             results.append(("A-10", _SEVERITY_INFO, "[OK] 每个声明的能力都至少有一个动作实现"))
 
@@ -432,7 +430,7 @@ def run_checks(module_str: str) -> list[CheckResult]:
             ("S-11", _SEVERITY_ERROR, f"未找到 build_xxx_session 构建器 (搜索 {module_str} 和 {module_str}.session)")
         )
     elif not callable(builder):
-        results.append(("S-11", _SEVERITY_ERROR, f"Session builder 存在但不可调用 "))
+        results.append(("S-11", _SEVERITY_ERROR, "Session builder 存在但不可调用 "))
     else:
         results.append(("S-11", _SEVERITY_INFO, "[OK] Session builder 存在且可调用"))
 
@@ -532,10 +530,92 @@ def run_checks(module_str: str) -> list[CheckResult]:
             else:
                 results.append(("E-15", _SEVERITY_INFO, "[OK] Env 暴露了 z_min_safe 安全下限"))
 
+    # ====================================================================
+    # [C-16] 标定集成契约 — 只做结构校验，不导入 solver 或硬件
+    # ====================================================================
+    results.extend(_check_calibration_integration(module_str))
+
     return results
 
 
-def _find_driver_class(module_str: str) -> Optional[type]:
+def _check_calibration_integration(module_str: str) -> list[CheckResult]:
+    """校验 calibration-owned adapter wrapper（可选，无则跳过）。
+
+    新机械臂若要支持手眼标定，需在 ``jiuwensymbiosis.calibration.adapters.<name>``
+    暴露 ``CALIBRATION_ADAPTER_SPEC``。此检查只做结构的静态校验，不导入 solver、
+    不连接硬件,也不要求安装 OpenCV:
+      * wrapper 存在且暴露 ``CalibrationAdapterSpec``;
+      * spec 不再携带 ``load_config``（统一用 session_factory 加载配置）;
+      * spec 暴露 session_factory / load_calibration_artifact / make_calibration_device。
+    """
+    results: list[CheckResult] = []
+    package = (
+        module_str.split(".")[2]
+        if module_str.startswith("jiuwensymbiosis.adapters.")
+        else module_str.rsplit(".", 1)[-1]
+    )
+    wrapper_name = f"jiuwensymbiosis.calibration.adapters.{package}"
+    try:
+        wrapper = importlib.import_module(wrapper_name)
+    except ModuleNotFoundError as exc:
+        # A wrapper is optional, but a dependency failure while importing an
+        # existing wrapper is not.  ``ModuleNotFoundError.name`` identifies
+        # the module Python was trying to load; only an exact match means the
+        # requested wrapper itself is absent.
+        if exc.name != wrapper_name:
+            logger.error("标定 wrapper %s 依赖导入失败: %r", wrapper_name, exc, exc_info=True)
+            results.append(
+                (
+                    "C-16",
+                    _SEVERITY_ERROR,
+                    f"标定 wrapper {wrapper_name} 导入失败：依赖 {exc.name or 'unknown'} 缺失 ({exc})。",
+                )
+            )
+            return results
+        results.append(
+            (
+                "C-16",
+                _SEVERITY_INFO,
+                f"未找到标定 wrapper {wrapper_name} — 若不支持手眼标定可忽略。"
+                "如需接入，参考 templates/xxx_adapter/ 的 calibration 说明。",
+            )
+        )
+        return results
+    except Exception as exc:
+        logger.error("标定 wrapper %s 导入失败: %r", wrapper_name, exc, exc_info=True)
+        results.append(("C-16", _SEVERITY_ERROR, f"标定 wrapper {wrapper_name} 导入失败：{exc!r}。"))
+        return results
+    try:
+        from jiuwensymbiosis.calibration.integration.integration import CalibrationAdapterSpec
+
+        spec = getattr(wrapper, "CALIBRATION_ADAPTER_SPEC", None)
+        if not isinstance(spec, CalibrationAdapterSpec):
+            results.append(
+                (
+                    "C-16",
+                    _SEVERITY_ERROR,
+                    f"{wrapper_name} 必须暴露 CALIBRATION_ADAPTER_SPEC 为 CalibrationAdapterSpec。",
+                )
+            )
+            return results
+        if hasattr(spec, "load_config"):
+            results.append(
+                ("C-16", _SEVERITY_ERROR, f"{wrapper_name} 不应再携带 load_config（统一用 session_factory 加载配置）。")
+            )
+        for attr in ("session_factory", "load_calibration_artifact", "make_calibration_device"):
+            if not callable(getattr(spec, attr, None)):
+                results.append(
+                    ("C-16", _SEVERITY_ERROR, f"{wrapper_name} CalibrationAdapterSpec.{attr} 缺失或不可调用。")
+                )
+        if not any(r[1] == _SEVERITY_ERROR for r in results):
+            results.append(("C-16", _SEVERITY_INFO, f"[OK] 标定集成契约满足（{wrapper_name}）。"))
+    except Exception as exc:
+        logger.error("标定 wrapper %s 契约校验失败: %r", wrapper_name, exc, exc_info=True)
+        results.append(("C-16", _SEVERITY_ERROR, f"标定集成校验失败（{exc!r}）。"))
+    return results
+
+
+def _find_driver_class(module_str: str) -> type | None:
     """Best-effort locate the low-level driver class in ``<module>.lowlevel``.
 
     Anchors on the structural signature ``get_pose`` + ``move_to_pose_blocking``

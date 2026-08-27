@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -14,6 +15,8 @@ from jiuwensymbiosis.utils.logging import (
     configure_logging,
     get_logger,
 )
+
+_STAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(-\d+)?$")
 
 
 class TestConfigureLogging:
@@ -151,3 +154,43 @@ class TestTraceLogHandler:
         record = _BadRecord("x", logging.INFO, __file__, 1, "msg", None, None)
         out = fmt.format(record)
         assert isinstance(out, str)
+
+
+class TestPerRunDir:
+    def teardown_method(self):
+        import jiuwensymbiosis.utils.logging as mod
+
+        mod._run_dir = None
+
+    def test_begin_run_stamped_subdir_under_root(self, tmp_path):
+        from jiuwensymbiosis.utils.logging import begin_run
+
+        run_dir = begin_run(tmp_path)
+        assert run_dir.parent == tmp_path
+        assert _STAMP_RE.match(run_dir.name)
+
+    def test_two_runs_same_second_are_distinct(self, tmp_path):
+        from jiuwensymbiosis.utils.logging import begin_run
+
+        first = begin_run(tmp_path)
+        second = begin_run(tmp_path)
+        assert first != second
+
+    def test_current_run_dir_returns_last_begun(self, tmp_path):
+        from jiuwensymbiosis.utils.logging import begin_run, current_run_dir
+
+        run_dir = begin_run(tmp_path)
+        assert current_run_dir() == run_dir
+
+    def test_current_run_dir_lazy_default(self, tmp_path, monkeypatch):
+        import jiuwensymbiosis.utils.logging as mod
+
+        mod._run_dir = None
+        monkeypatch.chdir(tmp_path)
+        assert mod.current_run_dir().parent.name == "jiuwen_motion_log"
+
+    def test_begin_run_does_not_create_empty_dir(self, tmp_path):
+        from jiuwensymbiosis.utils.logging import begin_run
+
+        run_dir = begin_run(tmp_path)
+        assert not run_dir.exists()

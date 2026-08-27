@@ -86,6 +86,15 @@ class TestRobotAgentConfig:
         cfg = RobotAgentConfig(strict_capabilities=True)
         assert cfg.strict_capabilities is True
 
+    def test_fast_special_ops_default_on(self):
+        assert RobotAgentConfig().enable_fast_special_ops is True
+
+    def test_fast_special_ops_settable(self):
+        assert RobotAgentConfig(enable_fast_special_ops=False).enable_fast_special_ops is False
+
+    def test_fast_special_ops_from_dict(self):
+        assert RobotAgentConfig.from_dict({"enable_fast_special_ops": False}).enable_fast_special_ops is False
+
 
 class TestPromptTemplate:
     def test_contains_robot_name_placeholder(self):

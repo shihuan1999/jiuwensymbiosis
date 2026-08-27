@@ -96,6 +96,27 @@ def test_outcome_fast_path_track_detect_failure_names_action_and_reason_in_detai
     assert "red block" in outcome.detail  # reason 里的物体名对用户可见
 
 
+def test_outcome_carries_the_failed_step_error_code():
+    result = {
+        "ok": True,
+        "result": {
+            "ok": False,
+            "steps_done": 1,
+            "steps": [{"i": 0, "op": "track_grasp", "ok": False, "reason": "not detected", "error_code": "no_camera"}],
+        },
+    }
+    assert run_status.outcome_from_result(result).error_code == "no_camera"
+
+
+def test_outcome_carries_the_engine_error_code():
+    outcome = run_status.outcome_from_result({"ok": False, "error": "boom", "error_code": "detector_start_timeout"})
+    assert outcome.error_code == "detector_start_timeout"
+
+
+def test_outcome_error_code_defaults_to_empty():
+    assert run_status.outcome_from_result({"ok": False, "error": "boom"}).error_code == ""
+
+
 def test_outcome_fast_path_success_is_green():
     result = {"ok": True, "result": {"ok": True, "steps_done": 13, "steps": [{"i": 0, "op": "home", "ok": True}]}}
     outcome = run_status.outcome_from_result(result)

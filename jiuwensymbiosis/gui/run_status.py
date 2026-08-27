@@ -34,13 +34,16 @@ class Outcome:
 
     ``detail`` holds the detailed cause (often an English technical string): the area under the camera
     shows only the short ``narration``; ``detail`` is routed to the 「错误诊断」 tab + raw log so a long
-    English string doesn't clutter the main view.
+    English string doesn't clutter the main view. ``error_code`` is that same failure's machine code
+    (``jiuwensymbiosis.errors``) when the failure site set one — diagnostics looks it up directly
+    instead of re-deriving the cause from ``detail``.
     """
 
     status: str
     narration: str
     is_failure: bool
     detail: str = ""
+    error_code: str = ""
 
 
 def incomplete_message(summary: str) -> str:
@@ -60,7 +63,12 @@ def outcome_from_result(result: dict[str, Any]) -> Outcome:
     ``is_failure=True``.
     """
     if not result.get("ok"):
-        return Outcome("失败", "运行失败,已在下方「错误诊断」给出原因与处理建议。", True)
+        return Outcome(
+            "失败",
+            "运行失败,已在下方「错误诊断」给出原因与处理建议。",
+            True,
+            error_code=str(result.get("error_code") or ""),
+        )
     payload = result.get("result")
     # The fast path's result shape is {"ok", "steps_done", "steps":[...], ...} with no result_type;
     # the outer RunEngine ok only means "no exception raised", so real success/failure is this inner
@@ -76,7 +84,13 @@ def outcome_from_result(result: dict[str, Any]) -> Outcome:
             # internal step index (0-based, includes off-timeline track_detect, so it wouldn't match).
             label = humanize.friendly_label(str(failed.get("op", "")), {})
             detail = f"{label} 这一步失败:{reason}" if reason else f"{label} 这一步失败。"
-            return Outcome("未完成", "未完成", False, detail=detail)
+            return Outcome(
+                "未完成",
+                "未完成",
+                False,
+                detail=detail,
+                error_code=str(failed.get("error_code") or ""),
+            )
         return Outcome("未完成", "未完成", False, detail="动作序列未跑完。")
     rtype = payload.get("result_type") if isinstance(payload, dict) else ""
     summary = payload.get("output") if isinstance(payload, dict) else payload

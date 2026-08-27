@@ -1,44 +1,48 @@
-# SO-101 eye-to-hand 手眼标定配置 —— 供 scripts/calibrate/so101_eye_calib.py 使用。
+# SO-101 eye-to-hand 手眼标定配置 —— 供 scripts/calibrate/eye_to_hand_calib.py
+# （统一 body-agnostic eye-to-hand CLI）使用。旧的 SO-101 专用脚本
+# so101_eye_calib.py 已删除，SO-101 走与 Piper 同一条统一标定路径。
 #
 # 标定只需要：能连串口读关节角（FK 求法兰位姿）+ 能从桌面固定相机取帧。
 # 不需要 detector/VLM，因此本文件不含 api_servers 与 model 段（与 calibrate.yaml
 # 同样的极简风格）。
 #
-# 安全语义（与 so101_eye_calib.py --config 省略时的 _standalone_calibration_config
-# 对齐）：
+# 安全语义：
 #   * home_use_init_pose: true —— 豁免 safety_validated 门禁（connect 读取当前关节角
 #     作为 home，免去每次手填 home_joints_deg）。标定每次起始位不同，正合此意。
 #   * joint_limits ±180° —— 标定用宽软限位，避免标定位姿被 SafetyRail 误拦；
 #     真机运行配置请用收紧后的限位（见 configs/so101/so101.yaml）。
 #   * workspace_bounds / z_max_safe_mm = null —— 标定不限制笛卡尔工作空间。
-#   * disable_torque_on_disconnect: false —— 标定中可能断连后保持力矩；
-#     --release-torque 模式另由脚本内的 _release_torque_config 覆盖此字段。
+#   * disable_torque_on_disconnect: false —— 标定中可能断连后保持力矩。
 #
-# 用法：
+# 用法（统一 CLI eye_to_hand_calib.py，三种互斥模式）：
 #   1) 填好下面的 camera_serial（或导出环境变量）。
-#   2) 先示教边界，再自动采集，最后离线重解或松力矩：
+#   2) 先示教 waypoint，再自动采集，最后可离线重解：
 #
-#   python scripts/calibrate/so101_eye_calib.py \
+#   # 手动示教收集 waypoint（SO-101 ManualGuidance）
+#   python scripts/calibrate/eye_to_hand_calib.py \
 #       --config scripts/calibrate/so101_calibrate.yaml \
 #       --board charuco --squares-x 5 --squares-y 7 \
 #       --square-size-mm 15.28 --marker-size-mm 11 \
-#       --collect-bounds --bounds-file tmp/so101_bounds.npz
+#       --collect-poses tmp/so101_wp.npz
 #
-#   python scripts/calibrate/so101_eye_calib.py \
+#   # 自动沿 waypoint 采集 + 求解 + 写文件
+#   python scripts/calibrate/eye_to_hand_calib.py \
 #       --config scripts/calibrate/so101_calibrate.yaml \
 #       --board charuco --squares-x 5 --squares-y 7 \
 #       --square-size-mm 15.28 --marker-size-mm 11 \
-#       --auto --bounds-file tmp/so101_bounds.npz --n-stations 24 \
-#       --dump tmp/so101_eye_stations.npz --cross-check
+#       --auto tmp/so101_wp.npz --n-stations 24 --confirm-estop \
+#       --out tmp/so101_eye_to_hand.json
 #
-#   python scripts/calibrate/so101_eye_calib.py \
-#       --config scripts/calibrate/so101_calibrate.yaml --release-torque
+#   # 离线重解（无硬件）
+#   python scripts/calibrate/eye_to_hand_calib.py \
+#       --replay tmp/so101_eye_stations.npz \
+#       --config scripts/calibrate/so101_calibrate.yaml --out tmp/so101_eye_to_hand.json
 
 env:
   cfg:
     low_level:
       name: "so101"
-      port: "/dev/your_port"            # [必填] 串口设备路径；用 `lerobot-find-port` 确认
+      port: "/dev/your_port"          # [必填] 串口设备路径；用 `lerobot-find-port` 确认（机器特定值请复制整份为 so101_calibrate.local.yaml 并用 --config 指向它）
       robot_id: "so101_left"          # [必填] 必须与 `lerobot-calibrate --robot.id=` 一致
       calibration_dir: null           # [选填] null 用 LeRobot 默认标定目录
 
@@ -62,12 +66,43 @@ env:
       z_max_safe_mm: null             # 不设 Z 上限
       workspace_bounds: null          # 不限 XY 工作空间
 
-      # 标定用短超时与紧到位容差（与 _standalone_calibration_config 默认一致）。
+      # 标定用短超时与紧到位容差（与 calibration 配置默认值一致）。
       move_timeout_s: 5.0
       joint_tolerance_deg: 3.5
       settle_overcompensate: false
+      settle_max_z_undershoot_mm: 30.0
 
       # --- 桌面固定 eye-to-hand 相机（标定必须有相机） ---
-      camera_serial: "<your-camera-serial>"   # 填入你的 RealSense 序列号
+      # camera_mount 是相机挂载方式的唯一权威来源（不在顶层 calibration: 段）。
+      # SO-101 只支持 eye_to_hand（桌面固定相机），from_dict 拒绝其他值。
+      camera_mount: "eye_to_hand"
+      camera_serial: "<your-camera-serial>"   # 填入你的 RealSense 序列号（机器特定，见上 port 注释）
       camera_resolution: [640, 480]
       camera_fps: 30
+
+# 顶层 calibration: 段只放脚本元数据（adapter_module / 轨迹空间 / 输出 / 可观测性阈值）。
+# camera_mount 不在此处。本段供 scripts/calibrate/eye_to_hand_calib.py 使用。
+calibration:
+  adapter_module: "jiuwensymbiosis.adapters.so101"
+  trajectory:
+    space: joint                # SO-101 默认关节空间轨迹（5-DoF 笛卡尔不可达时拒绝）
+  output: "tmp/so101_eye_to_hand.json"
+  observability:
+    min_relative_rotation_deg: 5.0
+    min_axis_separation_deg: 15.0
+    min_max_rotation_deg: 20.0
+    min_translation_baseline_mm: 30.0
+    duplicate_rotation_deg: 2.0
+    duplicate_translation_mm: 5.0
+  # Reach/exposure gates decide whether a station's *real* pose is close
+  # enough to the command to be captured.  SO-101 STS3215 servos have no
+  # integral term; under gravity load (elbow_flex near 0deg) the steady-state
+  # offset can reach ~3.5deg, so the default 0.5deg reach gate would skip
+  # otherwise-valid stations.  Calibration uses FK of the *real* joint
+  # angles, so a station that did not reach the command is still a valid
+  # observation as long as the real pose is within this gate.
+  capture_gate:
+    reach_rotation_deg: 4.0       # 默认 0.5;盖住 STS3215 ~3.5deg 稳态偏差,留 0.5deg 余量
+    reach_translation_mm: 0.5     # 关节空间平移恒 0,保持默认
+    exposure_rotation_deg: 1.0    # 采图前后位姿稳定性(防曝光中舵机漂移)
+    exposure_translation_mm: 0.5

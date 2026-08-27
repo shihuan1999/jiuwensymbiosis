@@ -2,7 +2,7 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 """标定板检测与生成（ChArUco / 棋盘格）+ 相机内参标定.
 
-依赖 OpenCV（延迟加载，缺包时由 ``handeye_core._require_cv2`` 抛安装提示）。
+依赖 OpenCV（延迟加载，缺包时由 ``jiuwensymbiosis.calibration.domain.solver._require_cv2`` 抛安装提示）。
 ``detect_board`` 永不因坏帧抛异常，而是返回 ``ok=False`` + 中文原因。
 """
 
@@ -14,11 +14,8 @@ from pathlib import Path
 
 import numpy as np
 
-if __package__:
-    from .handeye_core import ViewDetection, _require_cv2
-else:  # Support direct imports from scripts/calibrate on sys.path.
-    from handeye_core import ViewDetection, _require_cv2
-
+from jiuwensymbiosis.calibration.domain.models import ViewDetection
+from jiuwensymbiosis.calibration.domain.solver import _require_cv2
 from jiuwensymbiosis.utils.geometry import make_transform
 
 logger = logging.getLogger("calibrate_hand_eye")

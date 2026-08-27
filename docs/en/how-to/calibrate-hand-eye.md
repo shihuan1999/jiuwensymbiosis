@@ -170,3 +170,9 @@ python scripts/calibrate/calibrate_hand_eye.py --selftest
 | `--selftest` | Run the solver against synthetic data |
 
 Run `python scripts/calibrate/calibrate_hand_eye.py --help` for the complete current option set.
+
+## SO-101 fixed-camera workflow
+
+For the complete SO-101 eye-to-hand procedure—including hardware preparation, waypoint teaching, automatic
+collection, offline re-solving, and runtime configuration—see
+[Calibrate an SO-101 with a Fixed Camera](calibrate-so101-eye-to-hand.md).
