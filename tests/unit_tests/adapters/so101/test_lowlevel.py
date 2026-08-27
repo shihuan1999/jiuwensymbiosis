@@ -37,6 +37,8 @@ from jiuwensymbiosis.adapters.so101.lowlevel import (
     So101PoseConvergenceError,
     So101PreDispatchError,
 )
+from jiuwensymbiosis.env.protocol import HandGuidingDriver, HandGuidingRecoveryError
+from jiuwensymbiosis.errors import SAFETY_REJECTED, error_code
 
 from .lowlevel_helpers import FakeFollower, FakeKinematics, fake_lerobot_import, make_calib_file
 
@@ -171,6 +173,75 @@ class TestCalibrationSupport:
         transform = driver.forward_kinematics_mm([1.0, 2.0, 3.0, 0.0, 0.0])
 
         np.testing.assert_allclose(transform[:3, 3], [10.0, 20.0, 30.0])
+
+
+class TestHandGuiding:
+    @staticmethod
+    def _connected(tmp_path):
+        driver, follower, _ = _make_driver(_make_cfg(), tmp_path)
+        bus = _FakeTorqueBus()
+        follower.bus = bus
+        follower._arm = [10.0, 20.0, 30.0, 40.0, 50.0]
+        follower._gripper = 42.0
+        driver.connect()
+        return driver, follower, bus
+
+    def test_driver_satisfies_the_hand_guiding_port(self, tmp_path):
+        driver, _, _ = self._connected(tmp_path)
+
+        assert isinstance(driver, HandGuidingDriver)
+
+    def test_arm_only_release_leaves_the_gripper_powered_and_out_of_the_preset(self, tmp_path):
+        driver, follower, bus = self._connected(tmp_path)
+
+        with driver.hand_guiding():
+            assert bus.calls == [("disable", ARM_JOINT_ORDER)]
+
+        assert bus.calls == [("disable", ARM_JOINT_ORDER), ("enable", ())]
+        assert "gripper.pos" not in follower.sent_actions[-1]
+
+    def test_full_release_drops_every_motor_and_presets_the_gripper(self, tmp_path):
+        driver, follower, bus = self._connected(tmp_path)
+
+        with driver.hand_guiding(include_end_effector=True):
+            assert bus.calls == [("disable", ())]
+
+        assert bus.calls == [("disable", ()), ("enable", ())]
+        # Without this the gripper would snap back to its pre-release goal.
+        assert follower.sent_actions[-1]["gripper.pos"] == 42.0
+
+    def test_preset_failure_keeps_torque_disabled(self, tmp_path):
+        driver, follower, bus = self._connected(tmp_path)
+
+        with pytest.raises(HandGuidingRecoveryError, match="preset_current_joint_goal"):
+            with driver.hand_guiding():
+                follower._arm = [10.0, 20.0, math.nan, 40.0, 50.0]
+
+        assert bus.calls == [("disable", ARM_JOINT_ORDER)]
+
+    def test_body_error_stays_the_root_cause_of_a_failed_restore(self, tmp_path):
+        driver, follower, _ = self._connected(tmp_path)
+
+        with pytest.raises(HandGuidingRecoveryError) as excinfo:
+            with driver.hand_guiding():
+                follower._arm = [10.0, 20.0, math.nan, 40.0, 50.0]
+                raise KeyboardInterrupt("operator aborted")
+
+        assert isinstance(excinfo.value.__cause__, KeyboardInterrupt)
+
+    def test_hold_and_release_cycle_inside_the_context(self, tmp_path):
+        driver, _, bus = self._connected(tmp_path)
+
+        with driver.hand_guiding():
+            driver.restore_torque_at_current_pose()
+            driver.release_for_hand_guiding()
+
+        assert bus.calls == [
+            ("disable", ARM_JOINT_ORDER),
+            ("enable", ()),
+            ("disable", ARM_JOINT_ORDER),
+            ("enable", ()),
+        ]
 
 
 class TestSetGripper:
@@ -603,7 +674,7 @@ class TestSettleEdgeCases:
         driver.connect()
         driver._holding_payload = True
 
-        def unavailable(*_args):
+        def unavailable(*_args, **_kwargs):
             raise ValueError("test: no safe +Z candidate")
 
         driver._next_z_only_lift_command = unavailable
@@ -2136,3 +2207,192 @@ class TestHome:
                 np.array([0.0, 0.0, 3.0, 0.0, 0.0]),
                 label="payload",
             )
+
+
+class _FakeDeadZoneBus:
+    """Records dead-zone register traffic; ``fail_write`` forces the error path."""
+
+    def __init__(self, events: list, initial: int = 1, fail_write: bool = False) -> None:
+        self.events = events
+        self.values = {(reg, motor): initial for reg in ("CW_Dead_Zone", "CCW_Dead_Zone") for motor in ARM_JOINT_ORDER}
+        self.fail_write = fail_write
+
+    def read(self, register: str, motor: str, normalize: bool = True) -> int:
+        return self.values[(register, motor)]
+
+    def write(self, register: str, motor: str, value: int) -> None:
+        if self.fail_write:
+            raise RuntimeError("bus write failed")
+        self.values[(register, motor)] = value
+        self.events.append(("write", register, motor, value))
+
+
+def _make_settle_driver(tmp_path, *, disable_torque: bool, fail_write: bool = False):
+    events: list = []
+    follower = FakeFollower(config=None)
+    follower.bus = _FakeDeadZoneBus(events, fail_write=fail_write)
+    orig_disconnect = follower.disconnect
+
+    def recording_disconnect() -> None:
+        events.append(("follower_disconnect",))
+        orig_disconnect()
+
+    follower.disconnect = recording_disconnect
+    cfg = _make_cfg(disable_torque_on_disconnect=disable_torque)
+    driver, _, sleep_log = _make_driver(cfg, tmp_path, follower=follower)
+    return driver, follower, events, sleep_log
+
+
+class TestTeardownSettle:
+    """Leaving the arm under torque must damp the servo limit cycle first."""
+
+    def test_dead_zone_is_widened_then_restored_before_disconnect(self, tmp_path):
+        driver, follower, events, sleep_log = _make_settle_driver(tmp_path, disable_torque=False)
+        driver.connect()
+        driver.disconnect()
+
+        widened = [e for e in events if e[0] == "write" and e[3] != 1]
+        assert {e[2] for e in widened} == set(ARM_JOINT_ORDER)
+        assert {e[3] for e in widened} == {4}
+        assert len(widened) == 2 * len(ARM_JOINT_ORDER), "both CW and CCW dead zones must be pulsed"
+
+        # Every register must be back to its original value on the hardware.
+        assert set(follower.bus.values.values()) == {1}
+
+        disconnect_at = events.index(("follower_disconnect",))
+        assert all(events.index(e) < disconnect_at for e in widened), "settle must finish before the port closes"
+        assert 0.5 in sleep_log, "the servo needs dwell time to bleed off the oscillation"
+
+    def test_no_settle_when_torque_is_released(self, tmp_path):
+        driver, _, events, _ = _make_settle_driver(tmp_path, disable_torque=True)
+        driver.connect()
+        driver.disconnect()
+
+        assert [e for e in events if e[0] == "write"] == []
+        assert ("follower_disconnect",) in events
+
+    def test_write_failure_still_disconnects(self, tmp_path):
+        driver, _, events, _ = _make_settle_driver(tmp_path, disable_torque=False, fail_write=True)
+        driver.connect()
+        driver.disconnect()  # must not raise
+
+        assert ("follower_disconnect",) in events
+        assert driver._connected is False
+
+    def test_follower_without_bus_is_tolerated(self, tmp_path):
+        cfg = _make_cfg(disable_torque_on_disconnect=False)
+        driver, follower, _ = _make_driver(cfg, tmp_path)
+        assert not hasattr(follower, "bus")
+        driver.connect()
+        driver.disconnect()  # must not raise
+        assert follower.connected is False
+
+
+class TestZFloorEscapeHatch:
+    """A pose already under ``z_min_safe`` must not trap the arm there.
+
+    Gravity droop settles the real arm a few mm below where it was commanded, so
+    the observed pose can end up under the floor. The floor stops the arm being
+    driven *into* the table; a path that climbs out of a violating start stays
+    legal, one that sinks further does not.
+
+    ``FakeKinematics`` maps ``elbow_flex`` to z = 10 * elbow_flex.
+    """
+
+    def test_move_joint_climbs_out_of_a_below_floor_start(self, tmp_path):
+        cfg = _make_cfg(z_min_safe_mm=30.0)
+        driver, follower, _ = _make_driver(cfg, tmp_path)
+        driver.connect()
+        follower._arm = [0.0, 0.0, 2.0, 0.0, 0.0]  # z=20 mm, under the 30 mm floor
+
+        driver.move_joint_blocking([0.0, 0.0, 5.0, 0.0, 0.0])
+
+        assert follower._arm[2] == pytest.approx(5.0, abs=1e-6)
+
+    def test_move_joint_still_refuses_to_sink_further(self, tmp_path):
+        cfg = _make_cfg(z_min_safe_mm=30.0)
+        driver, follower, _ = _make_driver(cfg, tmp_path)
+        driver.connect()
+        follower._arm = [0.0, 0.0, 2.0, 0.0, 0.0]
+        sent_before = len(follower.sent_actions)
+
+        with pytest.raises(So101PreDispatchError, match="escape floor"):
+            driver.move_joint_blocking([0.0, 0.0, 1.0, 0.0, 0.0])
+
+        assert len(follower.sent_actions) == sent_before
+
+    def test_home_climbs_out_of_a_below_floor_start(self, tmp_path):
+        cfg = _make_cfg(z_min_safe_mm=30.0, home_joints_deg=[0.0, 0.0, 5.0, 0.0, 0.0])
+        driver, follower, _ = _make_driver(cfg, tmp_path)
+        driver.connect()
+        follower._arm = [0.0, 0.0, 2.0, 0.0, 0.0]
+
+        driver.home()
+
+        assert follower._arm[2] == pytest.approx(5.0, abs=1e-6)
+
+    def test_goto_pose_climbs_out_of_a_below_floor_start(self, tmp_path):
+        cfg = _make_cfg(z_min_safe_mm=30.0)
+        driver, follower, _ = _make_driver(cfg, tmp_path)
+        driver.connect()
+        follower._arm = [0.0, 0.0, 2.0, 0.0, 0.0]
+
+        driver.move_to_pose_blocking(So101Pose(0.0, 0.0, 50.0, 0.0, 0.0, 0.0))
+
+        assert follower._arm[2] == pytest.approx(5.0, abs=1e-6)
+
+    def test_commanded_target_below_the_floor_stays_rejected(self, tmp_path):
+        cfg = _make_cfg(z_min_safe_mm=30.0)
+        driver, follower, _ = _make_driver(cfg, tmp_path)
+        driver.connect()
+        follower._arm = [0.0, 0.0, 2.0, 0.0, 0.0]
+        sent_before = len(follower.sent_actions)
+
+        # Being under the floor is not a licence to command a new pose under it.
+        with pytest.raises(So101PreDispatchError, match="below driver z_min_safe"):
+            driver.move_to_pose_blocking(So101Pose(0.0, 0.0, 25.0, 0.0, 0.0, 0.0))
+
+        assert len(follower.sent_actions) == sent_before
+
+    def test_a_legal_start_keeps_the_configured_floor(self, tmp_path):
+        cfg = _make_cfg(z_min_safe_mm=30.0)
+        driver, follower, _ = _make_driver(cfg, tmp_path)
+        driver.connect()
+        follower._arm = [0.0, 0.0, 4.0, 0.0, 0.0]  # z=40 mm, above the floor
+        sent_before = len(follower.sent_actions)
+
+        with pytest.raises(So101PreDispatchError, match="below driver z_min_safe"):
+            driver.move_joint_blocking([0.0, 0.0, 0.0, 0.0, 0.0])
+
+        assert len(follower.sent_actions) == sent_before
+
+
+class TestPreDispatchErrorCode:
+    """Only the envelope rejections carry ``safety_rejected``.
+
+    The wrapper covers several causes; coding it on the class would label an IK
+    failure or a malformed config as a boundary violation and send the operator
+    to check the workspace instead of the real problem.
+    """
+
+    def test_soft_limit_rejection_carries_safety_rejected(self, tmp_path):
+        cfg = _make_cfg()
+        driver, _follower, _ = _make_driver(cfg, tmp_path)
+        driver.connect()
+        with pytest.raises(So101PreDispatchError) as exc_info:
+            driver.move_joint_blocking([0.0, 0.0, 0.0, 0.0, 999.0])
+        assert "out of soft limits" in str(exc_info.value)
+        assert error_code(exc_info.value) == SAFETY_REJECTED
+
+    def test_z_floor_rejection_carries_safety_rejected(self, tmp_path):
+        cfg = _make_cfg(z_min_safe_mm=30.0)
+        driver, _follower, _ = _make_driver(cfg, tmp_path)
+        driver.connect()
+        with pytest.raises(So101PreDispatchError) as exc_info:
+            driver.move_to_pose_blocking(So101Pose(0.0, 0.0, 25.0, 0.0, 0.0, 0.0))
+        assert error_code(exc_info.value) == SAFETY_REJECTED
+
+    def test_malformed_orientation_config_carries_no_code(self):
+        # An orientation config error is not a boundary violation: it must not
+        # inherit the safety card just because it shares the wrapper type.
+        assert error_code(So101PreDispatchError("orientation overrides must be numeric.")) == ""

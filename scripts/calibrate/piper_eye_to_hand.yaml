@@ -1,0 +1,67 @@
+# Piper eye-to-hand 手眼标定配置 —— 供 scripts/calibrate/eye_to_hand_calib.py 使用。
+#
+# 与 configs/piper/piper.yaml（eye-in-hand 腕部相机）不同：本配置用一台**桌面固定
+# 相机**（eye-to-hand），标定求解 T_base_cam（相机在 base 系的常量位姿，不随法兰变）。
+#
+# camera_mount 是相机挂载方式的唯一权威来源（不在顶层 calibration: 段）。
+# eye_to_hand 时：反投影 p_base = T_base_cam @ p_cam，**每步不读法兰**。
+#
+# 标定板用 ChArUco，夹在夹爪上随臂运动（满足 AX=XB 刚性耦合前提）。
+#
+# 安全：标定用宽软限位 + home_use_init_pose；真机运行配置请用收紧后的限位。
+# 启动前务必确认 E-stop 可达（--confirm-estop）。
+
+env:
+  cfg:
+    low_level:
+      # --- arm
+      can_port: "can_left"
+      move_speed: 20                # 真机先慢
+      tool_offset_mm: 95.0          # 法兰→指尖（与运行配置一致）
+
+      # --- camera mount（单一权威来源）
+      camera_mount: "eye_to_hand"   # 桌面固定相机；from_dict 拒绝其他值
+      poses_are_tip_frame: false    # eye-to-hand 无 object 锚点时用 YAML home/z_min
+
+      # --- workspace（标定放宽；真机请收紧）
+      calib_path: null              # 标定产出此文件，运行配置再指向它
+      home_lift_mm: 250.0
+      z_safe_margin_mm: -10.0
+      home_pose_xyzrxryrz_mm_deg: [200.0, 0.0, 400.0, 0.0, 90.0, 0.0]  # 法兰 home（mm/deg）
+      z_min_safe_mm: 50.0
+      home_use_init_pose: true
+
+      # --- cartesian 安全盒（mm）
+      x_min_mm: 0.0
+      x_max_mm: 700.0
+      y_min_mm: -500.0
+      y_max_mm: 500.0
+      z_max_mm: 800.0
+
+      # --- 桌面固定相机（eye-to-hand）
+      camera_serial: "<your-desktop-camera-serial>"   # 桌面 RealSense 序列号
+      camera_resolution: [640, 480]
+      camera_fps: 30
+
+      # --- joint 软限位（deg；标定用宽限位）
+      joint_limits:
+        J1: [-180.0, 180.0]
+        J2: [-180.0, 180.0]
+        J3: [-180.0, 180.0]
+        J4: [-180.0, 180.0]
+        J5: [-180.0, 180.0]
+        J6: [-180.0, 180.0]
+
+# 顶层 calibration: 段只放脚本元数据。camera_mount 不在此处。
+calibration:
+  adapter_module: "jiuwensymbiosis.adapters.piper"
+  trajectory:
+    space: joint                # Piper 6-DoF 也可笛卡尔；本模板用关节空间
+  output: "tmp/piper_eye_to_hand.json"
+  observability:
+    min_relative_rotation_deg: 5.0
+    min_axis_separation_deg: 15.0
+    min_max_rotation_deg: 20.0
+    min_translation_baseline_mm: 30.0
+    duplicate_rotation_deg: 2.0
+    duplicate_translation_mm: 5.0

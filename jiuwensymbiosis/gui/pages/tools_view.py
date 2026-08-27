@@ -4,12 +4,14 @@
 """The 「工具」 page (NiceGUI): master-detail — tool list on the left, the selected tool's workspace on the right.
 
 Holds task-agnostic debug / calibration tools. A new tool = one entry in ``_TOOLS`` + a method that
-builds its workspace.
+builds its workspace into its own container.
 
-The only tool so far, 「感知测试」, shows the live camera; clicking anywhere prints that point's
-base-frame (x, y, z). Real hardware only — ``PerceptionEngine`` runs the preview + reprojection on a
-background thread, and this view updates only by draining its event queue via ``drain()`` (the same
-``ui.timer`` polling as the run page).
+「感知测试」 shows the live camera; clicking anywhere prints that point's base-frame (x, y, z).
+「手眼标定」 is the four-step calibration wizard (see ``calibration_view``). Both are real-hardware
+only and both run their work on a background thread, so this view updates only by draining event
+queues via ``drain()`` (the same ``ui.timer`` polling as the run page).
+
+Only one tool may hold the camera/bus at a time: switching tools stops the one being left.
 """
 
 from __future__ import annotations
@@ -22,6 +24,8 @@ from nicegui import ui
 
 from jiuwensymbiosis.gui import registry
 from jiuwensymbiosis.gui.app_state import AppState
+from jiuwensymbiosis.gui.pages.calibration_view import CalibrationView
+from jiuwensymbiosis.gui.pages.hardware_view import HardwareView
 from jiuwensymbiosis.gui.perception_engine import PerceptionEngine
 from jiuwensymbiosis.gui.run_engine import resolve_real_session_config
 
@@ -30,6 +34,8 @@ __all__ = ["ToolsView"]
 # Tool list: (key, name). Add a tool here and build its workspace in _build.
 _TOOLS: list[tuple[str, str]] = [
     ("perception", "感知测试"),
+    ("calibration", "手眼标定"),
+    ("hardware", "硬件控制"),
 ]
 
 
@@ -46,14 +52,21 @@ def _dig(data: Any, *keys: str) -> Any:
 class ToolsView:
     """The 「工具」 page view. Currently only 「感知测试」; the list + workspace layout is ready for more tools."""
 
-    def __init__(self, state: AppState) -> None:
-        """Build the tool list + workspace and attach the timer that drains perception-engine events."""
+    def __init__(self, state: AppState, *, on_open_config: Callable[[str], None] = lambda _path: None) -> None:
+        """Build the tool list + workspace and attach the timer that drains perception-engine events.
+
+        ``on_open_config`` jumps to the 「配置」 page and lands on one dotted config path.
+        """
         self._state = state
+        self._on_open_config = on_open_config
         self._engine: PerceptionEngine | None = None
         self._last_xyz: tuple[float, float, float] | None = None
         self._errored = False
         self._selected_tool = _TOOLS[0][0]
         self._tool_rows: dict[str, Any] = {}
+        self._panels: dict[str, Any] = {}
+        self._calibration: CalibrationView | None = None
+        self._hardware: HardwareView | None = None
 
         self._dispatch: dict[str, Callable[[Any], None]] = {
             "preview_started": self._on_preview_started,
@@ -92,14 +105,41 @@ class ToolsView:
                     row.on("click", lambda _e, k=key: self._select_tool(k))
                     self._tool_rows[key] = row
             with ui.column().classes("grow gap-2"):
-                self._build_perception_panel()
+                self._panels["perception"] = ui.column().classes("w-full gap-2")
+                with self._panels["perception"]:
+                    self._build_perception_panel()
+                self._panels["calibration"] = ui.column().classes("w-full gap-2")
+                with self._panels["calibration"]:
+                    self._calibration = CalibrationView(self._state, on_open_config=self._on_open_config)
+                self._panels["hardware"] = ui.column().classes("w-full gap-2")
+                with self._panels["hardware"]:
+                    self._hardware = HardwareView(self._state)
         self._highlight_tool()
+        self._show_selected()
         self.refresh()
 
     def _select_tool(self, key: str) -> None:
-        # Only one tool for now; the selection + highlight state is kept so more tools can switch by key later.
+        """Switch tools, stopping whatever the tool being left was holding.
+
+        The camera and the arm bus are single-owner: leaving 「感知测试」 with the preview still
+        running would keep the RealSense open, and the calibration tool would then fail to connect.
+        """
+        if key == self._selected_tool:
+            return
+        if self._selected_tool == "perception":
+            self.stop_preview(wait=True)
+        elif self._selected_tool == "calibration" and self._calibration is not None:
+            self._calibration.stop(wait=True)
+        elif self._selected_tool == "hardware" and self._hardware is not None:
+            self._hardware.stop(wait=True)
         self._selected_tool = key
         self._highlight_tool()
+        self._show_selected()
+        self.refresh()
+
+    def _show_selected(self) -> None:
+        for key, panel in self._panels.items():
+            panel.set_visibility(key == self._selected_tool)
 
     def _highlight_tool(self) -> None:
         for key, row in self._tool_rows.items():
@@ -139,7 +179,6 @@ class ToolsView:
                     .classes("w-full rounded")
                     .style("background:#111; max-width:760px; cursor:crosshair;")
                 )
-                ui.label("点击画面任意位置显示其深度与基座坐标系下的坐标。").classes("text-sm text-gray-600")
             with ui.column().classes("w-1/3 gap-2"):
                 with ui.card().classes("w-full gap-1"):
                     ui.label("点选读数").classes("font-bold")
@@ -154,7 +193,15 @@ class ToolsView:
 
     # ------------------------------------------------------------------ lifecycle
     def refresh(self) -> None:
-        """Recompute preconditions (selected task / config); call on page entry or state change."""
+        """Recompute the selected tool's preconditions; call on page entry or state change."""
+        if self._selected_tool == "calibration":
+            if self._calibration is not None:
+                self._calibration.refresh()
+            return
+        if self._selected_tool == "hardware":
+            if self._hardware is not None:
+                self._hardware.refresh()
+            return
         if self.is_previewing():
             return
         reason = self._precondition_block()
@@ -216,6 +263,24 @@ class ToolsView:
             self._engine.stop()
         self._stop_btn.disable()
         self._status.set_text("正在停止…")
+
+    def release_hardware(self, *, wait: bool = True) -> bool:
+        """Stop every tool on this page that can hold the camera / arm bus (idempotent).
+
+        All three tools open the arm connection (and the first two the RealSense), so leaving the
+        page, restarting, or starting a normal run must release whichever one is active — not just
+        the perception preview.
+
+        Returns whether they actually let go. Two phases cannot be interrupted on request:
+        calibration's automatic capture, and hand guiding with the arm parked outside its soft
+        limits (restoring torque there would fail and leave the arm limp). A caller that is about
+        to drive the hardware itself must check this rather than assume the request was honoured.
+        With ``wait=False`` nothing has had time to stop, so the answer is normally ``False``.
+        """
+        self.stop_preview(wait=wait)
+        released = self._calibration is None or self._calibration.stop(wait=wait)
+        released = (self._hardware is None or self._hardware.stop(wait=wait)) and released
+        return released and not self.is_previewing()
 
     def stop_preview(self, *, wait: bool = True) -> None:
         """Stop the preview and release the camera/CAN (leaving the 「工具」 page, or before a normal run; idempotent).

@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from jiuwensymbiosis.agent.session import RobotSession
 from jiuwensymbiosis.gui import registry
 
@@ -59,6 +61,57 @@ def test_so101_body_builds_real_session_from_shipped_config():
     # 随包真实配置带相机 → 声明运动 + 夹爪 + 视觉能力。
     assert "grasp.parallel" in session.env.capabilities
     assert any(c.startswith("vision.") for c in session.env.capabilities)
+
+
+def _write_body_config(path):
+    path.write_text("env:\n  cfg:\n    low_level:\n      port: /dev/ttyUSB0\n", encoding="utf-8")
+
+
+def test_alternate_configs_lists_sibling_body_configs(tmp_path, monkeypatch):
+    monkeypatch.setattr(registry, "configs_dir", lambda: tmp_path)
+    directory = tmp_path / "so101"
+    directory.mkdir()
+    _write_body_config(directory / "so101.yaml")  # 默认配置本身不重复列出
+    _write_body_config(directory / "so101.local.yaml")
+    (directory / "so101_calib.json").write_text("{}", encoding="utf-8")
+    (directory / "notes.yaml").write_text("tasks: []\n", encoding="utf-8")  # 无 env.cfg.low_level
+    (directory / "broken.yaml").write_text("a: [", encoding="utf-8")
+
+    assert [p.name for p in registry.alternate_configs("so101")] == ["so101.local.yaml"]
+
+
+def test_alternate_configs_empty_when_dir_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(registry, "configs_dir", lambda: tmp_path)
+    assert registry.alternate_configs("so101") == []
+
+
+def test_is_body_config_text_needs_low_level_section():
+    assert registry.is_body_config_text("env:\n  cfg:\n    low_level:\n      port: /dev/x\n") is True
+    assert registry.is_body_config_text("tasks: []\n") is False
+    assert registry.is_body_config_text("a: [") is False  # 坏 YAML 不是配置
+
+
+def test_body_config_path_appends_suffix_and_strips_directories(tmp_path, monkeypatch):
+    monkeypatch.setattr(registry, "configs_dir", lambda: tmp_path)
+    directory = registry.get_body("so101").config_path().parent
+    assert registry.body_config_path("so101", "bench") == directory / "bench.yaml"
+    assert registry.body_config_path("so101", "bench.yml") == directory / "bench.yml"
+    assert registry.body_config_path("so101", "../../evil") == directory / "evil.yaml"  # 挡住目录穿越
+
+
+def test_body_config_path_rejects_blank_name():
+    with pytest.raises(ValueError, match="配置名"):
+        registry.body_config_path("so101", "  ")
+
+
+def test_save_body_config_becomes_an_alternate(tmp_path, monkeypatch):
+    monkeypatch.setattr(registry, "configs_dir", lambda: tmp_path)
+    default = registry.get_body("so101").config_path()
+    default.parent.mkdir(parents=True)
+    _write_body_config(default)
+    saved = registry.save_body_config("so101", "bench", "env:\n  cfg:\n    low_level:\n      port: /dev/y\n")
+    assert saved.is_file()
+    assert [p.name for p in registry.alternate_configs("so101")] == ["bench.yaml"]
 
 
 def test_load_tasks_merges_user_tasks(tmp_path, monkeypatch):

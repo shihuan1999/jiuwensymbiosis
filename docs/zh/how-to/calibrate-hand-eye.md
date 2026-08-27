@@ -33,7 +33,9 @@
 pip install -e ".[calib,piper]"
 ```
 
-`[calib]` 提供 OpenCV 和 RealSense 支持，`[piper]` 提供 piper 机械臂驱动（如果你使用的机械臂并非 piper，需自行安装相对应的依赖）。
+标定代码属于根项目的 `jiuwensymbiosis.calibration` 子包；`[calib]` 提供
+OpenCV 与 RealSense 支持。`[piper]` 提供 piper 机械臂驱动（如果你使用的机械臂并非
+piper，需自行安装相对应的依赖）。
 
 ### 1.2 准备标定板
 
@@ -42,7 +44,7 @@ pip install -e ".[calib,piper]"
 **没有现成的板？让程序生成一张可打印图：**
 
 ```bash
-python scripts/calibrate/calibrate_hand_eye.py --generate-board board.png \
+jiuwensymbiosis-calibrate-eye-in-hand --generate-board board.png \
     --board charuco --squares-x 5 --squares-y 7 --square-size-mm 30 --marker-size-mm 22
 ```
 
@@ -75,7 +77,7 @@ python scripts/calibrate/calibrate_hand_eye.py --generate-board board.png \
 把机械臂上电、CAN 接好、标定板摆在相机视野里，运行：
 
 ```bash
-python scripts/calibrate/calibrate_hand_eye.py --config scripts/calibrate/calibrate.yaml \
+jiuwensymbiosis-calibrate-eye-in-hand --config scripts/calibrate/calibrate.yaml \
     --board charuco --squares-x 5 --squares-y 7 --square-size-mm 30 --marker-size-mm 22
 ```
 
@@ -137,7 +139,7 @@ python scripts/calibrate/calibrate_hand_eye.py --config scripts/calibrate/calibr
 **末端是裸法兰（没装工具）：**
 
 ```bash
-python scripts/calibrate/calibrate_hand_eye.py --config scripts/calibrate/calibrate.yaml \
+jiuwensymbiosis-calibrate-eye-in-hand --config scripts/calibrate/calibrate.yaml \
     --board charuco --squares-x 5 --squares-y 7 --square-size-mm 30 --marker-size-mm 22 \
     --verify-touch
 ```
@@ -175,7 +177,7 @@ piper-pick-demo --config configs/piper/piper.yaml
 把 `--board charuco --marker-size-mm ...` 换成 `--board chessboard`，其余一样。ChArUco 对遮挡/模糊更鲁棒，优先用它。
 
 **Q：没有硬件，想先熟悉一下？**
-跑 `python scripts/calibrate/calibrate_hand_eye.py --selftest`，用合成数据离线验证程序本身（无需机械臂和相机）。
+跑 `jiuwensymbiosis-calibrate-eye-in-hand --selftest`，用合成数据离线验证程序本身（无需机械臂和相机）。
 
 ---
 
@@ -197,4 +199,111 @@ piper-pick-demo --config configs/piper/piper.yaml
 | `--generate-board <png>` | 生成可打印标定板图 |
 | `--selftest` | 离线自检（无需硬件） |
 
-完整参数见 `python scripts/calibrate/calibrate_hand_eye.py --help`。
+完整参数见 `jiuwensymbiosis-calibrate-eye-in-hand --help`。在源码仓库中仍可直接运行
+`python scripts/calibrate/calibrate_hand_eye.py ...`。
+
+上述无模式向导及 `--selftest`、`--generate-board`、`--verify` 属于明确保留的
+legacy compatibility 路径，命令启动时会打印提示；`--collect-poses`、带 waypoint
+archive 的 `--auto` 和 `--replay` 使用本体无关统一工作流。
+
+---
+
+## 7. eye-to-hand 通用标定（桌面固定相机）
+
+上面 §1–§6 讲的是 **eye-in-hand**（相机在腕部，求 `T_flange_cam`，随法兰变），
+对应 piper + `calibrate_hand_eye.py`。
+
+使用 SO-101 和固定相机的操作者可直接阅读
+[SO-101 固定相机手眼标定使用指南](calibrate-so101-eye-to-hand.md)，按完整的硬件准备、
+示教、自动采集、离线重解和运行配置流程操作。
+
+本节讲 **eye-to-hand**：相机固定在桌面/基座，求 `T_base_cam`（相机在 base
+系的**常量**位姿，不随法兰变；反投影 `p_base = T_base_cam @ p_cam`，**每步不读法兰**）。
+入口是本体无关的 [scripts/calibrate/eye_to_hand_calib.py](../../../scripts/calibrate/eye_to_hand_calib.py)，
+安装 wheel 后使用 `jiuwensymbiosis-calibrate-eye-to-hand`，
+piper 与 SO-101 都支持，新设备靠 calibration-owned adapter wrapper 实现
+`jiuwensymbiosis.calibration.ports` 协议族”接入，
+**零脚本改动**。
+
+calibration 是根项目内的独立边界：它拥有模型、求解、归档、工作流和硬件 Port，
+不依赖 Agent/SafetyRail，代码位于 `jiuwensymbiosis/calibration/`。
+`jiuwensymbiosis.calibration.integration` 提供配置、RobotSession 生命周期、adapter
+标识和制品回读验证。标定执行操作者确认的受控轨迹，不自动修改轨迹、home 或挂接
+Agent Rail。可用 `make calib-test CONDA_ENV=` 和 `make calib-check CONDA_ENV=` 检查
+同一根分发中的标定模块。
+
+三个工作流可脱离 CLI 单独调用：`collect_waypoints(device, ...)`、
+`execute_calibration(device, archive, ...)` 和 `replay_calibration(archive, ...)`。
+它们就是标定子系统的直接调用边界。
+
+### 7.1 两类设备、两种轨迹空间
+
+- **SO-101**（5-DoF）：默认 `trajectory.space: joint`（关节空间）。`--collect-poses`
+  用 `ManualGuidance` 同 session 手动示教（松臂力矩→托臂移动→回车记录→退出恢复力矩）。
+- **Piper**（6-DoF）：可选 joint 或 cartesian。不支持 `ManualGuidance`，`--collect-poses`
+  回退到外部示教器移动后 snapshot，或用 `--import-poses` 导入自描述 waypoint archive。
+
+`camera_mount` 是相机挂载方式的**单一权威来源**：运行时权威是 adapter 配置的
+`cfg.camera_mount`，再由 calibration-owned adapter wrapper 以 `device.camera_mount`
+暴露给 workflow。当前 YAML loader 仍兼容旧的
+`env.cfg.low_level.camera_mount` 写法；它不属于顶层 `calibration:` 段：
+
+```yaml
+env:
+  cfg:
+    low_level:
+      camera_mount: "eye_to_hand"   # eye_in_hand | eye_to_hand
+      camera_serial: "<桌面相机序列号>"
+calibration:
+  adapter_module: "jiuwensymbiosis.adapters.so101"
+  trajectory: { space: joint }
+```
+
+### 7.2 三种模式（互斥）
+
+```bash
+# 1) 同 session 手动示教收集 waypoint（SO-101 ManualGuidance）
+jiuwensymbiosis-calibrate-eye-to-hand \
+    --config scripts/calibrate/so101_calibrate.yaml \
+    --board charuco --squares-x 5 --squares-y 7 --square-size-mm 15.28 --marker-size-mm 11 \
+    --collect-poses tmp/so101_wp.npz
+
+# 2) 自动沿 waypoint 轨迹采集 + 求解 + 发布（live，必须有 --config）
+jiuwensymbiosis-calibrate-eye-to-hand \
+    --config scripts/calibrate/so101_calibrate.yaml \
+    --board charuco --squares-x 5 --squares-y 7 --square-size-mm 15.28 --marker-size-mm 11 \
+    --auto tmp/so101_wp.npz --n-stations 24 --confirm-estop \
+    --out tmp/so101_eye_to_hand.json
+
+# 3) 离线重解（两层语义）
+#   无 --config：只输出不可被运行时加载的 REVIEW/candidate 报告（不发布正式标定）
+#   有 --config：额外校验 adapter module/挂载/frame + adapter reload smoke，通过才发布
+jiuwensymbiosis-calibrate-eye-to-hand --replay tmp/stations.npz
+jiuwensymbiosis-calibrate-eye-to-hand --replay tmp/stations.npz \
+    --config scripts/calibrate/so101_calibrate.yaml --out tmp/so101_eye_to_hand.json
+```
+
+`--collect-poses --import-poses INPUT` 不连硬件，只把自描述 waypoint archive
+规范化到 OUTPUT（不猜测裸数组的单位/关节顺序/pose 约定）。
+
+### 7.3 安全：ManualGuidance 恢复失败即中止
+
+`ManualGuidance` 上下文退出时严格执行 **preset-before-enable**：先把当前关节角
+写成 goal，再恢复力矩。preset 失败**不会**重新启动力矩（避免跳到陈旧 goal），
+任一步失败抛 `ManualGuidanceRecoveryError` 中止标定——请人工托臂并归位后再继续。
+
+### 7.4 reload 复验
+
+正式标定（schema-2 顶层 `T_base_cam`）只有在**可观测性 ACCEPT 且通过目标
+adapter `load_calibration` reload round-trip smoke test** 后才写出。REVIEW/candidate
+用独立 schema（`artifact_kind=eye_to_hand_solve_report`，矩阵放在
+`candidate.T_base_cam`，**无顶层 `T_base_cam`**），运行时 loader 无法加载——
+`--out result.json` 时 candidate 写到 `result.candidate.json`，正式路径绝不被覆盖。
+
+### 7.5 可观测性（固定阈值，可覆盖）
+
+`jiuwensymbiosis.calibration.quality.observability_report` 基于相对运动评估激励质量，第一版固定阈值
+（`scripts/calibrate/<adapter>_calibrate.yaml` 的 `calibration.observability` 覆盖，
+同名 CLI 参数优先级更高）：相对旋转 ≥5°、≥2 根有效相对旋转轴、两轴夹角 ≥15°、
+最大相对旋转 ≥20°、最大平移基线 ≥30mm、重复姿态（旋转 <2° 且平移 <5mm）即 REVIEW。
+SVD 条件数只作报告项，不直接控制 ACCEPT。

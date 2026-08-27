@@ -39,31 +39,46 @@ _GRIPPER_ENABLE = 0x01
 
 
 # =============================================================================
-# Per-run command log. Persists every ``[Piper]``
-# motion line to ``logs/motion/<run-stamp>/commands.log`` so a real-run
-# failure leaves a motion trace on disk. Disable with ``JIUWEN_PIPER_CMD_LOG=0``.
+# Per-run command log. Persists every ``[Piper]`` motion line to
+# ``<per-run dir>/commands.log`` — the run directory shared with grasp-debug
+# (see jiuwensymbiosis.utils.logging.current_run_dir) — so a real-run failure
+# leaves a motion trace on disk. Disable with ``JIUWEN_PIPER_CMD_LOG=0``.
 # =============================================================================
-_CMD_LOG_RUN_STAMP = time.strftime("%Y-%m-%d_%H-%M-%S")
-_CMD_LOG_ATTACHED = False
 _CMD_LOG_PATH: Path | None = None
+_CMD_LOG_HANDLER: logging.Handler | None = None
 
 
 def _attach_cmd_log_handler() -> Path | None:
-    global _CMD_LOG_ATTACHED, _CMD_LOG_PATH
-    if _CMD_LOG_ATTACHED:
-        return _CMD_LOG_PATH
-    _CMD_LOG_ATTACHED = True
+    """Point the Piper command log at the current per-run directory.
+
+    Called from the driver ctor on each ``connect()``; re-targets the file
+    handler when the run directory changed (the GUI reconnects per task) so every
+    run's motion lines land in that run's ``commands.log``. Best-effort.
+    """
+    global _CMD_LOG_PATH, _CMD_LOG_HANDLER
     if os.environ.get("JIUWEN_PIPER_CMD_LOG", "") == "0":
         return None
-    root = Path(os.environ.get("JIUWEN_PIPER_CMD_LOG_DIR") or os.environ.get("JIUWEN_CMD_LOG_DIR", "./logs/motion"))
-    try:
-        log_dir = root / _CMD_LOG_RUN_STAMP
-        log_dir.mkdir(parents=True, exist_ok=True)
-        os.environ.setdefault("JIUWEN_MOTION_LOG_RUN_DIR", str(log_dir))
-        path = log_dir / "commands.log"
-        # Centralised logging: uniform format + console, DEBUG so motion lines land.
-        from jiuwensymbiosis.utils.logging import _OWNED_TAG, DEFAULT_FMT, configure_logging
+    from jiuwensymbiosis.utils.logging import (
+        _OWNED_TAG,
+        DEFAULT_FMT,
+        configure_logging,
+        current_run_dir,
+    )
 
+    try:
+        path = current_run_dir() / "commands.log"
+        if _CMD_LOG_HANDLER is not None and _CMD_LOG_PATH == path:
+            return path  # already pointed at this run's dir
+        # Run dir changed (or first attach): drop the previous handler.
+        if _CMD_LOG_HANDLER is not None:
+            logger.removeHandler(_CMD_LOG_HANDLER)
+            try:
+                _CMD_LOG_HANDLER.close()
+            except OSError:
+                pass
+            _CMD_LOG_HANDLER = None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Centralised logging: uniform format + console, DEBUG so motion lines land.
         configure_logging(level="DEBUG", log_dir=None)
         # Per-run Piper file handler (same uniform format), tagged as owned.
         handler = logging.FileHandler(path, mode="w", encoding="utf-8")
@@ -74,14 +89,10 @@ def _attach_cmd_log_handler() -> Path | None:
         if logger.level == logging.NOTSET or logger.level > logging.DEBUG:
             logger.setLevel(logging.DEBUG)
         _CMD_LOG_PATH = path
-        logger.info(
-            "[Piper] cmd log started: pid=%d log=%s run-stamp=%s",
-            os.getpid(),
-            path,
-            _CMD_LOG_RUN_STAMP,
-        )
+        _CMD_LOG_HANDLER = handler
+        logger.info("[Piper] cmd log started: pid=%d log=%s", os.getpid(), path)
         return path
-    except Exception as exc:  # noqa: BLE001 - logging is best-effort
+    except Exception as exc:
         logger.warning("[Piper] cmd log setup failed: %s", exc)
         return None
 
@@ -225,12 +236,27 @@ class PiperLowLevel:
         logger.info("[Piper] CAN %s connected + arm/gripper enabled.", can_port)
 
         # --- calibration / workspace anchor
+        # A calibration JSON always carries the camera geometry; its base-frame
+        # ``object`` anchor is optional (schema-2 publications omit it). Home,
+        # z_min_safe and the tip-vs-flange pose convention follow the ANCHOR, not
+        # the file: without one they come from config, and the camera transform
+        # still loads.
         self._calib: dict[str, Any] | None = None
         self._tf_flange_cam: np.ndarray | None = None
+        calib_object_xyz: Any | None = None
         if calib_path is not None:
             self._calib = load_calibration(calib_path)
             self._tf_flange_cam = self._calib["T_flange_cam"]["matrix_4x4"]
-            calib_object_xyz = self._calib["object"]["xyz_base_mm"]
+            anchor = self._calib.get("object")
+            calib_object_xyz = None if anchor is None else anchor["xyz_base_mm"]
+            if calib_object_xyz is None:
+                logger.warning(
+                    "[Piper] calibration %s carries no object anchor: home and z_min_safe come from "
+                    "config, and poses are FLANGE-frame (an anchored calibration would make them "
+                    "TIP-frame). Check home_pose_xyzrxryrz_mm_deg / z_min_safe_mm / tool_offset_mm.",
+                    calib_path,
+                )
+        if calib_object_xyz is not None:
             self._calib_object_pose = PiperPose(
                 x=float(calib_object_xyz[0]),
                 y=float(calib_object_xyz[1]),
@@ -254,7 +280,11 @@ class PiperLowLevel:
             )
         else:
             if home_pose_xyzrxryrz_mm_deg is None or len(home_pose_xyzrxryrz_mm_deg) != 6:
-                raise ValueError("[Piper] either calib_path or home_pose_xyzrxryrz_mm_deg (6-tuple) must be set")
+                raise ValueError(
+                    "[Piper] no calibration object anchor is available, so home must come from "
+                    "config: set home_pose_xyzrxryrz_mm_deg (6-tuple), or point calib_path at a "
+                    "calibration JSON carrying object.xyz_base_mm."
+                )
             if z_min_safe_mm is None:
                 z_min_safe_mm = 50.0
             self._home_pose = PiperPose(*[float(v) for v in home_pose_xyzrxryrz_mm_deg])
@@ -285,8 +315,9 @@ class PiperLowLevel:
         if init_pose is None:
             raise RuntimeError("[Piper] GetArmEndPoseMsgs() failed during init.")
         self._init_pose = init_pose  # FLANGE frame
-        if self._calib is not None:
-            # Inherit live orientation into the home / calibration-object poses.
+        if calib_object_xyz is not None:
+            # Inherit live orientation into the anchor-derived home / object poses
+            # (both were built from a translation-only anchor above).
             self._home_pose = PiperPose(
                 self._home_pose.x,
                 self._home_pose.y,

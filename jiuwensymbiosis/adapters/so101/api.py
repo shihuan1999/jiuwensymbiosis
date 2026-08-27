@@ -53,9 +53,12 @@ from jiuwensymbiosis.api.reachability import Reachability
 from jiuwensymbiosis.contracts import GraspFailure, GraspResult
 from jiuwensymbiosis.perception.detector_client import init_detector
 from jiuwensymbiosis.perception.vision import (
+    annotate_detection_overlay,
     apply_xy_correction,
     detect_and_centroid,
     dump_grasp_debug,
+    mask_pixels_and_depths,
+    select_top_surface_grasp,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -139,6 +142,11 @@ class So101Api(BaseRobotApi):
         z_correction_mm: float = 0.0,
         grasp_z_offset_mm: float = -25.0,
         place_z_offset_mm: float = 75.0,
+        grasp_top_surface_enabled: bool = False,
+        grasp_top_band_mm: float = 15.0,
+        grasp_top_percentile: float = 90.0,
+        grasp_min_points: int = 30,
+        grasp_mask_erode_px: int = 2,
     ) -> None:
         super().__init__(env)
         # Held, not inherited: any body that ships a URDF gets the same judge.
@@ -148,6 +156,16 @@ class So101Api(BaseRobotApi):
         self._z_correction_mm = float(z_correction_mm)
         self._grasp_z_offset_mm = float(grasp_z_offset_mm)
         self._place_z_offset_mm = float(place_z_offset_mm)
+        # Top-surface grasp point (opt-in via cfg; default off keeps centroid behaviour).
+        self._grasp_top_surface_enabled = bool(grasp_top_surface_enabled)
+        self._grasp_top_band_mm = float(grasp_top_band_mm)
+        self._grasp_top_percentile = float(grasp_top_percentile)
+        self._grasp_min_points = int(grasp_min_points)
+        self._grasp_mask_erode_px = int(grasp_mask_erode_px)
+        # Last annotated detection image (RGB ndarray), for the GUI to show per
+        # detection step. Built only on the public tool path, never in the
+        # tracking hot loop. Consumed via pop_last_detection_overlay.
+        self._last_detection_overlay: Any = None
 
     # --- gripper overrides (two-state percentage, no mm/N params) ------------
     @implements(OPEN_GRIPPER)
@@ -377,6 +395,93 @@ class So101Api(BaseRobotApi):
             )
         return {"x": float(xyz_raw[0]), "y": float(xyz_raw[1]), "z": float(xyz_raw[2])}
 
+    def _project_mask_pixels_to_base_raw(self, us: np.ndarray, vs: np.ndarray, depths_m: np.ndarray) -> np.ndarray:
+        """Eye-to-hand batch projection: ``(N,3)`` base points via the constant ``tf_base_cam``.
+
+        The batch form of the single-pixel projection in :meth:`_compute_grasp_info` —
+        one constant ``tf_base_cam @ p_cam`` applied to the whole masked point cloud
+        (no flange read). Used by the top-surface grasp path.
+        """
+        from jiuwensymbiosis.utils.geometry import apply_transform, pixels_and_depths_to_camera_xyz
+
+        ll = self._ll()
+        if ll.tf_base_cam is None:
+            raise RuntimeError("top-surface grasp needs a loaded eye-to-hand calibration (set calib_path in YAML).")
+        intrinsics, _src = self._resolve_intrinsics(ll)
+        return apply_transform(ll.tf_base_cam, pixels_and_depths_to_camera_xyz(us, vs, depths_m, intrinsics))
+
+    def _project_base_to_pixel(self, xyz_base: Any) -> tuple[float, float] | None:
+        """Eye-to-hand inverse projection: base-frame XYZ (mm) → pixel (u, v), or None.
+
+        Marks the actual top-surface grasp point on the GUI diagnostic overlay.
+        ``p_cam = inv(tf_base_cam) @ p_base``; pixel via the pinhole intrinsics.
+        Returns None when calibration/intrinsics are missing or the point is behind
+        the camera (non-positive depth).
+        """
+        from jiuwensymbiosis.utils.geometry import apply_transform, invert_transform
+
+        ll = self._ll()
+        if ll.tf_base_cam is None:
+            return None
+        intrinsics, _src = self._resolve_intrinsics(ll)
+        tf_cam_base = invert_transform(np.asarray(ll.tf_base_cam, dtype=np.float64))
+        p_cam = apply_transform(tf_cam_base, np.asarray(xyz_base, dtype=np.float64))
+        z = float(p_cam[2])
+        if not np.isfinite(z) or z <= 0.0:
+            return None
+        k = np.asarray(intrinsics, dtype=np.float64)
+        u = float(k[0, 0]) * float(p_cam[0]) / z + float(k[0, 2])
+        v = float(k[1, 1]) * float(p_cam[1]) / z + float(k[1, 2])
+        return (u, v)
+
+    def _maybe_top_surface_grasp(self, best: dict, depth_img_m: np.ndarray) -> dict[str, float] | None:
+        """Yaw-only bounding-box grasp point from the masked point cloud, or None.
+
+        Returns ``None`` (caller then uses the centroid pixel) when the feature is
+        off or there are too few valid points to trust the box — a graceful
+        degrade, never worse than the default path.
+        """
+        if not self._grasp_top_surface_enabled:
+            return None
+        us, vs, depths_m = mask_pixels_and_depths(best, depth_img_m, erode_px=self._grasp_mask_erode_px)
+        if us.size < self._grasp_min_points:
+            return None
+        points_base = np.asarray(self._project_mask_pixels_to_base_raw(us, vs, depths_m), dtype=np.float64)
+        return select_top_surface_grasp(
+            points_base,
+            band_mm=self._grasp_top_band_mm,
+            top_percentile=self._grasp_top_percentile,
+            min_points=self._grasp_min_points,
+        )
+
+    def pop_last_detection_overlay(self) -> Any:
+        """Return and clear the last annotated detection image (RGB ndarray) or None.
+
+        A non-action accessor for the GUI: the run page pops the overlay after a
+        detection step to show it. Clearing prevents a stale overlay leaking to a
+        later, non-detection step.
+        """
+        overlay = self._last_detection_overlay
+        self._last_detection_overlay = None
+        return overlay
+
+    def _stash_detection_overlay(
+        self, rgb: Any, best: dict, centroid_uv: tuple[float, float], result: dict, top_surface: dict | None
+    ) -> None:
+        """Build + stash the annotated detection image (best-effort; never raises)."""
+        try:
+            grasp_uv = centroid_uv
+            if top_surface is not None:
+                reproj = self._project_base_to_pixel(result["position"])
+                if reproj is not None:
+                    grasp_uv = reproj
+            self._last_detection_overlay = annotate_detection_overlay(
+                rgb, best, centroid_uv=centroid_uv, grasp_uv=grasp_uv
+            )
+        except Exception as exc:  # overlay is a diagnostic; never break a grasp
+            logger.debug("[detection-overlay] build failed: %s", exc)
+            self._last_detection_overlay = None
+
     @implements(GET_GRASP_INFO_SIMPLE)
     def get_grasp_info_simple(self, object_name: str) -> GraspResult | GraspFailure:
         """Detect an object and return its 3D grasp/place geometry (eye-to-hand).
@@ -385,7 +490,7 @@ class So101Api(BaseRobotApi):
         xy-correct -> grasp/place geometry. ``tf_base_cam`` is a constant, so
         projection does NOT read the flange pose (the camera is desk-fixed).
         """
-        result, _tracking = self._compute_grasp_info(object_name, include_tracking=False)
+        result, _tracking = self._compute_grasp_info(object_name, include_tracking=False, build_overlay=True)
         return cast(GraspResult | GraspFailure, result)
 
     def get_grasp_tracking_sample(self, object_name: str) -> dict[str, Any]:
@@ -406,8 +511,13 @@ class So101Api(BaseRobotApi):
         object_name: str,
         *,
         include_tracking: bool,
+        build_overlay: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-        """Compute public grasp geometry plus optional private tracking data."""
+        """Compute public grasp geometry plus optional private tracking data.
+
+        ``build_overlay`` annotates the detection for the GUI; the tracking hot
+        loop leaves it off.
+        """
         from types import SimpleNamespace
 
         from jiuwensymbiosis.utils.geometry import apply_transform, pixel_and_depth_to_camera_xyz
@@ -439,10 +549,14 @@ class So101Api(BaseRobotApi):
         intrinsics, intrinsics_src = self._resolve_intrinsics(ll)
 
         # Eye-to-hand: constant T_base_cam, no flange read.
-        xyz_raw = apply_transform(
-            ll.tf_base_cam,
-            pixel_and_depth_to_camera_xyz((u, v), depth_m, intrinsics),
-        )
+        top_surface = self._maybe_top_surface_grasp(best, depth_img_m)
+        if top_surface is not None:
+            xyz_raw = np.asarray([top_surface["x"], top_surface["y"], top_surface["z_top"]], dtype=np.float64)
+        else:
+            xyz_raw = apply_transform(
+                ll.tf_base_cam,
+                pixel_and_depth_to_camera_xyz((u, v), depth_m, intrinsics),
+            )
         calib = getattr(ll, "calibration", None)
         xy_transform = calib.get("xy_transform") if calib is not None else None
         xy_corr = calib.get("xy_correction_mm") if (calib is not None and xy_transform is None) else None
@@ -525,6 +639,11 @@ class So101Api(BaseRobotApi):
             "pixel_uv": [u, v],
             "depth_m": depth_m,
         }
+        if top_surface is not None:
+            result["grasp_rz"] = top_surface["rz"]
+            result["grasp_width_mm"] = top_surface["width_mm"]
+        if build_overlay:
+            self._stash_detection_overlay(rgb, best, (float(u), float(v)), result, top_surface)
         tracking = None
         if include_tracking:
             tracking = self._tracking_metadata(
@@ -566,7 +685,6 @@ class So101Api(BaseRobotApi):
             "_tracking_valid_depth_ratio": valid_ratio,
         }
 
-
     @implements(ANALYZE_SCENE)
     def analyze_scene(self, object_name: str | None = None) -> dict:
         """Scene analysis grounded on ``object_name`` (detection counts + scores)."""
@@ -584,8 +702,10 @@ class So101Api(BaseRobotApi):
         scores = sorted((float(r.get("score", 0.0)) for r in results), reverse=True)
         # Shared meaning is "every instance"; this body has no per-instance depth, so an
         # entry carries score + pixel only — enough for a planner to size a multi-target loop.
-        objects = [{"object": target, "score": float(r.get("score", 0.0)),
-                    "pixel_uv": r.get("center") or r.get("pixel_uv")} for r in results]
+        objects = [
+            {"object": target, "score": float(r.get("score", 0.0)), "pixel_uv": r.get("center") or r.get("pixel_uv")}
+            for r in results
+        ]
         return {
             "ok": True,
             "object": target,

@@ -10,8 +10,9 @@
 并更新 NiceGUI 元素,跨线程只经这一个队列。
 
 本模块**无 Qt / 无 nicegui 依赖**,可独立单测。事件标签:
-``run_started`` / ``step_started`` / ``step_finished`` / ``frame`` / ``narration`` /
-``safety_event`` / ``log`` / ``run_finished``。``frame`` 的载荷是编码好的 data URI 字符串。
+``run_started`` / ``step_started`` / ``step_finished`` / ``frame`` / ``step_frame`` /
+``narration`` / ``safety_event`` / ``log`` / ``run_finished``。``frame`` 的载荷是编码好的
+data URI 字符串;``step_frame`` 是 ``{"index", "uri"}``(把某步专属画面钉到该步,不改实时画面)。
 
 同一时刻只应有一个运行(日志/检测 sidecar 端口是进程级单例),由界面负责串行化。
 """
@@ -30,6 +31,7 @@ from typing import Any
 
 from jiuwensymbiosis.agent import ModelSpec, RobotAgentConfig, run_robot_task
 from jiuwensymbiosis.agent.cancel import CancelToken, RunCancelled
+from jiuwensymbiosis.errors import error_code
 from jiuwensymbiosis.gui import imaging
 from jiuwensymbiosis.gui.bridge import UIBridgeRail
 from jiuwensymbiosis.gui.config_model import ConfigModel
@@ -144,15 +146,25 @@ class RunEngine:
         # complementary between-step path (UIBridgeRail.before_tool_call).
         self._cancel = CancelToken()
 
-    def clone(self) -> RunEngine:
-        """以同样的本体/任务/配置/工作区新建一个引擎(供运行页「重新执行」)。
+    @property
+    def body_key(self) -> str:
+        """本次运行的本体;「重新执行」据此取该本体当前的配置。"""
+        return self._body_key
 
-        用引擎自身持有的参数而非当前界面状态,保证「同配置重跑」——与运行后用户是否又改了
-        配置无关。配置深拷贝,互不影响。
+    @property
+    def task_key(self) -> str:
+        """本次运行的任务 key。"""
+        return str(self._task.key)
+
+    def rerun_with(self, config_data: dict[str, Any]) -> RunEngine:
+        """同一本体/任务/工作区,换用 ``config_data`` 新建一个引擎(供「重新执行」)。
+
+        本体与任务取自引擎自身(界面此后可能已切走),配置由调用方给出,所以配置页改完再点
+        「重新执行」跑的是新配置。配置深拷贝,两个引擎互不影响。
         """
         return RunEngine(
             self._task,
-            copy.deepcopy(self._config.data),
+            copy.deepcopy(config_data),
             workspace=self._workspace,
             body_key=self._body_key,
         )
@@ -172,6 +184,15 @@ class RunEngine:
             return
         self._events.put(("frame", uri))
 
+    def step_frame(self, idx: int, rgb: Any) -> None:
+        """把某一步的专属画面(检测叠加图)钉到该步,不改实时画面 _latest_uri。"""
+        try:
+            uri = imaging.to_data_uri(rgb)
+        except Exception as exc:  # 坏帧不应中断运行
+            logger.debug("step frame encode failed: %s", exc)
+            return
+        self._events.put(("step_frame", {"index": int(idx), "uri": uri}))
+
     def narration(self, text: str) -> None:
         self._events.put(("narration", text))
 
@@ -184,6 +205,18 @@ class RunEngine:
         if self._thread is not None and self._thread.is_alive():
             return
         self._thread = Thread(target=self._run, name="jiuwen-gui-run", daemon=True)
+        self._thread.start()
+
+    def start_return_to(self, joints: list[float]) -> None:
+        """起线程:连接 → 关节运动到 ``joints`` → 断连。不跑 agent、不起检测服务。
+
+        走引擎自己这条线是为了继承既有互斥:``AppState.is_busy()`` 认的就是这个线程,
+        于是回位期间开跑 / 重启都会被同一道门拦住,不必另立一套占用登记。
+        """
+        if self._thread is not None and self._thread.is_alive():
+            return
+        target = [float(v) for v in joints]
+        self._thread = Thread(target=lambda: self._run_return_to(target), name="jiuwen-gui-return", daemon=True)
         self._thread.start()
 
     def request_stop(self) -> None:
@@ -224,6 +257,7 @@ class RunEngine:
             )
             conv_id = f"gui-{uuid.uuid4().hex[:8]}"
             with session:
+                self._emit_start_pose(session)
                 self._emit_initial_frame(session)
                 # 连接已完成,接下来 run_robot_task 先做 fast 的唯一云端大模型调用(编译动作序列),
                 # 通常要等十几~几十秒。给个明确提示:这段是在等云侧模型响应,不是本地卡死。
@@ -233,7 +267,15 @@ class RunEngine:
             self._events.put(
                 (
                     "run_finished",
-                    {"ok": True, "result": result, "conversation_id": conv_id, "workspace": self._workspace},
+                    {
+                        "ok": True,
+                        "result": result,
+                        "conversation_id": conv_id,
+                        "workspace": self._workspace,
+                        # 无异常≠成功:fast 内层步骤失败也走这一支,界面同样要开诊断。
+                        # 日志尾是诊断的佐证输入,这里不带上,诊断就只能看到一句错误串。
+                        "log_tail": handler.log_tail(),
+                    },
                 )
             )
         except RunCancelled:
@@ -259,12 +301,29 @@ class RunEngine:
                         "error": f"{type(exc).__name__}: {exc}",
                         "ok": False,
                         "error_type": type(exc).__name__,
+                        "error_code": error_code(exc),
                         "log_tail": handler.log_tail(),
                     },
                 )
             )
         finally:
             log.removeHandler(handler)
+
+    def _run_return_to(self, joints: list[float]) -> None:
+        """回位线程主体:连接 → 关节运动 → 断连,结果入队。"""
+        self._events.put(("pose_return_started", {"joints": list(joints)}))
+        try:
+            body = get_body(self._body_key)
+            session = body.build_real_session(self._real_session_config(), include_sidecars=False)
+            with session:
+                # 走驱动的关节运动而不是 home():``home_use_init_pose`` 的本体在这次
+                # 新连接时又把当前姿态当成了 home,home() 会原地不动。目标点是上次开跑
+                # 时机械臂实际所在的位置,路径由驱动逐点预校验(限位/FK/桌面间隙)。
+                session.env.low_level.move_joint_blocking(list(joints))
+            self._events.put(("pose_return_finished", {"ok": True}))
+        except Exception as exc:
+            logger.exception("回到起始位失败")
+            self._events.put(("pose_return_finished", {"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
 
     # ------------------------------------------------------------------ 内部
     def _build(self) -> tuple[Any, RobotAgentConfig, str]:
@@ -278,6 +337,7 @@ class RunEngine:
 
         session = body.build_real_session(self._real_session_config())
         session.cancel_token = self._cancel
+        session.motion_log_dir = agent_cfg.motion_log_dir
         self._apply_fast_exec_config(session, agent_cfg)
 
         bridge = UIBridgeRail(self, session, should_stop=lambda: self._stop)
@@ -295,6 +355,25 @@ class RunEngine:
         if self._config.get("gui.disable_vision"):
             data = strip_vision_services(data)
         return resolve_real_session_config(data, get_body(self._body_key).config_path().parent)
+
+    def _emit_start_pose(self, session: Any) -> None:
+        """连接后记下开跑姿态,供运行结束后的「回到起始位」。
+
+        必须在这里取:``home_use_init_pose`` 的本体把连接那一刻的关节角当 home,而会话
+        一断这个值就没了,事后再连读到的已经是运行结束的姿态。没有关节、或驱动不支持
+        关节运动的本体不发事件 —— 与其给一个走不到的目标,不如让按钮保持禁用。
+        """
+        from jiuwensymbiosis.env.protocol import JointDriver
+
+        if not isinstance(getattr(session.env, "low_level", None), JointDriver):
+            return
+        try:
+            joints = session.env.get_observation().joints
+        except Exception as exc:  # 取不到不影响运行,只是没有回位目标
+            logger.debug("start pose snapshot failed: %s", exc)
+            return
+        if joints:
+            self._events.put(("start_pose", {"body": self._body_key, "joints": [float(v) for v in joints]}))
 
     def _emit_initial_frame(self, session: Any) -> None:
         """连接后先推一帧初始相机画面,让主视觉区不为空。"""

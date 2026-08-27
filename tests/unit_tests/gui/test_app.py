@@ -19,6 +19,34 @@ def test_wait_for_port_release_times_out_while_still_held(monkeypatch):
     assert app._wait_for_port_release("127.0.0.1", 8770, timeout=0.2) is False
 
 
+def _occupied(monkeypatch, *, marked: bool, released: bool) -> None:
+    monkeypatch.setattr(app, "_server_already_running", lambda host, port: True)
+    monkeypatch.setattr(app, "_healthy_instance_marked", lambda port: marked)
+    monkeypatch.setattr(app, "_wait_for_port_release", lambda host, port, timeout: released)
+
+
+def test_port_takeover_starts_when_port_is_free(monkeypatch):
+    monkeypatch.setattr(app, "_server_already_running", lambda host, port: False)
+    assert app._port_takeover("127.0.0.1", 8770, show=True) == "start"
+
+
+def test_port_takeover_points_browser_at_healthy_instance(monkeypatch):
+    _occupied(monkeypatch, marked=True, released=False)
+    assert app._port_takeover("127.0.0.1", 8770, show=True) == "open"
+
+
+def test_port_takeover_waits_out_a_closing_instance(monkeypatch):
+    _occupied(monkeypatch, marked=False, released=True)
+    assert app._port_takeover("127.0.0.1", 8770, show=True) == "start"
+    assert app._port_takeover("127.0.0.1", 8770, show=False) == "start"  # 重启的接替进程同样接手
+
+
+def test_port_takeover_aborts_headless_when_port_never_freed(monkeypatch):
+    _occupied(monkeypatch, marked=False, released=False)
+    assert app._port_takeover("127.0.0.1", 8770, show=True) == "open"  # 还能指到旧实例
+    assert app._port_takeover("127.0.0.1", 8770, show=False) == "abort"  # 无浏览器可指,只能放弃
+
+
 def test_instance_marker_lifecycle(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "_INSTANCE_MARKER", None)
     monkeypatch.setattr(app, "_marker_path", lambda port: tmp_path / f"gui-{port}.lock")
@@ -72,4 +100,5 @@ def test_spawn_replacement_clears_marker_and_launches_entry(tmp_path, monkeypatc
 
     assert app._healthy_instance_marked(8770) is False  # 先撤标记 → 接替进程会等端口让出后自己起
     assert calls and "jiuwensymbiosis.gui" in calls[0][0][0]  # 拉起同一入口
+    assert "--no-browser" in calls[0][0][0]  # 接替进程不再开新标签页,原页面自行重连刷新
     assert calls[0][1].get("start_new_session") is True  # 分离式,不随本进程退出被带走

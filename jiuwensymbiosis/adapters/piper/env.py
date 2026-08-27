@@ -174,11 +174,13 @@ class PiperEnv(BaseRobotEnv):
         )
         if self.cfg.calib_path:
             kwargs["calib_path"] = self.cfg.calib_path
-        else:
-            kwargs["home_pose_xyzrxryrz_mm_deg"] = self.cfg.home_pose_xyzrxryrz_mm_deg
-            if self.cfg.calib_object_xyzrxryrz_mm_deg:
-                kwargs["calib_object_xyzrxryrz_mm_deg"] = self.cfg.calib_object_xyzrxryrz_mm_deg
-            kwargs["z_min_safe_mm"] = self.cfg.z_min_safe_mm
+        # Always forward the config fallbacks: the driver falls back to them when the
+        # calibration carries no object anchor, which a calib_path no longer rules out.
+        # They are inert when the calibration does carry one.
+        kwargs["home_pose_xyzrxryrz_mm_deg"] = self.cfg.home_pose_xyzrxryrz_mm_deg
+        if self.cfg.calib_object_xyzrxryrz_mm_deg:
+            kwargs["calib_object_xyzrxryrz_mm_deg"] = self.cfg.calib_object_xyzrxryrz_mm_deg
+        kwargs["z_min_safe_mm"] = self.cfg.z_min_safe_mm
         if self.cfg.camera_serial:
             kwargs["camera_serial"] = self.cfg.camera_serial
 

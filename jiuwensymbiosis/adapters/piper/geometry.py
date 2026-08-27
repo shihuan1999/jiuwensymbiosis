@@ -26,12 +26,14 @@ from scipy.spatial.transform import Rotation
 from jiuwensymbiosis.utils.geometry import (
     apply_transform,
     make_transform,
+    matrix_mm_to_xyzrpy,
     pixel_and_depth_to_camera_xyz,
 )
 
 __all__ = [
     "FlangePose",
     "rpy_deg_to_rot",
+    "matrix_mm_to_flange_pose",
     "pixel_and_depth_to_base_xyz",
 ]
 
@@ -41,6 +43,17 @@ _RPY_AXES = "xyz"
 def rpy_deg_to_rot(rx_deg: float, ry_deg: float, rz_deg: float) -> np.ndarray:
     """RPY (degrees) → 3x3 rotation matrix using ``_RPY_AXES``."""
     return np.asarray(Rotation.from_euler(_RPY_AXES, [rx_deg, ry_deg, rz_deg], degrees=True).as_matrix())
+
+
+def matrix_mm_to_flange_pose(matrix: np.ndarray) -> FlangePose:
+    """Convert a 4x4 SE(3) with **millimetre** translation to a :class:`FlangePose`.
+
+    Lets the calibration workflow drive a flange SE(3) into Piper's command type
+    without a vendor-specific pose builder. Rotation is read from the leading
+    3x3 and emitted as ``_RPY_AXES`` Euler degrees; translation passes through
+    unchanged (mm).
+    """
+    return FlangePose(*matrix_mm_to_xyzrpy(matrix, axes=_RPY_AXES))
 
 
 @dataclass(frozen=True, slots=True)

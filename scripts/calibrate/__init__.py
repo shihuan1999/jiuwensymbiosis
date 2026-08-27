@@ -3,10 +3,19 @@
 
 """Hand-eye calibration scripts sub-package.
 
-Groups the vendor-specific calibration entry points (``calibrate_hand_eye``
-for piper eye-in-hand, ``so101_eye_calib`` for SO-101 eye-to-hand) with the
-shared calibration engine (``handeye_core``) and board detection helpers
-(``handeye_board``) so they can be imported as ``scripts.calibrate.<name>``
-while still being runnable as plain scripts (``python scripts/calibrate/<x>.py``),
-relying on ``sys.path[0]`` for same-directory sibling imports.
+Groups the vendor-specific calibration entry points with the board detection
+helpers (``handeye_board``). The package is installed alongside
+``jiuwensymbiosis`` (see ``[tool.setuptools.packages.find]``), so every module
+here imports its siblings as ``scripts.calibrate.<name>`` — the same absolute
+form works for the console entry points and for ``python scripts/calibrate/<x>.py``.
+
+The body-agnostic domain/workflow API is published as
+``jiuwensymbiosis.calibration``; these scripts remain JiuwenSymbiosis
+integration entry points and keep the
+``jiuwensymbiosis.calibration.integration.integration`` bridge for adapter composition.
+
+* ``hand_eye_calib`` — mount-neutral collect/auto/replay application flow.
+* ``eye_in_hand_calib`` / ``eye_to_hand_calib`` — mount-pinned compatibility
+  facades; eye-in-hand keeps a documented fallback to ``calibrate_hand_eye``
+  for its legacy wizard-only options.
 """

@@ -16,12 +16,19 @@ import tempfile
 from pathlib import Path
 
 from jiuwensymbiosis.gui import APP_NAME
-from jiuwensymbiosis.utils.logging import configure_logging
+from jiuwensymbiosis.utils.logging import configure_logging, get_logger
 
 __all__ = ["run", "clear_instance_marker", "spawn_replacement", "set_replay_workspace", "replay_url"]
 
+logger = get_logger(__name__)
+
 # 默认监听端口。仅绑定回环地址,不对外暴露。
 _DEFAULT_PORT = 8770
+
+# 端口被旧实例占着时等它让出多久:能开浏览器的启动路径超时就指过去,不必久等;重启的接替
+# 进程(不开浏览器)没有这条退路,等不到就彻底没界面,故多等一会儿。
+_SHOW_PORT_WAIT_S = 1.5
+_TAKEOVER_PORT_WAIT_S = 15.0
 
 # 浏览器标签图标:openJiuwen 官方品牌标(矢量)。缺失时回落到 NiceGUI 默认,不报错。
 _FAVICON = Path(__file__).parent / "assets" / "favicon.svg"
@@ -82,14 +89,16 @@ def spawn_replacement() -> None:
     """为「重启」拉起一个接替本进程的新 GUI 进程;调用方随后关停本进程。
 
     先撤健康标记:新进程会看到端口仍被占但无标记,据此判定「旧实例在退」,等端口让出后
-    自己起服务器(而非只把浏览器指过来)——与手动重开走同一套单实例逻辑。分离式启动
-    (``start_new_session``),使新进程不随本进程退出而被带走。命令固定、无用户输入、不走 shell。
+    自己起服务器(而非只把浏览器指过来)——与手动重开走同一套单实例逻辑。带 ``--no-browser``
+    起:接替进程不再开新标签页,原页面在新服务器起来后由 NiceGUI 的重连逻辑自行刷新,重启
+    多少次都只有一个标签页。分离式启动(``start_new_session``),使新进程不随本进程退出而被
+    带走。命令固定、无用户输入、不走 shell。
     """
     import subprocess
     import sys
 
     clear_instance_marker()
-    subprocess.Popen([sys.executable, "-m", "jiuwensymbiosis.gui"], start_new_session=True)
+    subprocess.Popen([sys.executable, "-m", "jiuwensymbiosis.gui", "--no-browser"], start_new_session=True)
 
 
 # 历史回放:经已在跑的本机 HTTP 服务打开,而非 file://。后者会被部分浏览器(如 snap/flatpak
@@ -133,21 +142,42 @@ def _resolve_trace(stem: str, workspace: str | None) -> Path | None:
     return path
 
 
+def _port_takeover(host: str, port: int, *, show: bool) -> str:
+    """端口已被占用时怎么办:``start`` 自己起 / ``open`` 指向在跑的实例 / ``abort`` 放弃。
+
+    有健康标记=另一实例在正常跑(关了标签页又点图标)→ 指过去秒开;没标记=刚点「退出/重启」
+    正在关停的旧实例(已先撤标记)→ 等它让出端口后自己接手。重启的接替进程(``show=False``)
+    没有「指过去」这条退路,等不到就只能放弃。
+    """
+    if not _server_already_running(host, port):
+        return "start"
+    if show and _healthy_instance_marked(port):
+        return "open"
+    timeout = _SHOW_PORT_WAIT_S if show else _TAKEOVER_PORT_WAIT_S
+    if _wait_for_port_release(host, port, timeout=timeout):
+        return "start"
+    return "open" if show else "abort"
+
+
 def run(*, host: str = "127.0.0.1", port: int = _DEFAULT_PORT, show: bool = True) -> int:
-    """构建页面并进入 NiceGUI/uvicorn 事件循环(阻塞至退出),返回进程退出码。"""
+    """构建页面并进入 NiceGUI/uvicorn 事件循环(阻塞至退出),返回进程退出码。
+
+    ``show=False``(重启的接替进程 / headless)不开浏览器:原标签页会在本服务器起来后自动
+    重连刷新,不必再开一个。
+    """
     configure_logging("INFO")
 
-    # 端口被占且要弹浏览器:有健康标记=另一实例在正常跑(关标签页又点图标)→ 指过去秒开;没标记
-    # =刚点「退出」正在关停的旧实例(已先撤标记),等它让出端口后往下自己接手重开(等到超时仍被占
-    # 则也指过去、不硬起)。headless/测试照常起。
-    if show and _server_already_running(host, port):
-        if _healthy_instance_marked(port) or not _wait_for_port_release(host, port, timeout=1.5):
-            from nicegui.helpers import schedule_browser
+    action = _port_takeover(host, port, show=show)
+    if action == "open":
+        from nicegui.helpers import schedule_browser
 
-            # schedule_browser 在守护线程里开浏览器;join 等它开完再返回,否则进程先退会把线程杀掉。
-            thread, _ = schedule_browser("http", host, port)
-            thread.join(3.0)
-            return 0
+        # schedule_browser 在守护线程里开浏览器;join 等它开完再返回,否则进程先退会把线程杀掉。
+        thread, _ = schedule_browser("http", host, port)
+        thread.join(3.0)
+        return 0
+    if action == "abort":
+        logger.error("端口 %d 一直被占用,接替进程放弃启动;请手动重开图形界面。", port)
+        return 1
 
     global _active_host, _active_port
     _active_host, _active_port = host, port

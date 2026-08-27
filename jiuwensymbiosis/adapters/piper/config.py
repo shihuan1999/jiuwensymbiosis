@@ -10,7 +10,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
@@ -73,6 +73,10 @@ class PiperConfig:
     camera_serial: str | None = None
     camera_resolution: tuple[int, int] = (640, 480)
     camera_fps: int = 30
+    # Camera topology, and the single authority the calibration subsystem reads
+    # to pick its output frame. Piper's camera is wrist-mounted, so calibration
+    # solves ``T_flange_cam``.
+    camera_mount: Literal["eye_in_hand"] = "eye_in_hand"
 
     # --- gripper (parallel; piper supports width + force, 0.001mm / 0.001 N·m).
     gripper_open_mm: float = 70.0  # commanded width when "open"
@@ -129,6 +133,11 @@ class PiperConfig:
             kw = dict(data)
         if "camera_resolution" in kw:
             kw["camera_resolution"] = tuple(kw["camera_resolution"])
+        if "camera_mount" in kw and kw["camera_mount"] != "eye_in_hand":
+            raise ValueError(
+                f"PiperConfig: camera_mount must be 'eye_in_hand' (the camera is wrist-mounted), "
+                f"got {kw['camera_mount']!r}."
+            )
         if "joint_limits" in kw:
             raw_limits = kw["joint_limits"]
             if not isinstance(raw_limits, dict):

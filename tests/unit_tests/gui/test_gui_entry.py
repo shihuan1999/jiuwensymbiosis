@@ -8,7 +8,11 @@
 
 from __future__ import annotations
 
+import sys
+
 from jiuwensymbiosis.gui import __main__ as gui_main
+from jiuwensymbiosis.gui import app as gui_app
+from jiuwensymbiosis.gui import preflight
 
 
 def test_preferred_cjk_font_picks_first_available():
@@ -43,6 +47,24 @@ def test_nearest_native_px_prefers_smaller_on_tie():
 def test_nearest_native_px_falls_back_to_target_when_no_bitmap():
     # TrueType/Xft:任意字号都平滑,没有"原生尺寸"约束,直接用目标像素
     assert gui_main._nearest_native_px(26, []) == 26
+
+
+def _run_main(monkeypatch, argv: list[str]) -> dict:
+    kwargs: dict = {}
+    monkeypatch.setattr(preflight, "preflight_message", lambda: None)
+    monkeypatch.setattr(gui_app, "run", lambda **kw: kwargs.update(kw) or 0)
+    monkeypatch.setattr(sys, "argv", ["jiuwensymbiosis-gui", *argv])
+    assert gui_main.main() == 0
+    return kwargs
+
+
+def test_main_opens_browser_by_default(monkeypatch):
+    assert _run_main(monkeypatch, [])["show"] is True
+
+
+def test_main_no_browser_flag_starts_headless(monkeypatch):
+    # 「重启」的接替进程带此参数:只起服务器,原标签页自行重连刷新,不再新开页面。
+    assert _run_main(monkeypatch, ["--no-browser"])["show"] is False
 
 
 def test_startup_failure_message_is_actionable():

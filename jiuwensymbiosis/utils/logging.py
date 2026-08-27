@@ -18,6 +18,9 @@ This module provides:
   records to a bound :class:`~jiuwensymbiosis.agent.trace.TraceRail` so key log
   lines (rail warnings, detector failures, …) land in the execution trace
   without touching business code.
+- :func:`begin_run` / :func:`current_run_dir` — the per-run output directory
+  (``<root>/<stamp>``) shared by the piper command log and the grasp-debug
+  dumps, so one run's on-disk artifacts land under one folder.
 
 Call ``configure_logging(...)`` once at agent build time (see
 ``build_robot_agent``). It is idempotent: repeated calls do not stack handlers.
@@ -27,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Protocol
@@ -37,6 +41,10 @@ _LOG_FILE_NAME = "jiuwensymbiosis.log"
 # Sentinel attached to handlers we own, so configure_logging can recognise its
 # own handlers on a repeat call and avoid stacking them.
 _OWNED_TAG = "_jiuwensymbiosis_owned"
+
+# Per-run output directory shared by the piper command log and grasp-debug
+# dumps. Set at RobotSession.connect(); None until the first run begins.
+_run_dir: Path | None = None
 
 LevelLike = int | str
 
@@ -195,6 +203,43 @@ def configure_logging(
                     pass
 
 
+def begin_run(root: str | Path) -> Path:
+    """Start a new per-run output directory ``<root>/<stamp>`` and return it.
+
+    Called once per run at ``RobotSession.connect()``. The stamp
+    (``YYYY-MM-DD_HH-MM-SS``) matches the legacy motion-log folder name. The
+    directory is created lazily by whoever writes into it (grasp-debug dump /
+    command-log handler), so a run that writes nothing leaves no empty folder.
+    Two runs in the same second stay distinct: the name is disambiguated
+    (``<stamp>-2`` …) against both what's on disk and the previous run dir.
+
+    Single-run assumption: the framework runs one task at a time (the GUI
+    serialises; the detector sidecar port is a process singleton), so this
+    module-level state is safe without locking.
+    """
+    global _run_dir
+    stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    base = Path(root)
+    run_dir = base / stamp
+    suffix = 2
+    while run_dir.exists() or run_dir == _run_dir:
+        run_dir = base / f"{stamp}-{suffix}"
+        suffix += 1
+    _run_dir = run_dir
+    return run_dir
+
+
+def current_run_dir(default_root: str | Path = "./jiuwen_motion_log") -> Path:
+    """Return the current per-run output directory.
+
+    Lazily begins a run under ``default_root`` for callers that never went
+    through ``RobotSession.connect()`` (ad-hoc detector scripts, unit tests).
+    """
+    if _run_dir is None:
+        return begin_run(default_root)
+    return _run_dir
+
+
 def get_logger(name: str | None = None) -> logging.Logger:
     """Return a logger.
 
@@ -216,4 +261,12 @@ def get_logger(name: str | None = None) -> logging.Logger:
     return logging.getLogger(name)
 
 
-__all__ = ["_OWNED_TAG", "DEFAULT_FMT", "TraceLogHandler", "configure_logging", "get_logger"]
+__all__ = [
+    "_OWNED_TAG",
+    "DEFAULT_FMT",
+    "TraceLogHandler",
+    "begin_run",
+    "configure_logging",
+    "current_run_dir",
+    "get_logger",
+]

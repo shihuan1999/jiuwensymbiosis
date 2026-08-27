@@ -41,6 +41,7 @@ Env without its own implementation forwards to the driver under the same name.
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
@@ -286,6 +287,33 @@ class GripperDriver(Protocol):
     @property
     def gripper_state(self) -> Any:
         """Last commanded gripper state (implementation-defined; e.g. bool closed)."""
+
+
+class HandGuidingRecoveryError(RuntimeError):
+    """A hand-guiding context could not return the robot to a controllable state.
+
+    Distinct from an ordinary failure: the arm may still be unpowered and needs
+    a human hand on it before anything else is attempted.
+    """
+
+
+@runtime_checkable
+class HandGuidingDriver(Protocol):
+    """Optional hand-guiding surface — release torque so a human can pose the robot."""
+
+    def hand_guiding(self, *, include_end_effector: bool = False) -> AbstractContextManager[None]:
+        """Release torque on entry; restore a controllable state on exit.
+
+        ``include_end_effector=False`` (default) releases the arm only and leaves
+        the end effector powered — hand-eye calibration teaching relies on this to
+        keep the board clamped. ``True`` releases the end effector as well, so
+        whatever it holds will drop. Drivers whose end effector cannot be released
+        (e.g. suction) treat the flag as a no-op.
+
+        Exit must resynchronise the motion targets with where the human actually
+        left the robot before re-energising, otherwise the servos snap back to the
+        pre-release goal. Raise :class:`HandGuidingRecoveryError` when that fails.
+        """
 
 
 @runtime_checkable

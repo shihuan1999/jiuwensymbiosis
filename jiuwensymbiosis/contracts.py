@@ -102,6 +102,8 @@ class GraspResult(TypedDict, total=False):
     score: float
     pixel_uv: list  # [u, v]
     depth_m: float
+    grasp_rz: float  # top-surface yaw (deg); only present when top-surface grasp is enabled
+    grasp_width_mm: float  # object extent along the gripper closing axis; top-surface grasp only
 
 
 # =============================================================================

@@ -19,6 +19,7 @@ Public surface mirrors the other adapters::
 
 from __future__ import annotations
 
+from jiuwensymbiosis.adapters.so101._calibration import load_calibration_artifact
 from jiuwensymbiosis.adapters.so101.api import So101Api
 from jiuwensymbiosis.adapters.so101.config import So101Config
 from jiuwensymbiosis.adapters.so101.env import So101Env
@@ -41,4 +42,5 @@ __all__ = [
     "So101PreDispatchError",
     "So101PoseConvergenceError",
     "build_so101_session",
+    "load_calibration_artifact",
 ]

@@ -47,6 +47,7 @@ from jiuwensymbiosis.api.decorators import ToolMeta
 from jiuwensymbiosis.api.memory import ExecutionMemory
 from jiuwensymbiosis.api.state import contradicted_requirements
 from jiuwensymbiosis.api.world_state import WorldState, current_tokens
+from jiuwensymbiosis.errors import DetectionError, GraspNotConfirmedError, JiuwenSymbiosisError, error_code
 from jiuwensymbiosis.rails.recovery import read_holding_payload, recover_session
 from jiuwensymbiosis.tools.robot_control_tool import _build_action_index, record_action
 
@@ -264,6 +265,32 @@ def _prescan(session: Any, steps: list[ActionStep]) -> dict[str, dict[str, Any]]
     return cache
 
 
+def _track_miss_error(session: Any, object_name: str) -> DetectionError:
+    """Build the error for a track op that never saw its target.
+
+    ``track_grasp`` / ``track_detect`` collapse "camera delivered no frame" and
+    "object genuinely absent" into a ``None`` return, which would otherwise always
+    read as a plain "not detected" — and mis-advise the user to check object
+    placement/lighting when the real cause is a dead camera. Probe one detection so
+    a no-frame condition surfaces as ``no_camera`` (the same reason the
+    ``get_grasp_info`` path already reports), which the diagnostics table maps to
+    the camera card.
+    """
+    reason = "no_detection"
+    try:
+        gi = session.api.get_grasp_info_simple(object_name)
+        if isinstance(gi, dict) and gi.get("reason") == "no_camera":
+            reason = "no_camera"
+    except Exception as exc:  # best-effort probe; fall back to the generic reason
+        logger.debug("[runner] track-miss probe raised for %r: %s", object_name, exc)
+    if reason == "no_camera":
+        return DetectionError(
+            f"target {object_name!r} not detected (reason=no_camera): camera delivered no frame",
+            code="no_camera",
+        )
+    return DetectionError(f"target {object_name!r} not detected", code=reason)
+
+
 def _track_detect(
     session: Any,
     object_name: str,
@@ -348,9 +375,7 @@ def _track_detect(
             f" error={res.error}" if res.error else "",
         )
         if not res.ok:
-            raise RuntimeError(
-                f"track_detect failed: {res.reason}: {res.error}" if res.error else f"track_detect failed: {res.reason}"
-            )
+            raise _servo_failure("track_detect", res)
         latest = tracker.latest_target()
         return dict(latest) if latest is not None else None
     finally:
@@ -451,11 +476,7 @@ def _track_grasp(
             f" error={approach.error}" if approach.error else "",
         )
         if not approach.ok:
-            raise RuntimeError(
-                f"track_grasp approach failed: {approach.reason}: {approach.error}"
-                if approach.error
-                else f"track_grasp approach failed: {approach.reason}"
-            )
+            raise _servo_failure("track_grasp approach", approach)
         descend = _run_servo_phase(
             binding,
             descend_target,
@@ -474,11 +495,7 @@ def _track_grasp(
             f" error={descend.error}" if descend.error else "",
         )
         if not descend.ok:
-            raise RuntimeError(
-                f"track_grasp descend failed: {descend.reason}: {descend.error}"
-                if descend.error
-                else f"track_grasp descend failed: {descend.reason}"
-            )
+            raise _servo_failure("track_grasp descend", descend)
 
         # Require a detection whose IMAGE was grabbed after descend finished:
         # capture time (not inference completion) so a frame grabbed mid-descend
@@ -515,11 +532,7 @@ def _track_grasp(
                 cancel_token=token,
             )
             if not re_descend.ok:
-                raise RuntimeError(
-                    f"track_grasp post-descend re-align failed: {re_descend.reason}: {re_descend.error}"
-                    if re_descend.error
-                    else f"track_grasp post-descend re-align failed: {re_descend.reason}"
-                )
+                raise _servo_failure("track_grasp post-descend re-align", re_descend)
             descend_finished_t = time.monotonic()
             final = _wait_post_descend_target(
                 tracker,
@@ -576,12 +589,23 @@ Executor = Callable[[str, dict[str, Any]], dict[str, Any]]
 Replanner = Callable[[WorldState, str], "list[ActionStep | LoopStep] | None"]
 
 
-class _StepExecutionError(RuntimeError):
+class _StepExecutionError(JiuwenSymbiosisError, RuntimeError):
     """Primitive-op failure with recovery ownership metadata."""
 
-    def __init__(self, message: str, *, recovery_managed: bool = False) -> None:
-        super().__init__(message)
+    def __init__(self, message: str, *, recovery_managed: bool = False, code: str | None = None) -> None:
+        super().__init__(message, code=code)
         self.recovery_managed = recovery_managed
+
+
+def _servo_failure(phase: str, res: ServoResult) -> _StepExecutionError:
+    """Turn a failed servo phase into a step failure that keeps the driver's own code.
+
+    ``ServoResult.error_code`` already carries the typed rejection raised at dispatch
+    (SafetyRail's ``safety_rejected``, a driver's ``cartesian_*``); re-raising a plain
+    RuntimeError here would drop it one layer above the failure site.
+    """
+    message = f"{phase} failed: {res.reason}: {res.error}" if res.error else f"{phase} failed: {res.reason}"
+    return _StepExecutionError(message, code=res.error_code or "")
 
 
 def _raise_executor_failure(
@@ -597,6 +621,7 @@ def _raise_executor_failure(
     raise _StepExecutionError(
         message,
         recovery_managed=response.get("recovery_managed") is True,
+        code=str(response.get("error_code") or ""),
     )
 
 
@@ -620,7 +645,7 @@ def direct_executor(api_or_index: Any) -> Executor:
         try:
             result = fn(**params)
         except Exception as exc:  # noqa: BLE001 - convert op failure to structured result
-            return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+            return {"ok": False, "reason": f"{type(exc).__name__}: {exc}", "error_code": error_code(exc)}
         api = getattr(fn, "__self__", None)
         if api is not None:
             record_action(api, fn, params, result)
@@ -695,7 +720,9 @@ def _retry_unconfirmed_grasp(
             logger.info("[runner] grasp retry %d/%d confirmed", attempt, cfg.max_grasp_retries)
             return detection, close_result, attempt
 
-    raise RuntimeError(f"grasp_not_confirmed: no contact after initial attempt + {cfg.max_grasp_retries} retry")
+    raise GraspNotConfirmedError(
+        f"grasp_not_confirmed: no contact after initial attempt + {cfg.max_grasp_retries} retry"
+    )
 
 
 def _cancellable_executor(run_op: Executor, token: CancelToken) -> Executor:
@@ -781,14 +808,14 @@ def _run_action(step: ActionStep, ctx: _RunContext) -> bool:
         if step.op == TRACK_DETECT:
             det = _track_detect(session, params["object_name"], cfg, cache, occluded=holding)
             if det is None:
-                raise RuntimeError(f"target {params['object_name']!r} not detected")
+                raise _track_miss_error(session, params["object_name"])
             if step.bind:
                 env[step.bind] = det
             result: Any = {"detected": det.get("position")}
         elif step.op == TRACK_GRASP:
             det = _track_grasp(session, params["object_name"], float(params["approach_mm"]), cfg)
             if det is None:
-                raise RuntimeError(f"target {params['object_name']!r} not detected")
+                raise _track_miss_error(session, params["object_name"])
             if step.bind:
                 env[step.bind] = det
             tracked_grasp = _TrackedGraspContext(
@@ -811,30 +838,36 @@ def _run_action(step: ActionStep, ctx: _RunContext) -> bool:
                 if not (isinstance(result, dict) and result.get("ok")):
                     reason = result.get("reason", "unknown") if isinstance(result, dict) else "no result"
                     target = params.get("object_name", step.bind)
-                    raise RuntimeError(
+                    raise DetectionError(
                         f"detection for {target!r} produced no usable result (reason={reason}); "
-                        f"later steps read '{step.bind}.<field>' — aborting instead of crashing downstream"
+                        f"later steps read '{step.bind}.<field>' — aborting instead of crashing downstream",
+                        code=str(reason),
                     )
                 env[step.bind] = normalize_detection(result)
             if step.op in _GRIP_CLOSE_OPS:
                 sleep_cancellable(max(0.0, cfg.settle_grip_s), token)
                 confirmed = _grasp_confirmation(session.api, result)
-                if confirmed is False and tracked_grasp is not None and cfg.max_grasp_retries > 0:
-                    retry_det, result, retry_count = _retry_unconfirmed_grasp(
-                        session,
-                        tracked_grasp,
-                        cfg,
-                        run_op,
-                    )
-                    if tracked_grasp.bind:
-                        env[tracked_grasp.bind] = retry_det
-                    if isinstance(result, dict):
-                        result = {**result, "grasp_retry_attempts": retry_count}
+                # An empty close is a failure however the approach was planned.
+                # Only the RETRY needs a track_grasp context (it re-runs that op);
+                # without one the step still has to fail closed rather than let
+                # the sequence carry on placing an object it is not holding.
+                if confirmed is False:
+                    if tracked_grasp is not None and cfg.max_grasp_retries > 0:
+                        retry_det, result, retry_count = _retry_unconfirmed_grasp(
+                            session,
+                            tracked_grasp,
+                            cfg,
+                            run_op,
+                        )
+                        if tracked_grasp.bind:
+                            env[tracked_grasp.bind] = retry_det
+                        if isinstance(result, dict):
+                            result = {**result, "grasp_retry_attempts": retry_count}
+                        else:
+                            result = {"result": result, "grasp_retry_attempts": retry_count}
+                        confirmed = _grasp_confirmation(session.api, result)
                     else:
-                        result = {"result": result, "grasp_retry_attempts": retry_count}
-                    confirmed = _grasp_confirmation(session.api, result)
-                elif confirmed is False and tracked_grasp is not None:
-                    raise RuntimeError("grasp_not_confirmed: gripper closed without object contact")
+                        raise GraspNotConfirmedError("grasp_not_confirmed: gripper closed without object contact")
                 holding = confirmed is not False
                 tracked_grasp = None
             elif step.op in _GRIP_OPEN_OPS:
@@ -858,7 +891,17 @@ def _run_action(step: ActionStep, ctx: _RunContext) -> bool:
             logger.info("[runner] recovery already handled by the ability rail stack")
         else:
             _safe_retreat(session)
-        out.append({"i": i, "op": step.op, "ok": False, "reason": f"{type(exc).__name__}: {exc}"})
+        # ``reason`` is the human/LLM-facing text; ``error_code`` is the machine
+        # one the GUI looks up directly instead of re-deriving it from that text.
+        out.append(
+            {
+                "i": i,
+                "op": step.op,
+                "ok": False,
+                "reason": f"{type(exc).__name__}: {exc}",
+                "error_code": error_code(exc),
+            }
+        )
         state["i"] = i + 1
         return False
 

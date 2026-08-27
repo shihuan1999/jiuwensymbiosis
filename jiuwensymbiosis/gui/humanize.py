@@ -53,6 +53,9 @@ FRAME_AFTER_TOOLS: frozenset[str] = frozenset(
     }
 )
 
+# 这些检测工具执行后,把「检测叠加图(bbox + 抓取位点)」钉到该步,供失败诊断。
+DETECTION_TOOLS: frozenset[str] = frozenset({"get_grasp_info_simple"})
+
 # 从工具参数里提取"物体名"时依次尝试的键。
 _OBJECT_KEYS = ("object_name", "chip_object_name", "slot_object_name", "target")
 

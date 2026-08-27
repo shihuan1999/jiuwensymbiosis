@@ -12,6 +12,7 @@ Public entry point::
         ...
 """
 
+from jiuwensymbiosis.adapters.piper._calibration import load_calibration as load_calibration_artifact
 from jiuwensymbiosis.adapters.piper.api import PiperApi
 from jiuwensymbiosis.adapters.piper.config import PiperConfig
 from jiuwensymbiosis.adapters.piper.env import PiperEnv
@@ -22,4 +23,5 @@ __all__ = [
     "PiperEnv",
     "PiperApi",
     "build_piper_session",
+    "load_calibration_artifact",
 ]

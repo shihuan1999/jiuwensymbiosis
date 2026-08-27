@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -23,6 +24,7 @@ import numpy as np
 from jiuwensymbiosis.adapters.so101.config import So101Config
 from jiuwensymbiosis.adapters.so101.geometry import So101Pose
 from jiuwensymbiosis.env.base import BaseRobotEnv, RobotObservation
+from jiuwensymbiosis.env.protocol import HandGuidingDriver
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from jiuwensymbiosis.adapters.so101.lowlevel import So101Driver
@@ -293,6 +295,18 @@ class So101Env(BaseRobotEnv):
         if self._inner is None:
             raise RuntimeError("So101Env.get_angles: env not connected.")
         return list(self._inner.get_angles())
+
+    def hand_guiding(self, *, include_end_effector: bool = False) -> AbstractContextManager[None]:
+        """Forward to the driver's ``HandGuidingDriver`` context manager.
+
+        Exposed on the Env so callers that only need hand guiding do not have to
+        reach through ``low_level``; probe support with
+        ``isinstance(env.low_level, HandGuidingDriver)``.
+        """
+        driver = self._require_driver()
+        if not isinstance(driver, HandGuidingDriver):
+            raise NotImplementedError(f"{self.name}: driver does not implement HandGuidingDriver.hand_guiding.")
+        return driver.hand_guiding(include_end_effector=include_end_effector)
 
     # --- cartesian entry point: normalize any pose-like object to So101Pose -----
     def move_to_flange(self, pose: Any) -> None:

@@ -146,6 +146,9 @@ class UIBridgeRail(AgentRail):
         self._safe(self.emitter.step_finished, info)
         if name in humanize.FRAME_AFTER_TOOLS:
             self._grab_frame()
+        elif name in humanize.DETECTION_TOOLS:
+            # step_finished 之后再发,覆盖该步默认快照,把检测叠加图钉到这一步。
+            self._emit_detection_overlay(idx)
 
     async def on_tool_exception(self, ctx: Any) -> None:
         """一步失败:发出"步骤失败";若是安全护栏拦截,另发安全事件。"""
@@ -209,6 +212,20 @@ class UIBridgeRail(AgentRail):
             return
         if rgb is not None:
             self._safe(self.emitter.frame, rgb)
+
+    def _emit_detection_overlay(self, idx: int) -> None:
+        """取本步检测的叠加图(bbox + 抓取位点)钉到该步(失败只记日志,绝不影响运行)。"""
+        api = getattr(self.session, "api", None)
+        pop = getattr(api, "pop_last_detection_overlay", None)
+        if not callable(pop):
+            return
+        try:
+            overlay = pop()
+        except Exception as exc:  # 诊断叠加图缺失不能中断任务
+            logger.debug("detection overlay pop failed: %s", exc)
+            return
+        if overlay is not None:
+            self._safe(self.emitter.step_frame, idx, overlay)
 
     @staticmethod
     def _safe(fn: Any, *args: Any) -> None:

@@ -232,3 +232,37 @@ class TestTraceFinalizeOnDisconnect:
         s.disconnect()
         s.disconnect()  # second call: trace_rail already None, must be no-op
         assert calls == [1]
+
+
+class TestRobotSessionMotionLog:
+    def teardown_method(self):
+        import jiuwensymbiosis.utils.logging as mod
+
+        mod._run_dir = None
+
+    def test_connect_establishes_per_run_dir_under_motion_log_dir(self, tmp_path):
+        from jiuwensymbiosis.utils.logging import current_run_dir
+
+        env = MockArmEnv()
+        api = MockApi(env)
+        s = RobotSession(env=env, api=api, name="t")
+        s.motion_log_dir = str(tmp_path)
+        s.connect()
+        run_dir = current_run_dir()
+        s.disconnect()
+        assert run_dir.parent == tmp_path
+
+    def test_each_connect_gets_its_own_dir(self, tmp_path):
+        from jiuwensymbiosis.utils.logging import current_run_dir
+
+        env = MockArmEnv()
+        api = MockApi(env)
+        s = RobotSession(env=env, api=api, name="t")
+        s.motion_log_dir = str(tmp_path)
+        s.connect()
+        first = current_run_dir()
+        s.disconnect()
+        s.connect()
+        second = current_run_dir()
+        s.disconnect()
+        assert first != second

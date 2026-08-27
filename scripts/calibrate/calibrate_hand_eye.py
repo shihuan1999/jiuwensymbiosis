@@ -8,19 +8,21 @@
 写出与 ``configs/piper/piper_calib.json`` 完全一致的 schema-2 标定文件，并给出
 重投影 / AX=XB 残差 / 板原点聚集度等多维精度评估。
 
-本目录三个文件：
-  * ``handeye_core.py``  —— 本体无关引擎（几何/求解/残差/写文件）；
+本目录文件：
   * ``handeye_board.py`` —— 标定板检测/生成 + 内参标定（OpenCV）；
   * ``calibrate_hand_eye.py``（本文件）—— 向导式 CLI、采集、真机流程、离线自检。
 
 跨本体（generalization）
 ------------------------
-脚本只依赖各 adapter 已经满足的「固定命名接口」，不依赖任何本体具体类型：
-  * builder 命名约定 ``build_<vendor>_session``（``.from_yaml`` / ``.from_dict``）
-  * Env 中立动词 ``env.get_flange_pose()`` / ``env.move_to_flange()``
-  * Driver 协议 ``env.low_level.grab_frames()`` / ``env.low_level.intrinsics``
-唯一与本体相关的「厂商 pose → 4x4」转换由通用 ``pose_to_tf_base_flange`` 用鸭子
-类型 + 欧拉轴序处理，默认 ``xyz`` 度恰好等于 piper 运行时 ``FlangePose`` 的约定。
+脚本经 calibration-owned ``CalibrationAdapterSpec`` 显式契约发现 adapter，并在 RobotSession 连接后
+取得 calibration-owned adapter wrapper；所有标定能力都从该 device 读取，
+不依赖任何本体具体类型、不穿透 ``env.low_level``：
+  * 显式契约 ``load_adapter_spec``（``CalibrationAdapterSpec``，由 calibration integration 声明）
+  * device 标定协议 ``CalibrationCaptureSource``（``capture_calibration_frame`` + ``camera_mount``）
+    与 ``CalibrationPoseSource``（``get_flange_transform_mm`` → 4x4 SE(3), mm）
+  * 笛卡尔运动 ``move_to_flange_transform_mm(tf)``（SE(3), mm）
+  * RGB-D 复验 ``get_observation()``（对齐 rgb+depth），反投影用通用 SE(3) 变换
+本脚本仅支持 eye-in-hand（腕部相机）；eye-to-hand 请用 ``eye_to_hand_calib.py``。
 
 依赖
 ----
@@ -52,10 +54,40 @@ import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from jiuwensymbiosis.calibration.integration.integration import CalibrationAdapterSpec
 
 import numpy as np
-from handeye_board import (
+
+from jiuwensymbiosis.calibration.domain.models import EyeInHandResult, Station, VerifyStat, ViewDetection
+from jiuwensymbiosis.calibration.domain.quality import (
+    axxb_residuals,
+    board_origin_in_base,
+    board_origin_points,
+    outlier_mask,
+)
+from jiuwensymbiosis.calibration.domain.solver import (
+    MIN_STATIONS,
+    _require_cv2,
+    rotation_spread_deg,
+    save_calibration,
+    solve_eye_in_hand,
+)
+from jiuwensymbiosis.calibration.workflows.preflight import validate_mount
+from jiuwensymbiosis.utils.geometry import (
+    apply_transform,
+    invert_transform,
+    make_transform,
+    orthonormalize,
+    pixel_and_depth_to_camera_xyz,
+    pose_to_tf_base_flange,
+    rotation_angle_deg,
+    rpy_deg_to_rot,
+)
+from jiuwensymbiosis.utils.proxy import clear_proxy_env
+from scripts.calibrate.handeye_board import (
     BoardSpec,
     _fill_poses,
     _imread_rgb,
@@ -63,34 +95,6 @@ from handeye_board import (
     detect_board,
     generate_board_image,
 )
-
-# 直接运行 `python scripts/calibrate/calibrate_hand_eye.py` 时，脚本所在目录已位于
-# sys.path[0]，故同目录的 handeye_core / handeye_board 可直接 import。
-from handeye_core import (
-    MIN_STATIONS,
-    HandEyeResult,
-    Station,
-    VerifyStat,
-    ViewDetection,
-    _first_attr,
-    _opt_attr,
-    _require_cv2,
-    _rotation_angle_deg,
-    axxb_residuals,
-    board_origin_in_base,
-    board_origin_points,
-    invert_transform,
-    make_transform,
-    orthonormalize,
-    outlier_mask,
-    pose_to_tf_base_flange,
-    rotation_spread_deg,
-    rpy_deg_to_rot,
-    save_calibration,
-    solve_hand_eye,
-)
-
-from jiuwensymbiosis.utils.proxy import clear_proxy_env
 
 logger = logging.getLogger("calibrate_hand_eye")
 
@@ -174,41 +178,11 @@ def _maybe_show(args, rgb, det: ViewDetection | None) -> None:
         logger.debug("实时预览失败（无显示器？）：%s", exc)
 
 
-# =============================================================================
-# adapter 解析（沿用 smoke_test_adapter 的固定命名约定）
-# =============================================================================
-def _resolve_module(module_str: str | None, path_str: str | None) -> str:
-    if module_str:
-        return module_str
-    if path_str:
-        p = Path(path_str).resolve()
-        parts = list(p.parts)
-        try:
-            idx = parts.index("jiuwensymbiosis")
-        except ValueError:
-            idx = len(parts) - 1
-            for i, part in enumerate(parts):
-                if part == "adapters":
-                    idx = i - 1 if i > 0 else len(parts) - 1
-                    break
-        return ".".join(parts[idx:]).replace(".py", "")
-    return ""
+def _resolve_adapter_spec(module_str: str | None) -> CalibrationAdapterSpec:
+    from jiuwensymbiosis.calibration.integration.integration import load_adapter_spec
 
-
-def _load_builder(module_str: str) -> Any:
-    """import 适配器包并返回其 ``build_*_session`` 可调用对象（带 from_yaml/from_dict）。"""
-    import importlib
-
-    module = importlib.import_module(module_str)
-    candidate = getattr(module, "build_session", None)
-    if callable(candidate):
-        return candidate
-    for attr_name in dir(module):
-        if attr_name.startswith("build_") and attr_name.endswith("_session"):
-            candidate = getattr(module, attr_name)
-            if callable(candidate):
-                return candidate
-    raise AttributeError(f"{module_str} 中找不到 build_*_session 构造器")
+    module_name = module_str or "jiuwensymbiosis.adapters.piper"
+    return load_adapter_spec(module_name)
 
 
 def _board_from_args(args) -> BoardSpec:
@@ -222,28 +196,39 @@ def _board_from_args(args) -> BoardSpec:
     )
 
 
-def _env_self_check(env) -> tuple[bool, list[str]]:
-    """环境自检：相机内参 / 取帧 / 位姿。返回 (是否全 OK, 问题列表)。"""
+def _device_self_check(device) -> tuple[bool, list[str]]:
+    """Calibration device 自检：协议 / 位姿 / 取帧 / 内参。
+
+    返回 ``(是否全 OK, 问题列表)``。自检对象必须是 calibration-owned adapter wrapper，
+    不能退回到 RobotSession Env 上的兼容委托。
+
+    走 calibration protocols（CalibrationCaptureSource / CalibrationPoseSource），
+    fail-fast：协议缺失不"选择继续后再必然失败"，而是明确报缺哪个。
+    """
+    from jiuwensymbiosis.calibration.domain.ports import CalibrationCaptureSource, CalibrationPoseSource
+
     issues: list[str] = []
-    ll = getattr(env, "low_level", None)
-    if ll is None:
-        return False, ["env.low_level 为空——env 未连接（connect 失败？）"]
+    if not isinstance(device, CalibrationCaptureSource):
+        issues.append(
+            f"{type(device).__name__} 未实现 CalibrationCaptureSource（缺 capture_calibration_frame/camera_mount）"
+        )
+    if not isinstance(device, CalibrationPoseSource):
+        issues.append(f"{type(device).__name__} 未实现 CalibrationPoseSource（缺 get_flange_transform_mm）")
     try:
-        env.get_flange_pose()
+        device.get_flange_transform_mm()
     except Exception as exc:
-        issues.append(f"读取法兰位姿失败：{exc}")
+        issues.append(f"读取法兰 SE(3) 失败：{exc}")
     try:
-        frames = ll.grab_frames()
-        if frames is None:
-            issues.append("相机取帧返回 None——相机未启动或 YAML 未配置 camera_serial？")
+        frame = device.capture_calibration_frame()
     except Exception as exc:
-        issues.append(f"相机取帧异常：{exc}")
-    if getattr(ll, "intrinsics", None) is None:
-        issues.append("相机内参不可用（intrinsics=None）——可用 --intrinsics 手动指定或 --calibrate-intrinsics")
+        issues.append(f"相机取帧失败：{exc}")
+        return (len(issues) == 0), issues
+    if frame.intrinsics is None:
+        issues.append("相机内参不可用（frame.intrinsics=None）——可用 --intrinsics 手动指定或 --calibrate-intrinsics")
     return (len(issues) == 0), issues
 
 
-def _resolve_intrinsics_pre(args, env) -> tuple[np.ndarray | None, np.ndarray | None]:
+def _resolve_intrinsics_pre(args, device) -> tuple[np.ndarray | None, np.ndarray | None]:
     """采集前确定内参来源。返回 (K 或 None, dist 或 None)。"""
     if args.intrinsics:
         fx, fy, ppx, ppy = args.intrinsics
@@ -253,8 +238,12 @@ def _resolve_intrinsics_pre(args, env) -> tuple[np.ndarray | None, np.ndarray | 
     if args.calibrate_intrinsics:
         logger.info("内参来源：采集后用视图标定（--calibrate-intrinsics）。")
         return None, None
-    ll = getattr(env, "low_level", None)
-    raw_intrinsics = getattr(ll, "intrinsics", None) if ll is not None else None
+    try:
+        frame = device.capture_calibration_frame()
+        raw_intrinsics = frame.intrinsics
+    except Exception as exc:
+        logger.warning("⚠️ 取帧读内参失败（%s），改用采集后视图标定（等价 --calibrate-intrinsics）。", exc)
+        return None, None
     if raw_intrinsics is None:
         logger.warning("⚠️ 相机内参不可用，将自动改用采集后视图标定（等价 --calibrate-intrinsics）。")
         return None, None
@@ -274,7 +263,7 @@ def _print_config_card(args, board: BoardSpec, intrinsics: np.ndarray | None) ->
     logger.info(_hr())
     logger.info("📋 本次标定配置确认：")
     logger.info("   采集模式 : %s", "自动移动(--auto)" if args.auto else "手动交互")
-    logger.info("   手眼几何 : %s", "eye-to-hand" if args.eye_to_hand else "eye-in-hand（相机在腕部）")
+    logger.info("   手眼几何 : eye-in-hand（相机在腕部，本脚本仅支持此模式）")
     marker = f"/marker {board.marker_size_mm}mm" if board.kind == "charuco" else ""
     logger.info(
         "   标定板   : %s %dx%d，方格 %.1fmm%s（务必=实测打印尺寸）",
@@ -294,7 +283,7 @@ def _print_config_card(args, board: BoardSpec, intrinsics: np.ndarray | None) ->
 # =============================================================================
 # 采集
 # =============================================================================
-def _collect_manual(env, board: BoardSpec, intrinsics, dist, args) -> tuple[list[Station], tuple[int, int] | None]:
+def _collect_manual(device, board: BoardSpec, intrinsics, dist, args) -> tuple[list[Station], tuple[int, int] | None]:
     stations: list[Station] = []
     image_size: tuple[int, int] | None = None
     logger.info("")
@@ -334,15 +323,12 @@ def _collect_manual(env, board: BoardSpec, intrinsics, dist, args) -> tuple[list
             continue
         # 默认：采集一帧
         try:
-            pose = env.get_flange_pose()
-            frames = env.low_level.grab_frames()
+            pose_tf = device.get_flange_transform_mm()
+            frame = device.capture_calibration_frame()
         except Exception as exc:
             logger.error("✗ 读取位姿/相机失败：%s", exc)
             continue
-        if frames is None:
-            logger.error("✗ 相机无帧，请检查相机连接。")
-            continue
-        rgb, _depth = frames
+        rgb = frame.rgb
         image_size = (rgb.shape[1], rgb.shape[0])
         try:
             det = detect_board(rgb, board, intrinsics, dist, min_corners=args.min_corners)
@@ -361,7 +347,7 @@ def _collect_manual(env, board: BoardSpec, intrinsics, dist, args) -> tuple[list
                 args.max_reproj_px,
             )
             continue
-        stations.append(Station(pose_to_tf_base_flange(pose, axes=args.euler_axes), det))
+        stations.append(Station(pose_tf, det))
         ok_stations = [s for s in stations if s.detection.ok]
         n_ok2 = len(ok_stations)
         spread2 = rotation_spread_deg(ok_stations)
@@ -376,23 +362,31 @@ def _collect_manual(env, board: BoardSpec, intrinsics, dist, args) -> tuple[list
         _maybe_save_debug(args, rgb, det, n_ok2)
 
 
-def _perturb_target(base_pose, drx, dry, drz, dz):
-    """以读到的位姿为锚构造一个扰动后的法兰目标（piper 专属：构造 FlangePose）。"""
-    from jiuwensymbiosis.adapters.piper.geometry import FlangePose
+def _perturb_target_tf(
+    base_tf: np.ndarray, drx: float, dry: float, drz: float, dz: float, *, axes: str = "xyz"
+) -> np.ndarray:
+    """以读到的法兰 SE(3) 为锚构造扰动目标 SE(3)（mm 平移）。
 
-    bx = float(_first_attr(base_pose, "x_mm", "x"))
-    by = float(_first_attr(base_pose, "y_mm", "y"))
-    bz = float(_first_attr(base_pose, "z_mm", "z"))
-    brx = float(_opt_attr(base_pose, "rx_deg", "rx") or 0.0)
-    bry = float(_opt_attr(base_pose, "ry_deg", "ry") or 0.0)
-    brz = float(_opt_attr(base_pose, "rz_deg", "rz") or 0.0)
-    return FlangePose(bx, by, bz + dz, brx + drx, bry + dry, brz + drz)
+    把当前旋转反推为 RPY(axes)、各分量加 delta、再转回旋转矩阵，平移只改 z。
+    **不是** ``R @ delta_R`` 相对旋转——后者改变旋转作用坐标系；默认
+    axes="xyz" 与 Piper ``FlangePose`` 一致，须与本体运行时轴序相同。
+    """
+    from scipy.spatial.transform import Rotation
+
+    t = np.asarray(base_tf, dtype=np.float64)[:3, 3]
+    rot = np.asarray(base_tf, dtype=np.float64)[:3, :3]
+    rx, ry, rz = Rotation.from_matrix(rot).as_euler(axes, degrees=True)
+    rot_new = rpy_deg_to_rot(rx + drx, ry + dry, rz + drz, axes=axes)
+    return make_transform(rot_new, np.array([t[0], t[1], t[2] + dz], dtype=np.float64))
 
 
-def _collect_auto(env, board: BoardSpec, intrinsics, dist, args) -> tuple[list[Station], tuple[int, int] | None]:
+def _collect_auto(device, board: BoardSpec, intrinsics, dist, args) -> tuple[list[Station], tuple[int, int] | None]:
+    # 未接共享 motion safety policy：--auto 扰动目标是
+    # 运行时生成的，不自动落入人工确认 waypoint 的 SafetyRail 例外；当前由
+    # --confirm-estop + 操作者现场监督兜底，Driver 硬件限位保留。
     stations: list[Station] = []
     image_size: tuple[int, int] | None = None
-    base = env.get_flange_pose()
+    base_tf = device.get_flange_transform_mm()
     tilts = sorted({-args.auto_tilt_deg, 0.0, args.auto_tilt_deg})
     yaws = sorted({-args.auto_yaw_deg, 0.0, args.auto_yaw_deg})
     dzs = sorted({-args.auto_dz_mm, 0.0, args.auto_dz_mm})
@@ -405,14 +399,12 @@ def _collect_auto(env, board: BoardSpec, intrinsics, dist, args) -> tuple[list[S
         return stations, image_size
     for drx, dry, drz, dz in targets:
         try:
-            env.move_to_flange(_perturb_target(base, drx, dry, drz, dz))
+            device.move_to_flange_transform_mm(_perturb_target_tf(base_tf, drx, dry, drz, dz, axes=args.euler_axes))
         except Exception as exc:
             logger.warning("移动失败（可能不可达），跳过：%s", exc)
             continue
-        frames = env.low_level.grab_frames()
-        if frames is None:
-            continue
-        rgb, _depth = frames
+        frame = device.capture_calibration_frame()
+        rgb = frame.rgb
         image_size = (rgb.shape[1], rgb.shape[0])
         try:
             det = detect_board(rgb, board, intrinsics, dist, min_corners=args.min_corners)
@@ -420,10 +412,10 @@ def _collect_auto(env, board: BoardSpec, intrinsics, dist, args) -> tuple[list[S
             logger.info("✗ 未采纳：检测异常（%s）", exc)
             continue
         _maybe_show(args, rgb, det)
-        pose = env.get_flange_pose()
+        pose_tf = device.get_flange_transform_mm()
         accept = det.ok and (det.reproj_rms_px is None or det.reproj_rms_px <= args.max_reproj_px or args.lax)
         if accept:
-            stations.append(Station(pose_to_tf_base_flange(pose, axes=args.euler_axes), det))
+            stations.append(Station(pose_tf, det))
             logger.info("✓ 采纳（累计 %d）", len([s for s in stations if s.detection.ok]))
         else:
             why = det.reason if not det.ok else f"重投影 {det.reproj_rms_px:.2f}px 超阈值"
@@ -434,7 +426,7 @@ def _collect_auto(env, board: BoardSpec, intrinsics, dist, args) -> tuple[list[S
 # =============================================================================
 # object 锚点 / 报告 / 复验
 # =============================================================================
-def _resolve_object_xyz(args, res: HandEyeResult) -> list[float]:
+def _resolve_object_xyz(args, res: EyeInHandResult) -> list[float]:
     if args.object_xyz is not None:
         logger.info("object.xyz_base_mm 使用 --object-xyz：%s", list(args.object_xyz))
         return [float(v) for v in args.object_xyz]
@@ -459,7 +451,7 @@ def _resolve_object_xyz(args, res: HandEyeResult) -> list[float]:
     return [float(v) for v in xyz]
 
 
-def _report_dict(res: HandEyeResult) -> dict[str, Any]:
+def _report_dict(res: EyeInHandResult) -> dict[str, Any]:
     def _s(st: VerifyStat) -> dict[str, float]:
         return {"mean": st.mean, "max": st.max, "std": st.std}
 
@@ -481,7 +473,7 @@ def _report_dict(res: HandEyeResult) -> dict[str, Any]:
     }
 
 
-def _print_report(res: HandEyeResult, args, *, title: str = "") -> None:
+def _print_report(res: EyeInHandResult, args, *, title: str = "") -> None:
     logger.info("")
     _banner(["阶段 2 · 标定结果与精度评估" + (f"  {title}" if title else "")])
     logger.info(
@@ -529,7 +521,7 @@ def _print_report(res: HandEyeResult, args, *, title: str = "") -> None:
         logger.info("详细报告已存：%s", rp)
 
 
-def _maybe_drop_outliers(res: HandEyeResult, stations, intrinsics, args) -> HandEyeResult:
+def _maybe_drop_outliers(res: EyeInHandResult, stations, intrinsics, args) -> EyeInHandResult:
     """剔除个别离群帧后重解；用三道闸门防止掩盖系统性偏差（尺度/轴序/板不平）。
 
     返回最终采用的结果（剔除成功则为重解结果，否则原结果）。
@@ -577,11 +569,10 @@ def _maybe_drop_outliers(res: HandEyeResult, stations, intrinsics, args) -> Hand
     dropped = [(i, round(float(dists[i]), 1)) for i in range(len(good)) if mask[i]]
     logger.info("剔除 %d 个离群帧后用剩余 %d 帧重解；剔除帧 (索引,偏差mm)=%s", n_out, len(keep), dropped)
     try:
-        res2 = solve_hand_eye(
+        res2 = solve_eye_in_hand(
             keep,
             intrinsics,
             method=args.method,
-            eye_to_hand=args.eye_to_hand,
             cross_check=args.cross_check,
         )
     except Exception as exc:
@@ -598,7 +589,7 @@ def _maybe_drop_outliers(res: HandEyeResult, stations, intrinsics, args) -> Hand
     return res2
 
 
-def _print_next_steps(args, res: HandEyeResult) -> None:
+def _print_next_steps(args, res: EyeInHandResult) -> None:
     logger.info("")
     logger.info("👉 下一步：")
     logger.info("   - 真机反投影复验：重跑本脚本加 --verify（或 --verify-touch 靠近悬停目视）。")
@@ -606,19 +597,17 @@ def _print_next_steps(args, res: HandEyeResult) -> None:
     logger.info("   - 标定正确后，可逐步把 piper.yaml 的 z_correction_mm 调向 0。")
 
 
-def _verify_live(env, res: HandEyeResult, intrinsics: np.ndarray, args) -> None:
+def _verify_live(env, device, res: EyeInHandResult, intrinsics: np.ndarray, args) -> None:
+    # 未接共享 motion safety policy：verify-touch 目标
+    # 是运行时由求解结果+深度计算得到的，不自动落入人工确认 waypoint 例外；
+    # 当前由 --confirm-estop + 操作者现场监督兜底，Driver 硬件限位保留。
     logger.info("")
-    _banner(["阶段 3 · 真机反投影复验（与 demo 完全相同的反投影路径）"])
-    try:
-        from jiuwensymbiosis.adapters.piper.geometry import FlangePose, pixel_and_depth_to_base_xyz
-    except Exception as exc:
-        logger.warning("无法导入 piper 反投影（--verify 目前仅支持 piper）：%s", exc)
+    _banner(["阶段 3 · 真机反投影复验（通用 SE(3) 反投影，不依赖厂商 pose 类型）"])
+    obs = env.get_observation()
+    if obs.rgb is None or obs.depth is None:
+        logger.error("无 RGB-D 帧（rgb/depth=None），无法复验。")
         return
-    frames = env.low_level.grab_frames()
-    if frames is None:
-        logger.error("无相机帧，无法复验。")
-        return
-    rgb, depth_m = frames
+    rgb, depth_m = obs.rgb, obs.depth
     det = detect_board(rgb, _board_from_args(args), intrinsics, None, min_corners=args.min_corners)
     if not det.ok or det.image_points is None:
         logger.error("复验时未检测到标定板：%s", det.reason)
@@ -629,9 +618,11 @@ def _verify_live(env, res: HandEyeResult, intrinsics: np.ndarray, args) -> None:
     if not np.isfinite(d) or d <= 0:
         logger.error("板中心像素 (%d,%d) 深度无效（%.3f）。", u, v, d)
         return
-    pose = env.get_flange_pose()
-    fp = FlangePose(float(pose.x), float(pose.y), float(pose.z), float(pose.rx), float(pose.ry), float(pose.rz))
-    p_base = pixel_and_depth_to_base_xyz((u, v), d, fp, res.tf_flange_cam, intrinsics)
+    tf_base_flange = device.get_flange_transform_mm()
+    # 通用 SE(3) 反投影：p_base = (tf_base_flange @ tf_flange_cam) @ p_cam
+    p_cam_mm = pixel_and_depth_to_camera_xyz((u, v), d, intrinsics)
+    tf_base_cam = tf_base_flange @ res.tf_flange_cam
+    p_base = apply_transform(tf_base_cam, p_cam_mm)
     logger.info("板中心像素(%d,%d) 深度%.3fm → 基座坐标 %s mm", u, v, d, np.round(p_base, 1).tolist())
     if not args.verify_touch:
         logger.info("（仅反投影；如需机械臂靠近板面目视复验请加 --verify-touch）")
@@ -668,11 +659,18 @@ def _verify_live(env, res: HandEyeResult, intrinsics: np.ndarray, args) -> None:
         logger.info("已跳过 verify-touch。")
         return
 
-    # 指尖悬停高度换算为法兰目标 z；先到更高处再下降，避免侧向扫过标定板
+    # 指尖悬停高度换算为法兰目标 z；先到更高处再下降，避免侧向扫过标定板。
+    # 目标 SE(3) 保持当前旋转（只改平移到板中心上方），用 device 的
+    # move_to_flange_transform_mm 下发；Env 只提供运行时 RGB-D 观测和工具配置。
+    rot_cur = tf_base_flange[:3, :3]
     flange_hover_z = p_base[2] + tool + hover
     approach_z = flange_hover_z + 40.0
-    env.move_to_flange(FlangePose(p_base[0], p_base[1], approach_z, fp.rx_deg, fp.ry_deg, fp.rz_deg))
-    env.move_to_flange(FlangePose(p_base[0], p_base[1], flange_hover_z, fp.rx_deg, fp.ry_deg, fp.rz_deg))
+    device.move_to_flange_transform_mm(
+        make_transform(rot_cur, np.array([p_base[0], p_base[1], approach_z], dtype=np.float64))
+    )
+    device.move_to_flange_transform_mm(
+        make_transform(rot_cur, np.array([p_base[0], p_base[1], flange_hover_z], dtype=np.float64))
+    )
     logger.info(
         "指尖应悬停在板中心正上方约 %.0fmm（未接触）。请肉眼确认指尖是否对准板中心：xy 对齐即标定良好。",
         hover,
@@ -723,39 +721,49 @@ def do_calibrate(args) -> int:
             _print_board_print_notice(board)
             return 1
 
-    # 构建 session（固定命名 builder 约定）
-    module = args.module or "jiuwensymbiosis.adapters.piper"
-    logger.info("正在连接机器人（%s）...", module)
+    logger.info("正在连接机器人（%s）...", args.module or "jiuwensymbiosis.adapters.piper")
     try:
-        builder = _load_builder(_resolve_module(module, args.path))
-        session = builder.from_yaml(args.config) if args.config else builder.from_dict({})
+        spec = _resolve_adapter_spec(args.module)
+        if args.config:
+            session = spec.session_factory.from_yaml(args.config, include_sidecars=False)
+        else:
+            # ``make_builder``'s direct ``__call__`` accepts a config object;
+            # use its dict loader for the no-config/default path so adapter
+            # defaults are materialised instead of passing a bare dict into
+            # ``PiperEnv``/``So101Env``.
+            session = spec.session_factory.from_dict({}, include_sidecars=False)
     except Exception as exc:
         logger.error("❌ 构建 session 失败：%s", exc)
         logger.error("   请检查 --config / --module，以及硬件（CAN、相机）是否就绪。")
         return 2
 
-    # 标定只需 CAN 读位姿 + 相机取帧，不需要 detector/VLM 等 sidecar。某些 adapter
-    # （如 piper）的 detector.spawn 默认 True，会在 connect 时启动检测服务（加载
-    # GroundingDINO+SAM2，慢且吃 GPU）。这里统一禁用，避免标定误启动它们。
-    if getattr(session, "sidecar_starters", None):
-        n = len(session.sidecar_starters)
-        session.sidecar_starters = []
-        logger.info("标定无需检测服务，已跳过 %d 个 sidecar（不会加载 GroundingDINO 等）。", n)
-
     with session:
         env = session.env
-        # 阶段0：环境自检
-        ok, issues = _env_self_check(env)
+        try:
+            device = spec.make_calibration_device(session.env)
+        except Exception as exc:
+            logger.error("❌ 构建 calibration device 失败：%s", exc)
+            return 2
+        try:
+            mount = validate_mount(str(device.camera_mount), source="device.camera_mount")
+        except Exception as exc:
+            logger.error("❌ %s", exc)
+            return 2
+        if mount != "eye_in_hand":
+            logger.error("❌ 本脚本仅支持 eye-in-hand（腕部相机），当前 camera_mount=%s。", mount)
+            logger.error("   eye-to-hand（桌面固定相机）请用 scripts/calibrate/eye_to_hand_calib.py。")
+            return 2
+        ok, issues = _device_self_check(device)
         if not ok:
-            logger.error("❌ 环境自检发现问题：")
+            logger.error("❌ calibration device 自检发现问题：")
             for it in issues:
                 logger.error("   - %s", it)
             if not _ask_yes_no("仍要继续吗？", default=False, assume_yes=args.yes if interactive else False):
                 return 2
         else:
-            logger.info("✅ 环境自检通过（位姿/相机/内参就绪）。")
+            logger.info("✅ calibration device 自检通过（标定协议/位姿/相机/内参就绪）。")
 
-        intrinsics, dist = _resolve_intrinsics_pre(args, env)
+        intrinsics, dist = _resolve_intrinsics_pre(args, device)
         _print_config_card(args, board, intrinsics)
         if interactive and not args.yes:
             if not _ask_yes_no("以上配置是否正确，开始采集？", default=True):
@@ -768,9 +776,9 @@ def do_calibrate(args) -> int:
 
         # 阶段1：采集
         if args.auto:
-            stations, image_size = _collect_auto(env, board, intrinsics, dist, args)
+            stations, image_size = _collect_auto(device, board, intrinsics, dist, args)
         else:
-            stations, image_size = _collect_manual(env, board, intrinsics, dist, args)
+            stations, image_size = _collect_manual(device, board, intrinsics, dist, args)
         n_ok = len([s for s in stations if s.detection.ok])
         if n_ok < MIN_STATIONS:
             logger.error("❌ 有效视图 %d < %d，已放弃。", n_ok, MIN_STATIONS)
@@ -790,13 +798,11 @@ def do_calibrate(args) -> int:
                 )
             _fill_poses([s.detection for s in stations], intrinsics, dist, board)
 
-        # 阶段2：求解 + 评估
         try:
-            res = solve_hand_eye(
+            res = solve_eye_in_hand(
                 stations,
                 intrinsics,
                 method=args.method,
-                eye_to_hand=args.eye_to_hand,
                 cross_check=args.cross_check,
             )
         except Exception as exc:
@@ -831,7 +837,7 @@ def do_calibrate(args) -> int:
         _print_next_steps(args, res)
 
         if args.verify or args.verify_touch:
-            _verify_live(env, res, intrinsics, args)
+            _verify_live(env, device, res, intrinsics, args)
     return 0
 
 
@@ -941,8 +947,8 @@ def do_selftest(args) -> int:
         have_cv2 = False
     if have_cv2:
         intrinsics = np.array([[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]])
-        res = solve_hand_eye(stations, intrinsics, method="PARK", cross_check=True)
-        ang = _rotation_angle_deg(res.tf_flange_cam[:3, :3], tf_gt[:3, :3])
+        res = solve_eye_in_hand(stations, intrinsics, method="PARK", cross_check=True)
+        ang = rotation_angle_deg(res.tf_flange_cam[:3, :3], tf_gt[:3, :3])
         dmm = float(np.linalg.norm(res.tf_flange_cam[:3, 3] - tf_gt[:3, 3]))
         _selftest_assert(ang < 1e-3 and dmm < 1e-2, f"求解未恢复真值: {ang}°, {dmm}mm")
         logger.info("✅ calibrateHandEye 恢复真值：旋转误差 %.2e°，平移误差 %.2e mm", ang, dmm)
@@ -986,8 +992,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--generate-board", metavar="PATH", default=None, help="生成可打印标定板图后退出")
     # 机器人 / 适配器
     p.add_argument("--config", "-c", default=None, help="YAML 配置（如 scripts/calibrate/calibrate.yaml）")
-    p.add_argument("--module", "-m", default=None, help="适配器模块（默认 jiuwensymbiosis.adapters.piper）")
-    p.add_argument("--path", default=None, help="适配器目录路径（自动推导模块）")
+    p.add_argument(
+        "--module",
+        "-m",
+        default=None,
+        help="适配器包名（默认 jiuwensymbiosis.adapters.piper，由 calibration integration 提供标定契约）",
+    )
     # 标定板
     p.add_argument("--board", choices=["charuco", "chessboard"], default="charuco", help="标定板类型")
     p.add_argument("--squares-x", type=int, default=5, help="板 X 方向方格数")
@@ -1043,8 +1053,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="自动剔除离群帧后重解（默认开；--no-drop-outliers 关闭）",
     )
     p.add_argument("--outlier-k", type=float, default=3.0, help="离群判别的 MAD 倍数（越小越激进）")
-    p.add_argument("--eye-to-hand", action="store_true", help="eye-to-hand（默认 eye-in-hand）")
-    p.add_argument("--euler-axes", default="xyz", help="厂商位姿欧拉轴序（须与本体运行时一致）")
+    p.add_argument(
+        "--euler-axes",
+        default="xyz",
+        help="自动扰动目标 RPY 反推的轴序（仅用于 --auto 的 _perturb_target_tf；默认 xyz 与 piper FlangePose 一致，须与本体运行时一致）",
+    )
     # 输出 / 复验 / UX
     p.add_argument("--out", "-o", default="configs/piper/piper_calib.json", help="输出标定文件")
     p.add_argument("--verify", action="store_true", help="标定后真机反投影复验（仅打印坐标）")

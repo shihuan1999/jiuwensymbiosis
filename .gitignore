@@ -5,8 +5,14 @@
 *.pyc
 logs/
 *.local.yaml
+*.local.md
 .codegraph
 build/
 dist/
 *.egg*
 plans/
+jiuwen_motion_log/
+tmp/
+# 标定产物与写回配置时留下的备份,都是本机运行的结果
+configs/*/calibration/
+*.yaml.bak

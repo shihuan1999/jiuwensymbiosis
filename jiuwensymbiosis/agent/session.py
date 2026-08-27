@@ -26,9 +26,21 @@ from typing import Any
 
 from jiuwensymbiosis.agent.cancel import CancelToken, RunCancelled
 from jiuwensymbiosis.api.base import BaseRobotApi
-from jiuwensymbiosis.env.base import BaseRobotEnv
+from jiuwensymbiosis.env.base import DERIVED_CAPABILITIES, BaseRobotEnv
 
 logger = logging.getLogger(__name__)
+
+
+def _env_capabilities(env: Any) -> set[str]:
+    """What the env offers, on the SAME basis the tool gate uses.
+
+    ``build_robot_tools`` reads ``effective_capabilities`` (declared + what the body
+    SHIPS); reading plain ``capabilities`` here would report a mismatch the gate does
+    not see. Falls back for a duck-typed env, matching ``tools/builder.py``.
+    """
+    caps = getattr(env, "effective_capabilities", None) or getattr(env, "capabilities", None) or frozenset()
+    return set(caps)
+
 
 # Cap on how long the connect reaper waits for an abandoned env.connect to finish
 # before giving up (env.connect self-bounds via its own enable timeouts, so this
@@ -61,10 +73,12 @@ class RobotSession:
             ``time``, your own helpers here.
         strict_capabilities: When True, raise ``ValueError`` on connect if the
             api declares capabilities the env does not (a clear config error —
-            a Mixin was added without updating the env, or the env's hardware
-            capabilities changed). ``env``-only capabilities (hardware has a
-            feature the api doesn't surface) always stay a warning, since that
-            is a missing tool, not a misconfiguration.
+            an action was implemented without updating the env, or the env's
+            hardware capabilities changed). ``env``-only capabilities (hardware
+            has a feature the api doesn't surface) always stay a warning, since
+            that is a missing tool, not a misconfiguration. Capabilities in
+            ``DERIVED_CAPABILITIES`` are exempt from both: each side derives its
+            own half and the intersection already settles it.
     """
 
     env: BaseRobotEnv
@@ -78,6 +92,11 @@ class RobotSession:
     # connect; framework enforcement points read it. None → no cancellation wiring,
     # identical behaviour for CLI / tests.
     cancel_token: CancelToken | None = field(default=None, init=False, repr=False)
+
+    # Root for the per-run motion log (commands.log + grasp_debug). Set as an
+    # attribute by the runner before connect; None → "./jiuwen_motion_log".
+    # See jiuwensymbiosis.utils.logging.begin_run.
+    motion_log_dir: str | None = field(default=None, init=False, repr=False)
 
     _stack: ExitStack | None = field(default=None, init=False, repr=False)
     _connected: bool = field(default=False, init=False, repr=False)
@@ -100,6 +119,12 @@ class RobotSession:
         """Connect the env and start all sidecars. Idempotent."""
         if self._connected:
             return
+        from jiuwensymbiosis.utils.logging import begin_run
+
+        # Establish this run's output directory before the env driver attaches a
+        # command log (piper) or any grasp-debug dump lands, so all of one run's
+        # motion artifacts share one folder.
+        begin_run(self.motion_log_dir or "./jiuwen_motion_log")
         self._stack = ExitStack()
         # The starter loop is inside the try so a cancel raised between starters
         # (or inside a token-aware sidecar wait) still closes the stack, tearing
@@ -119,10 +144,14 @@ class RobotSession:
         self._connected = True
         logger.info("RobotSession[%s] connected", self.name)
 
-        env_caps = set(self.env.capabilities)
+        env_caps = _env_capabilities(self.env)
         api_caps = set(self.api.capabilities)
         env_only = env_caps - api_caps
-        api_only = api_caps - env_caps
+        # A derived capability is asymmetric BY DESIGN — the api half is "holds a judge",
+        # the env half is "ships the model", and the intersection is the answer. Reporting
+        # that asymmetry as a config error would flag every body that holds the generic
+        # judge without shipping a URDF, which is a supported, deliberate state.
+        api_only = api_caps - env_caps - DERIVED_CAPABILITIES
         if env_only:
             logger.warning(
                 "RobotSession[%s]: env has capabilities not declared by api: %s. "
@@ -133,11 +162,14 @@ class RobotSession:
         if api_only:
             env_cls = type(self.env).__name__
             api_cls = type(self.api).__name__
-            fix_hint = f"修复指引：在 {env_cls}.capabilities 里加入这些能力，或从 {api_cls} 移除对应的 Mixin。"
+            fix_hint = (
+                f"修复指引：在 {env_cls}.capabilities 里加入这些能力，"
+                f"或从 {api_cls} 移除对应动作的 @implements / capability 声明。"
+            )
             if self.strict_capabilities:
-                # api declares a capability the hardware does not provide — a
-                # config error (Mixin added without updating env, or hardware
-                # changed). Surface it loudly instead of silently dropping tools.
+                # api declares a capability the hardware does not provide — a config
+                # error (an action was implemented without updating the env, or the
+                # hardware changed). Surface it loudly instead of silently dropping tools.
                 self._connected = False
                 if self._stack is not None:
                     self._stack.close()
@@ -269,7 +301,7 @@ class RobotSession:
     # --------------------------------------------------------------- description
     def describe(self) -> dict[str, Any]:
         """JSON-able summary. ``effective_capabilities`` (env ∩ api) gates tools."""
-        env_caps = set(self.env.capabilities)
+        env_caps = _env_capabilities(self.env)
         api_caps = set(self.api.capabilities)
         return {
             "name": self.name,

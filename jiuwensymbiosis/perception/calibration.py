@@ -30,9 +30,9 @@ from typing import Any
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
+from jiuwensymbiosis.calibration_schema import CURRENT_SCHEMA_VERSION, PIPER_LEGACY_FRAME_FIELD
 
-CURRENT_SCHEMA_VERSION = 2
+logger = logging.getLogger(__name__)
 
 
 class LegacyCalibrationError(RuntimeError):
@@ -48,7 +48,7 @@ def load_calibration(
     path: str | Path,
     *,
     frame_field: str = "T_J3link_cam",
-    legacy_field: str = "T_TCP_cam",
+    legacy_field: str = PIPER_LEGACY_FRAME_FIELD,
     env_var: str = "JIUWEN_ALLOW_LEGACY_CALIB",
 ) -> dict[str, Any]:
     """Load a calibration JSON. Returns a dict with numpy arrays where natural.

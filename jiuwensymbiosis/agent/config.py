@@ -180,6 +180,9 @@ class RobotAgentConfig:
             the relative ``log_path``); the two are independent — jiuwensymbiosis
             does not configure openjiuwen's log path. Set ``None`` for
             console-only.
+        motion_log_dir: Root for the per-run motion log — each run gets its own
+            ``<motion_log_dir>/<stamp>/`` holding ``commands.log`` (piper) and
+            ``grasp_debug/`` (vision). ``None`` → ``"./jiuwen_motion_log"``.
         parallel_tool_calls: Whether the agent loop may dispatch multiple tool
             calls concurrently. Defaults **False** (sequential) — robot motion
             is inherently sequential, and openjiuwen's per-tool ``ctx.extra``
@@ -187,6 +190,12 @@ class RobotAgentConfig:
             locates the "current step" via ``ctx.extra`` or
             ``trace.entries[-1]`` (TraceRail / VisualFeedbackRail). Set True
             only with non-motion parallel tools after auditing the rail stack.
+        enable_fast_special_ops: Fast path only — authorize the runner-owned
+            real-time servo ops (``track_grasp`` / ``track_detect``). Defaults
+            True. Set False to force the fast compiler onto plain per-op steps
+            (analyze → grasp-info → goto → grasp) with no continuous tracking
+            loop, without dropping any session capability. No effect on the
+            agent path, which never emits special ops.
     """
 
     mode: Mode = "hybrid"
@@ -223,12 +232,19 @@ class RobotAgentConfig:
     # setting; jiuwensymbiosis does not touch openjiuwen's log path. Set None
     # for console-only; override via env or YAML ``agent.log_dir``.
     log_dir: str | None = "./logs"
+    # Root for the per-run motion log: each run → ``<motion_log_dir>/<stamp>/``
+    # with ``commands.log`` (piper) + ``grasp_debug/`` (vision). None →
+    # "./jiuwen_motion_log". Override via YAML ``agent.motion_log_dir``.
+    motion_log_dir: str | None = None
     parallel_tool_calls: bool = False
 
     # --- speed switch --- see ExecMode. Default is fastagent (compile once, then run
     # with no per-step LLM); --mock / --stepagent force stepagent for offline/debug.
     exec_mode: ExecMode = "fastagent"
     exec_config: Any = None
+    # Authorize fast-path real-time servo ops (track_grasp / track_detect).
+    # Default on; set False to run the fast path with plain per-op steps only.
+    enable_fast_special_ops: bool = True
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> RobotAgentConfig:

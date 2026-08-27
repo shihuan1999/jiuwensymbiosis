@@ -32,6 +32,7 @@
 ### How-to（操作指南）
 
 - [手眼标定指南](zh/how-to/calibrate-hand-eye.md)
+- [SO-101 固定相机手眼标定使用指南](zh/how-to/calibrate-so101-eye-to-hand.md)
 - [图形界面使用指南](zh/how-to/configure-gui.md)
 - [配置和使用日志](zh/how-to/configure-logging.md)
 - [移植机器人硬件适配器](zh/how-to/port-hardware-adapter.md)
@@ -61,6 +62,7 @@
 ### How-to
 
 - [Calibrate Hand-Eye Geometry](en/how-to/calibrate-hand-eye.md)
+- [Calibrate an SO-101 with a Fixed Camera](en/how-to/calibrate-so101-eye-to-hand.md)
 - [Configure the GUI](en/how-to/configure-gui.md)
 - [Configure and Use Logging](en/how-to/configure-logging.md)
 - [Port a Robot Hardware Adapter](en/how-to/port-hardware-adapter.md)

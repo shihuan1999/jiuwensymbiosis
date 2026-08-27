@@ -143,3 +143,38 @@ class TestPiperEnvNoDriverForwarding:
         hp = env.home_pose
         assert hp is not None
         assert hp.x == 200
+
+
+class TestConnectForwardsConfigFallbacks:
+    """A calibration carries camera geometry; home / z floor stay a config concern.
+
+    A schema-2 artifact may omit the ``object`` anchor, and the driver then falls
+    back to the config values — so ``calib_path`` being set must NOT suppress them.
+    """
+
+    @staticmethod
+    def _captured_kwargs(mocker, cfg: PiperConfig) -> dict:
+        from jiuwensymbiosis.adapters.piper.env import PiperEnv
+
+        captured: dict = {}
+
+        class _CapturingDriver:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        mocker.patch("jiuwensymbiosis.adapters.piper.lowlevel.PiperLowLevel", _CapturingDriver)
+        PiperEnv(cfg).connect()
+        return captured
+
+    def test_home_and_floor_reach_the_driver_alongside_a_calibration(self, mocker):
+        kwargs = self._captured_kwargs(mocker, PiperConfig(calib_path="/tmp/piper_calib.json", z_min_safe_mm=77.0))
+
+        assert kwargs["calib_path"] == "/tmp/piper_calib.json"
+        assert kwargs["z_min_safe_mm"] == 77.0
+        assert kwargs["home_pose_xyzrxryrz_mm_deg"] == PiperConfig().home_pose_xyzrxryrz_mm_deg
+
+    def test_no_calibration_still_forwards_them(self, mocker):
+        kwargs = self._captured_kwargs(mocker, PiperConfig(z_min_safe_mm=61.0))
+
+        assert "calib_path" not in kwargs
+        assert kwargs["z_min_safe_mm"] == 61.0

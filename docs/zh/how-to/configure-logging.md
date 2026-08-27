@@ -33,12 +33,11 @@ logger.error("使能超时：%s", exc)
 - **控制台（stderr）**——一个 `StreamHandler`，统一格式，**不过滤**：`jiuwensymbiosis.*` 和 openjiuwen 用标准库 `logging` 打的日志都会显示，便于调试时看全貌。
 - **文件** `<log_dir>/jiuwensymbiosis.log`——`RotatingFileHandler`，单文件 5 MB、保留 3 个备份。默认 `log_dir="./logs"`。**只记录 `jiuwensymbiosis.*` 名空间的日志**（文件 handler 上挂了 `_FrameworkFilter`，挡掉 openjiuwen 冒泡到 root 的标准库日志，保持文件干净）。
 
-默认 `./logs` 是刻意选择的，让框架日志与 Piper 命令日志同处一个 `logs/` 根目录。openjiuwen 自有日志后端因实现原因会落在 `logs/logs/` 下（见下方说明），彼此独立、互不干扰：
+默认 `./logs` 是刻意选择的：框架日志落在这里。openjiuwen 自有日志后端因实现原因会落在 `logs/logs/` 下（见下方说明），彼此独立、互不干扰：
 
 ```
 logs/
 ├── jiuwensymbiosis.log              ← 【我们的】框架日志（agent / rails / 各模块）
-├── motion/<时间戳>/commands.log    ← 【我们的】Piper 每次运行的命令轨迹
 └── logs/                            ← 【openjiuwen】自有日志后端（落点见下说明）
     ├── run/jiuwen.log               ← 运行日志
     ├── runner.log                   ← runner 日志
@@ -46,12 +45,20 @@ logs/
     └── performance/jiuwen_performance.log
 ```
 
+每次运行的运动产物单独成一个目录（`agent.motion_log_dir` 配置，默认 `./jiuwen_motion_log`）：
+
+```
+jiuwen_motion_log/<时间戳>/          ← 每次运行一个目录
+├── commands.log                     ← 【我们的】Piper 每次运行的命令轨迹（仅 piper）
+└── grasp_debug/                     ← 【我们的】检测/抓取位姿调试图（det/raw/info_NNN）
+```
+
 **日志归属说明**：
 
 | 来源 | 落点 | 是否进 `jiuwensymbiosis.log` |
 |------|------|------------------------------|
 | `jiuwensymbiosis.*`（我们的 agent/rails/适配器代码） | `logs/jiuwensymbiosis.log` | ✅ 是 |
-| Piper 运动命令日志 | `logs/motion/<stamp>/commands.log` | ❌（独立 per-run 文件） |
+| Piper 命令日志 + 抓取调试图 | `<motion_log_dir>/<stamp>/{commands.log, grasp_debug/}`（默认 `./jiuwen_motion_log`） | ❌（每次运行独立目录） |
 | openjiuwen 自有日志后端（json/trace_id 那套） | `logs/logs/run/`、`logs/logs/interface/`、`logs/logs/performance/` 下各文件 | ❌（绕过标准库 logging） |
 | openjiuwen 用标准库 `logging` 打的日志（如初始化时的 `Registered parser ...`） | 控制台可见，**不落 `jiuwensymbiosis.log`** | ❌（被 `_FrameworkFilter` 挡掉） |
 

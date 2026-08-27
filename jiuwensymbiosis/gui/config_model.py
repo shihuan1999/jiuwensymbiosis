@@ -73,16 +73,17 @@ class FieldSpec:
 # 各字段 default 与框架真实默认一致,使界面显示 = 实际运行行为。
 FIELD_GROUPS: tuple[FieldSpec, ...] = (
     # -- 基础 --
-    FieldSpec("env.cfg.prompt", "任务指令", "text", "基础", help="用自然语言描述要完成的任务;留空则用内置默认。"),
+    FieldSpec("env.cfg.prompt", "任务指令", "text", "基础", help="留空则用内置默认指令。"),
     # -- 执行方式 --
     FieldSpec(
         "agent.mode",
         "智能体模式",
         "choice",
         "执行方式",
-        choices=(("hybrid", "自动选择"), ("tool", "逐步工具调用"), ("code", "构建程序批量执行")),
-        help=(
-            "基于逐步 tool 调用或者基于一次性的 run_python 执行任务或由 agent 自己决定"
+        choices=(
+            ("hybrid", "自动选择"),
+            ("tool", "自主调用工具完成任务"),
+            ("code", "自主构建 python 程序完成任务"),
         ),
         default="hybrid",
     ),
@@ -99,15 +100,13 @@ FIELD_GROUPS: tuple[FieldSpec, ...] = (
     ),
     FieldSpec(
         "agent.exec_mode",
-        "快速模式(fast)",
+        "快速模式(fastagent)",
         "bool",
         "执行方式",
-        help=(
-            "开启快速模式后，会在开始时用一次 LLM 规划出整条动作序列并直接执行。"
-        ),
-        default="fast",
-        on_value="fast",
-        off_value="agent",
+        help=("开启快速模式后，会在开始时用一次 LLM 规划出整条动作序列并直接执行。"),
+        default="fastagent",
+        on_value="fastagent",
+        off_value="stepagent",
     ),
     # -- 安全与反馈 --
     FieldSpec(
@@ -148,9 +147,7 @@ FIELD_GROUPS: tuple[FieldSpec, ...] = (
         "禁用视觉服务",
         "bool",
         "机器人参数",
-        help=(
-            "打开后本次真机运行不启动视觉检测器、不打开相机。"
-        ),
+        help=("打开后本次真机运行不启动视觉检测器、不打开相机。"),
         default=False,
     ),
     # -- 模型 --
@@ -179,9 +176,7 @@ ROBOT_PARAM_FIELDS: dict[str, tuple[FieldSpec, ...]] = {
             "相机序列号",
             "str",
             "机器人参数",
-            help=(
-                "腕部 RealSense 相机的序列号，留空则不会启用相机"
-            ),
+            help=("腕部 RealSense 相机的序列号，留空则不会启用相机"),
         ),
     ),
     "so101": (
@@ -209,7 +204,7 @@ ROBOT_PARAM_FIELDS: dict[str, tuple[FieldSpec, ...]] = {
             "Z 安全下限(mm)",
             "float",
             "机器人参数",
-            help="控制帧 Z 向硬下限,SafetyRail 据此拦截过低的运动。",
+            help="控制帧 Z 向硬下限,低于它的运动会被拦截。",
             default=30.0,
         ),
         FieldSpec(
@@ -226,6 +221,26 @@ ROBOT_PARAM_FIELDS: dict[str, tuple[FieldSpec, ...]] = {
             "机器人参数",
             help="eye-to-hand 手眼标定 JSON(含 T_base_cam)路径,相对本配置文件目录或绝对路径。",
         ),
+        FieldSpec(
+            "env.cfg.low_level.grasp_top_surface_enabled",
+            "顶面抓取点(实验)",
+            "bool",
+            "机器人参数",
+            help=(
+                "开启后抓取点取自掩码点云的顶面(base +Z)外接盒中心,而非 mask 2D 质心那一个像素;"
+                "斜视相机不再把物体正面中央当抓取点。"
+            ),
+            default=False,
+        ),
+        FieldSpec(
+            "env.cfg.low_level.grasp_top_band_mm",
+            "顶面带厚度(mm)",
+            "float",
+            "机器人参数",
+            help="顶面下多少 mm 内算「可夹顶面」;仅在「顶面抓取点」开启时生效。",
+            default=15.0,
+            min_value=0.0,
+        ),
     ),
 }
 
@@ -240,9 +255,7 @@ DETECTOR_FIELDS: tuple[FieldSpec, ...] = (
         "GroundingDINO 模型",
         "str",
         "视觉服务",
-        help=(
-            "填写 HuggingFace repo id 或本地目录，填写 repo id 时自动加载本地快照"
-        ),
+        help=("填写 HuggingFace repo id 或本地目录，填写 repo id 时自动加载本地快照"),
         default="IDEA-Research/grounding-dino-base",
     ),
     FieldSpec(
@@ -250,9 +263,7 @@ DETECTOR_FIELDS: tuple[FieldSpec, ...] = (
         "SAM2 模型",
         "str",
         "视觉服务",
-        help=(
-            "填写 HuggingFace repo id 或本地目录，填写 repo id 时自动加载本地快照"
-        ),
+        help=("填写 HuggingFace repo id 或本地目录，填写 repo id 时自动加载本地快照"),
         default="facebook/sam2.1-hiera-large",
     ),
 )
