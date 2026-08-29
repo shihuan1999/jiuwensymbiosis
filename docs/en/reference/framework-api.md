@@ -1,6 +1,7 @@
 # Agent and Framework API Reference
 
-> Category: Reference. The [Chinese source](../../zh/reference/framework-api.md) is authoritative.
+> Category: Reference. The [Chinese source](../../zh/reference/framework-api.md) is authoritative. This page is based on
+> the public exports and function signatures of `jiuwensymbiosis/__init__.py` and `jiuwensymbiosis/agent/`.
 
 This page summarizes the stable Agent construction, configuration, Session, and task-running interfaces.
 
@@ -39,7 +40,7 @@ ModelSpec(
 )
 ```
 
-`build_model(spec=None)` creates the openjiuwen Model. `api_base` should end at the API root and must not include
+`build_model(spec=None)` creates the openjiuwen `Model` from that configuration. `api_base` should end at the API root and must not include
 `/chat/completions`.
 
 ## `RobotAgentConfig`
@@ -53,7 +54,7 @@ ModelSpec(
 | Trace | `enable_tracing=False`, `trace_max_entries=200`, `trace_max_frames=50`, `trace_save_frames=False`, `trace_console=False`, `trace_dir=None` |
 | Diagnosis | `enable_diagnosis=False`, `diagnosis_max_chars=1500`, `diagnosis_history_steps=3` |
 | Logging | `log_level="INFO"`, `log_dir="./logs"` |
-| Fast path | `exec_mode="agent"`, `exec_config=None` |
+| Fast path | `exec_mode="fastagent"`, `exec_config=None` |
 
 `RobotAgentConfig.from_dict(data)` consumes the YAML `agent:` mapping. Unknown fields raise `TypeError`.
 `parallel_tool_calls=True` is rejected for motion/grasp hardware and cannot be combined with tracing.
@@ -129,9 +130,13 @@ run_fast_task(
 ) -> dict
 ```
 
-`run_robot_task()` selects the configured Agent or fast execution path. `run_fast_task()` executes the deterministic
-fast runner directly and returns a dictionary. The caller owns Session connection; use `with session:` to guarantee
-cleanup.
+- `build_robot_agent` builds a single-robot DeepAgent; the Session lifecycle stays the caller's responsibility.
+- `build_robot_agent_config` returns the `SubAgentConfig` used by a multi-robot top-level Agent.
+- `run_robot_task` picks the ordinary Agent or the fast path according to `config.exec_mode`.
+- `run_fast_task` requires the configuration to be passed explicitly; when the fast path cannot be built it returns a
+  result dictionary carrying `ok=False`.
+
+The caller owns Session connection; use `with session:` to guarantee cleanup.
 
 Workspace resolution:
 

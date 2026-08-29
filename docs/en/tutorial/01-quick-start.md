@@ -18,7 +18,7 @@ python -m pip install -e .
 ## 2. Run the Piper Mock Agent
 
 ```bash
-python examples/piper_pick_demo.py \
+python examples/run_task.py \
   --config configs/piper/piper.yaml \
   --mock \
   --max-iter 1 \
@@ -30,6 +30,8 @@ python examples/piper_pick_demo.py \
 The command uses `MockArmEnv` and the offline `MockModelClient`. It initializes a `RobotSession`, builds the Agent,
 loads the built-in skills and tools, performs one model turn, and never connects to CAN, a camera, a detector, or a
 model endpoint.
+
+`examples/run_task.py` is the generic task entry point: `--config` picks the robot (the YAML's top-level `adapter:` field selects it from the registry), and `--query` (or `--voice`) supplies the task. Here `--mock` provides an in-memory dry run for Piper only; other robots go through their real session.
 
 ## 3. Verify the result
 

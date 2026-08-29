@@ -13,7 +13,7 @@
 | **结构化记录** | 每轮：`tool_name` / `input_params` / 输出摘要 / `success`/`error` / `duration_s` / `observation` 快照 / Rail 事件 / 关键日志 |
 | **持久化** | 一次 invoke 写一个 JSON 到 `<workspace>/traces/`，视觉帧到 `frames/{run_token}/` |
 | **可回放** | `jiuwensymbiosis-replay <trace.json>` 纯文本时间线回放，可选弹窗显示帧 |
-| **零侵入** | 不改任何 `@robot_tool`、不改 env、不改其它 rail 的既有行为 |
+| **零侵入** | 不改任何 `@implements`、不改 env、不改其它 rail 的既有行为 |
 | **默认关闭** | `enable_tracing=False`，关闭时零开销，不破坏既有部署 |
 | **可控开销** | `max_entries` / `max_frames` 截断；帧落盘按帧限 |
 

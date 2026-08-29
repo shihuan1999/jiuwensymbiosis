@@ -124,5 +124,5 @@ asserts so a failing assert can't skip the cleanup.
 
 Never hardcode real model API keys or hardware endpoints. Use `MockModel`
 for LLM paths and `MockDriver`/`MockArmEnv` for hardware paths. The
-`--mock` demo mode (`examples/piper_pick_demo.py --mock`) shows the
+`--mock` demo mode (`examples/run_task.py --mock`) shows the
 end-to-end no-credentials pattern.

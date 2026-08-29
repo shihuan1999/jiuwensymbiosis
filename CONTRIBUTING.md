@@ -188,7 +188,7 @@ git push origin feat/<short-description>
 
 - 单测路径镜像源码：`jiuwensymbiosis/tools/build_robot_tools.py` → `tests/unit_tests/tools/test_build_robot_tools.py`。
 - `tests/unit_tests/`：快、确定性、无硬件/GPU、CI 跑；`tests/integration/`：需真硬件/GPU/外部服务，CI 常跳过；`tests/mocks/`：共享 `MockApi` / `MockEnv` / `MockDriver` / `MockScene`，单测用它保持无硬件。
-- 选型：碰 serial/CAN/socket / 真相机 / 检测子进程 → integration；单函数 / 组件（`api/components.py`）/ rail 隔离 → unit（用 `MockEnv` / `MockApi`）；改 capability gating 或 tool emission → 在 `tests/unit_tests/api/` 与 `tests/unit_tests/tools/` 补测。
+- 选型：碰 serial/CAN/socket / 真相机 / 检测子进程 → integration；单函数 / 组件（`perception/scene3d.py`、`motion/approach.py`）/ rail 隔离 → unit（用 `MockEnv` / `MockApi`）；改 capability gating 或 tool emission → 在 `tests/unit_tests/api/` 与 `tests/unit_tests/tools/` 补测。
 - `pytest` + `asyncio_mode = "auto"`（无需 `@pytest.mark.asyncio` 模板）；`pytest-mock` 可用，优先 `mocker` fixture；测试类命名 `Test<Feature>`。
 - 凭据：库代码无真实凭据面，保持如此；测试 LLM 用离线 mock 模型（`build_mock_model()`，来自 `jiuwensymbiosis.agent.mock_model`），通过 `RobotAgentConfig(model=build_mock_model())` 传入 `build_robot_agent`，禁硬编码真实硬件端点。
 - 新公共 API（新 `ActionSpec` / `@implements` 绑定 / env 属性）需对应测试更新；用户可见行为变更需同步更新 `examples/` 与 `docs/`。

@@ -2,9 +2,7 @@
 
 > Category: Reference. This page records features present in the current code, built-in adapter support, and activation conditions; it is not a roadmap.
 
-The matrix follows `KNOWN_CAPABILITIES`, Env capability declarations, Api Mixin composition, `RobotAgentConfig`, and
-`pyproject.toml`. See [Architecture](../explanation/architecture.md) for call relationships and the
-[Robot Adapter Reference](adapter-reference.md) for exact contracts.
+The matrix follows `KNOWN_CAPABILITIES`, Env capability declarations, the action vocabulary (`api/actions.py`), `RobotAgentConfig`, and `pyproject.toml`. See [Architecture](../explanation/architecture.md) for call relationships and the [Robot Adapter Reference](adapter-reference.md) for exact contracts.
 
 ## 1. Status legend
 
@@ -15,76 +13,89 @@ The matrix follows `KNOWN_CAPABILITIES`, Env capability declarations, Api Mixin 
 | ◇ | Framework vocabulary or extension contract exists, but no built-in adapter implements it |
 | — | The object does not declare or provide this capability |
 
-Support means that a code path and interface exist; it does not certify every robot, firmware, or workspace. Accept real
-hardware according to the [porting guide](../how-to/port-hardware-adapter.md).
+Support means that a code path and interface exist; it does not certify every robot, firmware, or workspace. Accept real hardware according to the [porting guide](../how-to/port-hardware-adapter.md).
 
 ## 2. Built-in hardware adapter matrix
 
-| Feature | MockArm | Piper | SO-101 |
-|---|---|---|---|
-| Positioning | In-memory 4-DoF simulated arm | AgileX Piper 6-DoF CAN arm | LeRobot SO-101 underactuated 5-DoF arm |
-| Session entry | `MockArmEnv` + Mock Api/Model | `build_piper_session` | `build_so101_session` |
-| Cartesian motion | ✅ In-memory pose | ✅ XYZ/R plus full `goto_pose` | ✅ XYZ plus best-effort orientation IK |
-| Joint motion | — | ✅ Six joints | ✅ Five arm joints |
-| Real-time servo | ✅ Simulated sink | ✅ `servo_to_tip`/`servo_to_flange` | ✅ `servo_to_tip`/`servo_to_flange` |
-| Parallel gripper | ✅ Simulated state | ✅ Two-state operation with configured width/effort | ✅ Two-state percentage control with conservative contact detection |
-| Suction | — | — | — |
-| RGB | ✅ Synthetic image | ◐ Wrist RealSense | ◐ Desktop RealSense D405 |
-| Depth | ◐ Test scenes can provide it, but `vision.depth` is not advertised | ◐ With camera enabled | ◐ With camera enabled |
-| Open-vocabulary detection | ✅ Test/simulation path | ◐ Camera plus detector service | ◐ Camera plus detector service |
-| Camera mounting | Synthetic scene | Eye-in-hand | Eye-to-hand |
-| Hand-eye transform | Test geometry | `T_base_flange(live) @ T_flange_cam` | Fixed `T_base_cam` |
-| Detector sidecar | — | ◐ `detector.spawn=true` | ◐ `detector.spawn=true` |
-| Fast-path tracking | ◐ Test path | ◐ `track_detect` | ◐ `track_grasp` |
-| Main optional dependency | `dev` for tests | `piper`; add `full` for vision | Python 3.12 + `so101`; add `full` for vision |
-| Configuration directory | Tests or examples | `configs/piper/` | `configs/so101/` |
+| Feature | MockArm | Piper | SO-101 | Cruzr |
+|---|---|---|---|---|
+| Positioning | In-memory 4-DoF simulated arm | AgileX Piper 6-DoF CAN arm | LeRobot SO-101 underactuated 5-DoF arm | Cruzr mobile dual-arm (base + lift + waist) |
+| Session entry | `MockArmEnv` + Mock Api/Model | `build_piper_session` | `build_so101_session` | `build_cruzr_session` |
+| Cartesian motion | ✅ In-memory pose | ✅ XYZ/R plus full `goto_pose` | ✅ XYZ plus best-effort orientation IK | — |
+| Joint motion | — | ✅ Six joints | ✅ Five arm joints | ✅ Dual arms (named joint, radians) |
+| Real-time servo | ✅ Simulated sink | ✅ `servo_to_tip`/`servo_to_flange` | ✅ `servo_to_tip`/`servo_to_flange` | — |
+| Mobile base | — | — | — | ✅ `navigate_relative`/`rotate_base`/`drive_arc`; continuous `base_servo` |
+| Lift / waist | — | — | — | ✅ `set_lift_pose`/`lift_to_clearance`/`turn_waist` |
+| Target approach | — | — | — | ✅ `approach_for_grasp`/`approach_for_place` (`motion.goal`) |
+| Dual-arm coordination | — | — | — | ✅ `dual_arm_grasp`/`dual_arm_place` (`motion.dual_arm`) |
+| Parallel gripper | ✅ Simulated state | ✅ Two-state operation with configured width/effort | ✅ Two-state percentage control with conservative contact detection | — |
+| Paddle grasp | — | — | — | ✅ `grasp.paddle` (two plates clamp a face each; force-confirmed) |
+| Suction | — | — | — | — |
+| RGB | ✅ Synthetic image | ◐ Wrist RealSense | ◐ Desktop RealSense D405 | ✅ Waist + head, dual cameras |
+| Depth | ◐ Test scenes can provide it, but `vision.depth` is not advertised | ◐ With camera enabled | ◐ With camera enabled | ✅ Waist RGBD |
+| Open-vocabulary detection | ✅ Test/simulation path | ◐ Camera plus detector service | ◐ Camera plus detector service | ◐ Camera plus detector service |
+| Active search | — | — | — | ✅ `vision.search` + `search_target` (head/waist sweep) |
+| Camera mounting | Synthetic scene | Eye-in-hand | Eye-to-hand | Eye-to-hand (static waist + moving head) |
+| Hand-eye transform | Test geometry | `T_base_flange(live) @ T_flange_cam` | Fixed `T_base_cam` | Fixed `T_base_cam` (waist) |
+| Reachability (URDF) | — | — | — | ✅ `planning.reachability` (dual-arm + adaptive-lift judge) |
+| Detector sidecar | — | ◐ `detector.spawn=true` | ◐ `detector.spawn=true` | ◐ (`api_servers`) |
+| Main optional dependency | `dev` for tests | `piper`; add `full` for vision | Python 3.12 + `so101`; add `full` for vision | `cruzr`; add `full` for vision; source the ROS workspace at runtime |
+| Configuration directory | Tests or examples | `configs/piper/` | `configs/so101/` | `configs/cruzr/` |
 
 Visual capability activation differs:
 
-- Piper's class-level capability set includes vision. With no `camera_serial`, no camera is created; a visual task still
-  requires camera hardware, calibration, and a detector.
-- SO-101 derives instance capabilities from `camera_serial`. With no configured camera it does not advertise vision,
-  and a connected Driver can narrow capabilities further when it reports no camera. A configured camera that fails to
-  start makes connection fail closed.
+- Piper's class-level capability set includes vision. With no `camera_serial`, no camera is created; a visual task still requires camera hardware, calibration, and a detector.
+- SO-101 derives instance capabilities from `camera_serial`. With no configured camera it does not advertise vision, and a connected Driver can narrow capabilities further when it reports no camera. A configured camera that fails to start makes connection fail closed.
+- Cruzr declares waist + head cameras and depth. Vision is served via `api_servers`; when the detector is unreachable the shared client returns empty results, converted to `{"ok": false, "reason": "no_detection"}`.
 
 ## 3. Framework Capability matrix
 
-| Capability | Framework interface | LLM tools | MockArm | Piper | SO-101 |
-|---|---|---|---|---|---|
-| `motion.cartesian` | `MotionMixin` + `RobotDriver` | `home`, `get_pose`, `goto_xyzr`, and related tools | ✅ | ✅ | ✅ |
-| `motion.joint` | `JointMotionMixin` + `JointDriver` | `move_joint` | — | ✅ | ✅ |
-| `motion.servo` | `ServoDriver` + fast-controller hook | No standalone public Mixin tool | ✅ | ✅ | ✅ |
-| `grasp.parallel` | `ParallelGripperMixin` + `GripperDriver` | `open_gripper`, `close_gripper` | ✅ | ✅ | ✅ |
-| `grasp.suction` | `SuctionMixin` + `SuctionDriver` | `activate_suction`, `deactivate_suction` | — | — | — |
-| `vision.camera` | Env/Driver marker | Used through `VisionMixin.get_image` | ✅ | ◐ | ◐ |
-| `vision.depth` | Env/Driver marker | No standalone tool | — | ◐ | ◐ |
-| `vision.detection` | `VisionMixin` + raw projection seam | Grasp information, pixel projection, image | ✅ | ◐ | ◐ |
-| `vision.eye_to_hand` | Camera-mount marker | No standalone tool | — | — | ◐ |
-| `sorting.command` | Vocabulary and adapter extension point | No built-in generic tool | — | — | — |
-| `speech.tts` | Vocabulary marker; voice front end provides TTS separately | No built-in robot tool | — | — | — |
+Capability axes are **orthogonal and freely combinable**: motion (cartesian/joint/servo/base/base_servo/lift/waist/goal/dual_arm), sensing (camera/depth/detection/search/eye_to_hand), end effector (parallel/suction/paddle), and planning (reachability) each stand alone.
 
-The framework fully defines `grasp.suction`, but this repository has no built-in real suction adapter. The Tutorial's
-SCARA-with-suction implementation is educational and is not hardware-accepted built-in support.
+| Capability | Framework interface | Actions (`ActionSpec`) | MockArm | Piper | SO-101 | Cruzr |
+|---|---|---|---|---|---|---|
+| `motion.cartesian` | `CartesianDriver` | `goto_xyzr`, `goto_pose`, `move_direction`, `get_pose`, `get_home_pose` | ✅ | ✅ | ✅ | — |
+| `motion.joint` | `JointDriver`/`NamedJointDriver` | `move_joint`, `move_named_joint`, `get_joint_positions` | — | ✅ | ✅ | ✅ |
+| `motion.servo` | `ServoDriver` + fast-controller hook | — (no standalone public action; reachable via `robot_control`) | ✅ | ✅ | ✅ | — |
+| `motion.base` | Env verbs `navigate_relative`/`navigate_arc` | `navigate_relative`, `rotate_base`, `drive_arc` | — | — | — | ✅ |
+| `motion.base_servo` | Env verbs `start_base_drive` etc. | — (continuous base-drive primitive) | — | — | — | ✅ |
+| `motion.lift` | Env verb `set_lifter` | `set_lift_pose`, `lift_to_clearance` | — | — | — | ✅ |
+| `motion.waist` | Env verb `turn_waist` | `turn_waist` | — | — | — | ✅ |
+| `motion.goal` | `motion/approach` | `approach_for_grasp`, `approach_for_place` | — | — | — | ✅ |
+| `motion.dual_arm` | `motion/dual_arm` | `dual_arm_grasp`, `dual_arm_place` | — | — | — | ✅ |
+| `grasp.parallel` | `GripperDriver` | `open_gripper`, `close_gripper` | ✅ | ✅ | ✅ | — |
+| `grasp.paddle` | Body `dual_arm_grasp` | — (implemented via `dual_arm_grasp`) | — | — | — | ✅ |
+| `grasp.suction` | `SuctionDriver` | `activate_suction`, `deactivate_suction` | — | — | — | — |
+| `vision.camera` | `grab_rgb`/`grab_calibrated_frame` | `get_image`, `pixel_to_base_xyz` | ✅ | ◐ | ◐ | ✅ |
+| `vision.depth` | `grab_calibrated_frame` | — (no standalone action) | — | ◐ | ◐ | ✅ |
+| `vision.detection` | `vision.detect_and_centroid` + raw projection seam | `get_grasp_info_simple`, `locate_for_grasp`, `locate_for_place`, `analyze_scene` | ✅ | ◐ | ◐ | ◐ |
+| `vision.eye_to_hand` | Camera-mount marker | — (no standalone action) | — | — | ◐ | ✅ |
+| `vision.search` | `motion/approach.search_target` | `search_target` | — | — | — | ✅ |
+| `planning.reachability` | `Reachability` (derived) | — (planning-time judge) | — | — | — | ✅ |
+| `sorting.command` | Vocabulary and adapter extension point | — (no built-in generic tool) | — | — | — | — |
+| `speech.tts` | Vocabulary marker; voice front end provides TTS separately | — (no built-in robot action) | — | — | — | — |
+
+The framework fully defines `grasp.suction`, but this repository has no built-in real suction adapter. The Tutorial's SCARA-with-suction implementation is educational and is not hardware-accepted built-in support.
 
 ## 4. Execution and tool strategy matrix
 
 | Feature | Status | Default | Activation or constraint |
 |---|---|---|---|
-| Per-step DeepAgent execution | ✅ | `exec_mode="agent"` | The model plans and calls tools at every step |
-| Fast path | ◐ | Off | `exec_mode="fast"`; compile once then execute sequentially; tracking also needs servo/vision/grasp capabilities and adapter hooks |
-| Individual tool mode | ✅ | Optional | `mode="tool"`; each `@robot_tool` becomes one tool |
+| fastagent compile-once | ✅ | `exec_mode="fastagent"` | One model plan (tiered skill + action composition) then execute sequentially, no per-step LLM; `--stepagent` forces per-step |
+| Runtime re-planning | ✅ | Before each step | Re-plan when the world contradicts the next step's pre-conditions, capped by `max_replans` |
+| Individual tool mode | ✅ | Optional | `mode="tool"`; each `@implements` method becomes one tool |
 | Code mode | ✅ | Optional | `mode="code"`; provides `InProcessCodeTool` |
 | Hybrid mode | ✅ | `mode="hybrid"` | Provides individual and code tools together |
-| Skill workflows | ◐ | `enable_skill=False` | Enables `SkillUseRail` and `RobotControlTool`; built-in `visual_pick`/`visual_place` |
+| Skill workflows | ◐ | `enable_skill=False` | Enables `SkillUseRail` and `RobotControlTool`; built-in `visual_pick`/`visual_place`/`transport` |
 | Custom tools/Rails | ✅ | None | Inject through `extra_tools` and `extra_rails` |
 | Parallel tool calls | ◐ | `parallel_tool_calls=False` | Only for audited non-motion tools; motion/grasp rejects it, and it cannot run with Trace |
-| No-hardware/no-model dry run | ✅ | With `--mock` | `MockArmEnv` + `MockModel`; no CAN, camera, or model endpoint |
+| No-hardware/no-model dry run | ✅ | With `--mock` | `MockArmEnv` + `MockModel` (Piper only); no CAN, camera, or model endpoint |
 
 ## 5. Rails, Trace, and feedback matrix
 
 | Capability | Status | Default | Automatic condition or dependency |
 |---|---|---|---|
-| SafetyRail | ✅ | On | Cartesian or joint motion; checks Z, XY, and joint soft limits |
+| SafetyRail | ✅ | On | Env has any motion capability (cartesian/joint/base/lift/waist); checks derived from declared capability |
 | RecoveryRail | ✅ | On | Motion, suction, or gripper; attempts Home and release after failure |
 | VisualFeedbackRail | ◐ | On | Also requires `vision.camera`; stages a post-action frame |
 | SkillUseRail | ◐ | Off | `enable_skill=True` |
@@ -103,11 +114,13 @@ SCARA-with-suction implementation is educational and is not hardware-accepted bu
 | GroundingDINO text detection | ◐ | Install `full` and start or connect the detector service |
 | SAM2 masks | ◐ | Detector configuration `use_sam2=true` |
 | Detector sidecar lifecycle | ✅ | `make_detector_sidecar()` follows Session lifecycle |
-| Mask centroid and median depth | ✅ | `detect_and_centroid()` |
+| Mask centroid and median depth | ✅ | `scene3d.locate_for_grasp`/`analyze_scene` |
 | Eye-in-hand projection | ✅ | Piper implementation; needs `T_flange_cam` and live flange pose |
-| Eye-to-hand projection | ✅ | SO-101 implementation; needs fixed `T_base_cam` |
+| Eye-to-hand projection | ✅ | SO-101 / Cruzr implementation; needs fixed `T_base_cam` |
 | Multi-point/translation XY correction | ✅ | `apply_xy_correction()`; multi-point transform takes priority |
-| Grasp and place heights | ✅ | Shared `VisionMixin` applies `grasp_z_offset_mm` and `place_z_offset_mm` |
+| Grasp and place heights | ✅ | `grasp_z_offset_mm` and `place_z_offset_mm` applied uniformly |
+| Active search | ✅ | `motion/approach.search_target`: sweep in place, report bearing, converge |
+| Reachability prior | ◐ | Derived `planning.reachability` when the body ships a URDF + arm chains; Cruzr provides a dual-arm + lift judge |
 | Hand-eye calibration script | ◐ | Install `calib`; see [Calibrate Hand-Eye Geometry](../how-to/calibrate-hand-eye.md) for Piper |
 
 ## 7. User entry points and optional dependencies
@@ -115,19 +128,23 @@ SCARA-with-suction implementation is educational and is not hardware-accepted bu
 | Entry point or feature | Status | Install/command |
 |---|---|---|
 | Python API | ✅ | Import `jiuwensymbiosis` after core installation |
-| Piper demo | ◐ | `pip install -e ".[piper]"`; `piper-pick-demo` |
+| Generic task runner | ✅ | `jiuwensymbiosis-run --config <robot>.yaml --query "<task>"` |
+| Piper adapter | ◐ | `pip install -e ".[piper]"` |
 | SO-101 adapter | ◐ | Python 3.12; `pip install -e ".[so101]"` |
+| Cruzr adapter | ◐ | `pip install -e ".[cruzr]"`; source the ROS workspace at runtime |
 | Vision/GPU | ◐ | `pip install -e ".[full]"` with the CUDA 12.8 PyTorch index |
 | Browser GUI | ◐ | `pip install -e ".[gui]"`; `jiuwensymbiosis-gui`, default `127.0.0.1:8770` |
 | Voice front end | ◐ | `pip install -e ".[voice]"`; optional FunASR/capture, default `NullTTS` |
 | Hand-eye calibration | ◐ | `pip install -e ".[calib,piper]"` |
+| Actions/skills/state introspection | ✅ | `jiuwensymbiosis-actions` / `-skills` / `-state` |
 | Trace replay | ✅ | `jiuwensymbiosis-replay` |
 | Unit tests | ✅ | `pip install -e ".[dev]"`; `pytest tests/unit_tests/` |
 
 When maintaining this matrix, check these sources of truth together:
 
 - [`env/base.py`](../../../jiuwensymbiosis/env/base.py): Capability vocabulary;
-- [`api/mixins.py`](../../../jiuwensymbiosis/api/mixins.py): public tool capabilities;
-- [Piper Env](../../../jiuwensymbiosis/adapters/piper/env.py) and [SO-101 Env](../../../jiuwensymbiosis/adapters/so101/env.py): adapter declarations;
+- [`api/actions.py`](../../../jiuwensymbiosis/api/actions.py): action vocabulary (`ActionSpec`);
+- [`adapters/_common/capability_spec.py`](../../../jiuwensymbiosis/adapters/_common/capability_spec.py): capability→action mapping;
+- [Piper Env](../../../jiuwensymbiosis/adapters/piper/env.py), [SO-101 Env](../../../jiuwensymbiosis/adapters/so101/env.py), [Cruzr Env](../../../jiuwensymbiosis/adapters/cruzr/env.py): adapter declarations;
 - [`agent/config.py`](../../../jiuwensymbiosis/agent/config.py) and [`agent/builder.py`](../../../jiuwensymbiosis/agent/builder.py): execution and Rail switches;
 - [`pyproject.toml`](../../../pyproject.toml): Python requirements, optional dependencies, and CLI entry points.

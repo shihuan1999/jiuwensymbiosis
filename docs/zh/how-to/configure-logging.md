@@ -85,7 +85,7 @@ agent:
 加载链路：
 
 ```
-YAML → raw["agent"] → RobotAgentConfig.from_dict(raw["agent"])   # piper_pick_demo.py
+YAML → raw["agent"] → RobotAgentConfig.from_dict(raw["agent"])   # run_task.py / jiuwensymbiosis-run
                       → build_robot_agent(config=...)
                           → configure_logging(level=config.log_level, log_dir=config.log_dir)
 ```
@@ -117,7 +117,7 @@ agent:
 
 ### 2.2 CLI 参数覆盖（demo 临时调级）
 
-`examples/piper_pick_demo.py` 提供了 `--debug`，它在 `RobotAgentConfig.from_dict(...)` 之后把 `log_level` 改成 `DEBUG`，**优先级高于 YAML**：
+`examples/run_task.py` 提供了 `--debug`，它在 `RobotAgentConfig.from_dict(...)` 之后把 `log_level` 改成 `DEBUG`，**优先级高于 YAML**：
 
 ```python
 agent_cfg = RobotAgentConfig.from_dict(raw.get("agent"))
@@ -128,10 +128,10 @@ agent = build_robot_agent(session, config=agent_cfg)
 
 ```bash
 # 临时看 DEBUG 级日志（覆盖 YAML 的 log_level），不必改配置文件
-python examples/piper_pick_demo.py --config configs/piper/piper.yaml --mock --debug
+python examples/run_task.py --config configs/piper/piper.yaml --mock --debug
 ```
 
-> demo **不在 `main()` 里调 `logging.basicConfig`**——根日志完全由 `build_robot_agent → configure_logging` 接管。这点很重要：`basicConfig` 会另挂一个不被 `configure_logging` 识别的 handler，导致控制台重复打印（见 §三.3）。
+> demo **不在 `main()` 里调 `logging.basicConfig`**——根日志完全由 `build_robot_agent → configure_logging` 接管。这点很重要：`basicConfig` 会另挂一个不被 `configure_logging` 识别的 handler，导致控制台重复打印（见 §三.3）。<sup>run_task.py 在 `main()` 开头设了一个 `logging.basicConfig` 供语音监听阶段可见，随后 `configure_logging` 再接管根 logger。</sup>
 
 ### 2.3 与执行轨迹（trace）联动
 
@@ -235,6 +235,6 @@ root.handlers = [
 | [jiuwensymbiosis/utils/\_\_init\_\_.py](../../../jiuwensymbiosis/utils/__init__.py) | re-export `configure_logging` / `get_logger` / `TraceLogHandler` / `DEFAULT_FMT` |
 | [jiuwensymbiosis/agent/config.py](../../../jiuwensymbiosis/agent/config.py) | `RobotAgentConfig.log_level` / `log_dir` 字段 + `from_dict`（YAML 透传） |
 | [jiuwensymbiosis/agent/builder.py](../../../jiuwensymbiosis/agent/builder.py) | `build_robot_agent` 调 `configure_logging`；tracing 开启时挂 `TraceLogHandler` |
-| [examples/piper_pick_demo.py](../../../examples/piper_pick_demo.py) | `--debug` 覆盖 `log_level`；演示 YAML `agent:` 块加载链路 |
+| [examples/run_task.py](../../../examples/run_task.py) | `--debug` 覆盖 `log_level`；演示 YAML `agent:` 块加载链路 |
 | [jiuwensymbiosis/adapters/piper/lowlevel.py](../../../jiuwensymbiosis/adapters/piper/lowlevel.py) | Piper `_attach_cmd_log_handler` 复用 `configure_logging` |
 | [执行轨迹参考](../reference/tracing.md) | `TraceLogHandler` 的消费者与数据格式 |

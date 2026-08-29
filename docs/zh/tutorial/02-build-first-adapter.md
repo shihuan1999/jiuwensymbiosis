@@ -18,16 +18,18 @@
 │                   │  RecoveryRail                │  异常自动回零
 │                   │  VisualFeedbackRail          │  动作后视觉验证
 ├──────────────────────────────────────────────────┤
-│  Tool Layer       │  build_robot_tools(api)      │  每个 @robot_tool → 一个 LLM 工具
+│  Tool Layer       │  build_robot_tools(api)      │  每个 @implements → 一个 LLM 工具
 │                   │  RobotControlTool(api)       │  单一入口 action/params 分发
 │                   │  InProcessCodeTool           │  进程内 Python 代码执行
 ├──────────────────────────────────────────────────┤
 │  Skill Layer      │  visual_pick/SKILL.md        │  预置操作流程文档
-│                   │  visual_place/SKILL.md        │  SkillUseRail 自动加载
+│                   │  visual_place/SKILL.md       │  SkillUseRail 自动加载
+│                   │  transport/SKILL.md          │
 ├──────────────────────────────────────────────────┤
-│  API Layer        │  MotionMixin / VisionMixin   │  能力声明 + @robot_tool 方法
-│  (Capability      │  SuctionMixin / etc.         │  运动/抓取/取图带默认委托
-│   Mixins)         │  BaseRobotApi                │  持有 env 引用
+│  API Layer        │  ActionSpec 词表             │  动作契约（名称/能力/前置/效果）
+│  (Action          │  @implements(SPEC)           │  绑定一条契约 + ToolMeta
+│   Contract)       │  api/defaults                │  通用实现（自由函数，非基类）
+│                   │  BaseRobotApi                │  持有 env 引用
 ├──────────────────────────────────────────────────┤
 │  Env Layer        │  BaseRobotEnv                │  硬件契约面（唯一）
 │  (Hardware        │  connect/disconnect/observe  │  能力声明 (env.capabilities)
@@ -38,7 +40,7 @@
 │                   │  joint_limits                │  关节软限位（仅 motion.joint）
 │                   │  low_level: RobotDriver      │  受控穿透点（视觉标定/厂商特有）
 ├──────────────────────────────────────────────────┤
-│  Hardware Layer   │  XxxDriver (lowlevel.py)     │  实现 RobotDriver Protocol
+│  Hardware Layer   │  XxxDriver (lowlevel.py)     │  实现 Driver Protocol
 │  (Your Code)      │  串口/CAN/Socket 等          │  适配器开发者主要工作
 └──────────────────────────────────────────────────┘
 ```
@@ -57,9 +59,9 @@
 | 概念 | 定义 | 谁定义 |
 |------|------|--------|
 | **Capability** | 硬件能力的命名字符串，如 `"motion.cartesian"` | `env/base.py:KNOWN_CAPABILITIES` |
-| **Mixin** | 声明一个 capability 并提供 `@robot_tool` 方法的类；运动、抓取、取图和视觉抓放流程均有共享默认实现 | `api/mixins.py` |
+| **ActionSpec** | 一个动作的契约：名称/描述/能力门/参数/结果形状/前置条件与效果/位置新鲜度 | `api/actions.py` |
 | **Env** | 硬件驱动包装器，实现 `connect/disconnect/get_observation` | 适配器开发者 |
-| **Api** | 继承 Mixin + BaseRobotApi，覆写本体专属几何；视觉适配器实现 RAW 投影接缝 | 适配器开发者 |
+| **Api** | 继承 `BaseRobotApi`，用 `@implements(SPEC)` 绑定每条动作；无差异的转发 `api/defaults`，有几何差异的写方法体；视觉适配器实现 RAW 投影接缝 | 适配器开发者 |
 | **Config** | hardware 参数的 dataclass，含 `from_yaml/from_dict` | 适配器开发者 |
 | **Session** | 将 Env + Api + 子进程 打包为生命周期单元 | `make_builder()` 自动生成 |
 | **Sidecar** | 随 Session 启停的子进程（如视觉检测服务器） | `_common/detector_sidecar.py` |
@@ -67,8 +69,8 @@
 ### 约定
 
 - Env 的 `capabilities` 是**手动声明**的 frozenset
-- Api 的 `capabilities` 是**从 MRO 自动推导**的（遍历所有 Mixin 父类的 `capability` 属性）
-- 工具按 **`api.capabilities ∩ env.capabilities`** 门控：Api 有而 Env 无的能力，其工具**运行时不会暴露给 LLM**（`build_robot_tools` 强制交集，`validate_adapter` 的 A-08 会报 ERROR）。`session.describe()` 的 `effective_capabilities` 即此交集。Env 有而 Api 无的标记能力（如 `vision.camera`）不影响运行。
+- Api 的 `capabilities` 是**从动作的 spec 反推**的（每个 `@implements` 贡献自己 `ActionSpec` 的能力，再加上声明的 marker 能力类属性）
+- 工具按 **`api.capabilities ∩ env.capabilities`** 门控：Api 有而 Env 无的能力，其工具**运行时不会暴露给 LLM**（`build_robot_tools` 强制交集，`validate_adapter` 会报 ERROR）。`session.describe()` 的 `effective_capabilities` 即此交集。Env 有而 Api 无的标记能力（如 `vision.camera`）不影响运行。
 
 ---
 
@@ -82,7 +84,7 @@ cp -r templates/xxx_adapter/ jiuwensymbiosis/adapters/my_robot/
 #  - config.py: 填写硬件连接参数
 #  - lowlevel.py: 实现硬件通信（或先写 Mock）
 #  - env.py: 声明 capabilities + connect/disconnect/observe
-#  - api.py: 选择 Mixin 组合，覆写带专属几何的方法
+#  - api.py: @implements(SPEC) 绑定每条动作；无差异的转发 defaults，有专属几何的写方法体
 #  - session.py: 无需修改（make_builder 已封装；声明式 api_kwargs_from_cfg + make_detector_sidecar）
 
 # 3. 验证（静态结构 + 运行时冒烟）
@@ -102,7 +104,7 @@ with session:
 
 ## 2. 实现 Mock Driver
 
-下面开始实现完整的最小适配器。主要工作量在驱动；Api 只覆写 SCARA 字段命名差异，其余行为继承 Mixin 默认委托。
+下面开始实现完整的最小适配器。主要工作量在驱动；Api 只用 `@implements` 绑定没有本体差异的动作并转发 `api.defaults`，SCARA 的字段命名差异单独覆写。
 
 ```python
 """Mock SCARA 驱动 — 替换为真实串口/CAN 通信。"""

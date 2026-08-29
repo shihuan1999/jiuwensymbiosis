@@ -87,7 +87,7 @@ In jiuwensymbiosis context: use `pytest tests/unit_tests/` for fast deterministi
 verification (no hardware/GPU). Use `python scripts/validate_adapter.py` and
 `python scripts/smoke_test_adapter.py --module <adapter>` to verify adapter
 compatibility. Use
-`python examples/piper_pick_demo.py --mock` for an end-to-end smoke run
+`python examples/run_task.py --mock` for an end-to-end smoke run
 without real hardware or LLM. Return the verification result to the user.
 
 ---

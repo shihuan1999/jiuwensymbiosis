@@ -51,7 +51,7 @@ ModelSpec(
 | Trace | `enable_tracing=False`、`trace_max_entries=200`、`trace_max_frames=50`、`trace_save_frames=False`、`trace_console=False`、`trace_dir=None` |
 | Diagnosis | `enable_diagnosis=False`、`diagnosis_max_chars=1500`、`diagnosis_history_steps=3` |
 | 日志 | `log_level="INFO"`、`log_dir="./logs"` |
-| Fast path | `exec_mode="agent"`、`exec_config=None` |
+| Fast path | `exec_mode="fastagent"`、`exec_config=None` |
 
 `RobotAgentConfig.from_dict(data)` 从 YAML 的 `agent:` 映射构造配置；未知字段会触发 `TypeError`。
 
