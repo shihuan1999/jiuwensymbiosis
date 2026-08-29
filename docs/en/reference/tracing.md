@@ -71,11 +71,19 @@ class ExecutionTrace:
     initial_frame_path: str | None
 ```
 
+> **Per-step "before + after" frame pairing**: each step stores only one **after-frame** (the observation once the
+> action completes, `entry.frame_path`) and never grabs a separate before-frame — across consecutive steps, step N's
+> after-frame *is* step N+1's before-frame (nothing moves in between, so the environment is unchanged). Grabbing one
+> **initial frame** at the start of the invoke (`initial_frame_path`) is therefore enough to give every step a
+> before/after pair: step 1's before-frame is the initial frame, and for step N>1 it is the previous step's
+> after-frame. HTML replay uses this to present adjacent frames side by side as "before action → after action". The
+> initial frame consumes 1 of the `max_frames` budget.
+
 Important methods:
 
 - `new_entry(tool_name, input_params, started_at)` creates a 1-based step and attaches unscoped pending events.
-- `record_rail_event(..., step=None)` targets the current or explicit step.
-- `record_log_event(..., step=None)` targets a step or the trace-level log.
+- `record_rail_event(rail_name, kind, detail, success, step=None)` targets the current or explicit step.
+- `record_log_event(logger_name, level, msg, ts, step=None)` targets a step or the trace-level log.
 - `run_token()` returns the shared JSON/frame-directory identifier.
 - `to_dict()`, `to_json()`, and `save(traces_dir)` serialize the trace.
 
@@ -152,10 +160,11 @@ step-aware extension to retain the original step association.
 | File | Role |
 | --- | --- |
 | [agent/trace.py](../../../jiuwensymbiosis/agent/trace.py) | Trace records, Rail, frames, and persistence |
-| [agent/trace_html.py](../../../jiuwensymbiosis/agent/trace_html.py) | Self-contained HTML renderer |
-| [agent/config.py](../../../jiuwensymbiosis/agent/config.py) | Trace and diagnosis configuration |
-| [agent/builder.py](../../../jiuwensymbiosis/agent/builder.py) | Rail, sink, and handler assembly |
-| [agent/session.py](../../../jiuwensymbiosis/agent/session.py) | Final Trace cleanup ownership |
-| [utils/logging.py](../../../jiuwensymbiosis/utils/logging.py) | `TraceLogHandler` |
-| [cli.py](../../../jiuwensymbiosis/cli.py) | HTML and text replay commands |
+| [agent/trace_html.py](../../../jiuwensymbiosis/agent/trace_html.py) | `render_trace_html()`: trace → self-contained HTML renderer (frames base64-embedded) |
+| [agent/config.py](../../../jiuwensymbiosis/agent/config.py) | The trace fields of `RobotAgentConfig` |
+| [agent/builder.py](../../../jiuwensymbiosis/agent/builder.py) | `build_robot_agent` assembles TraceRail + sinks |
+| [agent/session.py](../../../jiuwensymbiosis/agent/session.py) | `disconnect` calls `close()` |
+| [rails/safety.py](../../../jiuwensymbiosis/rails/safety.py) / [recovery.py](../../../jiuwensymbiosis/rails/recovery.py) / [visual_feedback.py](../../../jiuwensymbiosis/rails/visual_feedback.py) | Receive `trace_sink` and push Rail events |
+| [utils/logging.py](../../../jiuwensymbiosis/utils/logging.py) | `TraceLogHandler` (see the [logging guide](../how-to/configure-logging.md)) |
+| [cli.py](../../../jiuwensymbiosis/cli.py) | `replay` / `replay_html` / `replay_main` (HTML by default + a clickable path printed; `--text` for plain text) |
 | [test_trace.py](../../../tests/unit_tests/rails/test_trace.py) | Unit tests |

@@ -1,10 +1,8 @@
 # Robot Adapter Reference
 
-> Category: Reference. This page is the lookup source for stable adapter contracts, parameters, and implementation locations.
+> Category: Reference. This page is the stable contract, parameters, and implementation locations for an adapter. The [Chinese source](../../zh/reference/adapter-reference.md) is authoritative.
 
-For a first implementation, use [Build Your First Robot Adapter](../tutorial/02-build-first-adapter.md). To replace a
-mock with a vendor SDK and real hardware, use [Port a Robot Hardware Adapter](../how-to/port-hardware-adapter.md). This
-page is not a sequential procedure.
+For your first adapter read [Build Your First Robot Adapter](../tutorial/02-build-first-adapter.md); for bringing a vendor SDK and real hardware in from a Mock, read [Port a Robot Hardware Adapter](../how-to/port-hardware-adapter.md). This page is not a sequential procedure.
 
 ## 1. The six adapter files
 
@@ -20,149 +18,154 @@ jiuwensymbiosis/adapters/<name>/
 
 | File | Stable responsibility | Must not contain |
 |---|---|---|
-| `config.py` | Configuration dataclass, `from_dict()`, and `from_yaml()` | Hardware connections or task text |
-| `lowlevel.py` | Vendor SDK, CAN, serial, socket, camera, and actuator I/O | Agent, Rail, or `@robot_tool` logic |
-| `env.py` | Capabilities, lifecycle, observations, safety properties, Driver wrapper | Prompts or vendor workflow orchestration |
-| `api.py` | Mixin composition, tool semantics, body geometry, raw visual projection | Duplicate detection/correction pipelines |
-| `session.py` | Config/Env/Api, sidecars, and extra-object wiring | Large business implementations |
-| `config_template.yaml` | Annotated deployment starting point | User tasks or secret credentials |
+| `config.py` | Config dataclass, `from_dict()`, `from_yaml()` | Hardware connection and task text |
+| `lowlevel.py` | Vendor SDK, CAN, serial, socket, camera and actuator I/O | Agent, Rail, `@implements` |
+| `env.py` | Capabilities, lifecycle, observation, safety properties, driver wrapping | Prompts and vendor workflow orchestration |
+| `api.py` | `@implements(SPEC)` bindings, body geometry, raw vision projection | Duplicated detection/correction pipelines |
+| `session.py` | Config/Env/Api, sidecar and extra-object wiring | Large business implementations |
+| `config_template.yaml` | Deployable starting point with annotated fields | User tasks and secrets |
 
-The skeleton is in `templates/xxx_adapter/`.
+Template lives in `templates/xxx_adapter/`.
 
-## 2. Capability, Mixin, and tool mapping
+## 2. Action vocabulary, capabilities, and tools
 
-`jiuwensymbiosis.env.base.KNOWN_CAPABILITIES` defines the vocabulary:
+What an action **is** is defined by the shared vocabulary in `jiuwensymbiosis/api/actions.py` as `ActionSpec`; the capability vocabulary is `jiuwensymbiosis.env.base.KNOWN_CAPABILITIES`. Each `ActionSpec` declares: name, description, capability gate, parameter names, result shape, pre-conditions and effects, location freshness, and whether it is visible to the planner.
 
-| Capability | Mixin or role | Main inherited tools or behavior |
-|---|---|---|
-| `motion.cartesian` | `MotionMixin` | `home()`, `get_pose()`, `get_home_pose()`, `goto_xyzr()` |
-| `motion.joint` | `JointMotionMixin` | `move_joint()` |
-| `motion.servo` | Adapter-specific real-time tool | Non-blocking streaming pose command |
-| `grasp.suction` | `SuctionMixin` | `activate_suction()`, `deactivate_suction()` |
-| `grasp.parallel` | `ParallelGripperMixin` | `open_gripper()`, `close_gripper()` |
-| `vision.detection` | `VisionMixin` | `get_image()`, `get_grasp_info_simple()`, `pixel_to_base_xyz()` |
-| `vision.camera` | Marker capability | RGB is available; no tool by itself |
-| `vision.depth` | Marker capability | Depth is available; no tool by itself |
-| `vision.eye_to_hand` | Marker capability | Camera is fixed in the base/world frame |
-| `sorting.command` | Adapter or dedicated tool | Opaque sorting protocol |
-| `speech.tts` | Adapter or service | Text-to-speech |
+| Capability | Actions (`ActionSpec`) |
+|---|---|
+| `motion.cartesian` | `goto_xyzr`, `goto_pose`, `move_direction`, `get_pose`, `get_home_pose` |
+| `motion.joint` | `move_joint`, `move_named_joint`, `get_joint_positions` |
+| `motion.servo` | (no standalone public action; reachable via `robot_control`) |
+| `motion.base` | `navigate_relative`, `rotate_base`, `drive_arc` |
+| `motion.base_servo` | (continuous base-drive primitive) |
+| `motion.lift` | `set_lift_pose`, `lift_to_clearance` |
+| `motion.waist` | `turn_waist` |
+| `motion.goal` | `approach_for_grasp`, `approach_for_place` |
+| `motion.dual_arm` | `dual_arm_grasp`, `dual_arm_place` |
+| `grasp.parallel` | `open_gripper`, `close_gripper` |
+| `grasp.suction` | `activate_suction`, `deactivate_suction` |
+| `grasp.paddle` | (implemented via `dual_arm_grasp`) |
+| `vision.camera` | `get_image`, `pixel_to_base_xyz` |
+| `vision.detection` | `get_grasp_info_simple`, `locate_for_grasp`, `locate_for_place`, `analyze_scene` |
+| `vision.search` | `search_target` |
 
-Env declares physical capabilities manually. Api derives software capabilities from its Mixin MRO. Effective tool
-capabilities are the intersection. Marker capabilities may exist without a Mixin; an Api capability missing from Env
-does not generate tools.
+The Env manually declares hardware capabilities; the Api **derives** its own from the specs of the actions it implements (plus declared marker-capability class attributes); the effective tool set is their intersection. An Env may declare marker capabilities with no corresponding action; an Api capability absent from the Env never becomes a tool.
+
+`adapters/_common/capability_spec.py` provides capability→action and capability→driver-member maps (`CAPABILITY_ACTIONS`, `CAPABILITY_DRIVER_MEMBERS`), shared by the validator and generator, mirroring `api/defaults.py` and `env/protocol.py`.
 
 ## 3. Driver Protocol contract
 
-Protocols live in `jiuwensymbiosis/env/protocol.py`. Concrete Drivers use structural typing and do not inherit them.
+Protocols are defined in `jiuwensymbiosis/env/protocol.py`, **sliced by capability** — one protocol per capability. A mobile dual-arm body has no flange pose; a bench arm has no wheels; a single god-protocol would force one of them into `NotImplementedError` stubs. `RobotDriver` therefore holds only what every driver has (`close()`), and each capability adds its own sibling protocol. Drivers use structural typing (`typing.Protocol`), not a base class.
 
 | Protocol | Capability | Required members |
 |---|---|---|
-| `RobotDriver` | `motion.cartesian` | `home_pose`, `z_min_safe`, `flange_z_min_safe`, `tool_offset_mm`, `close()`, `home()`, `get_pose()`, `move_to_pose_blocking(pose, ...)` |
-| `JointDriver` | `motion.joint` | `get_angles()`, `move_joint_blocking(q, timeout_s=...)` |
-| `ServoDriver` | `motion.servo` | `servo_to_pose(pose)` |
-| `GripperDriver` | `grasp.parallel` | `set_gripper(on)`, `gripper_state` |
-| `SuctionDriver` | `grasp.suction` | `set_suction(on)`, `suction_state`, `suction_di_last` |
+| `RobotDriver` | Every driver | `close()` (idempotent) |
+| `CartesianDriver` | `motion.cartesian` | `home_pose`, `z_min_safe`, `flange_z_min_safe`, `tool_offset_mm`, `home()`, `get_pose()`, `move_to_pose_blocking(pose, ...)` |
+| `JointDriver` | `motion.joint` (indexed, whole vector) | `get_angles()`, `move_joint_blocking(q, timeout_s=...)` |
+| `NamedJointDriver` | `motion.joint` (named, partial command) | `get_joint_positions()`, `move_joints_blocking(targets, timeout_s=...)` |
+| `ServoDriver` | `motion.servo` | `servo_to_pose(pose)` (non-blocking) |
+| `BaseDriver` | `motion.base`/`motion.goal` | `navigate_relative(dx_m, dy_m=0, dyaw_rad=0)`, `navigate_arc(radius_m, dyaw_rad)` |
+| `ContinuousBaseDriver` | `motion.base_servo` | `start_base_drive()`, `base_drive_running(handle)`, `steer_base_drive(handle, bearing_rad)`, `hold_base_drive(handle)`, `stop_base_drive(handle)` |
+| `LifterDriver` | `motion.lift` | `set_lifter(q_lifter)` |
+| `WaistDriver` | `motion.waist` | `turn_waist(delta_rad)` |
+| `DualArmDriver` | `motion.dual_arm` | `home()` (both arms home; the coordination itself is shared, taking a body hook) |
 | `CameraDriver` | `vision.camera` | `intrinsics`, `grab_frames()` |
+| `SuctionDriver` | `grasp.suction` | `suction_state`, `suction_di_last`, `set_suction(on)` |
+| `GripperDriver` | `grasp.parallel` | `set_gripper(on)`, `gripper_state` |
 | `VisionDriver` | eye-in-hand `vision.detection` | `tf_flange_cam`, `calibration` |
 
 Key semantics:
 
-- `get_pose()` and `home_pose` return a vendor Pose, either SCARA `(x,y,z,r)` or six-axis `(x,y,z,rx,ry,rz)`.
-- `move_to_pose_blocking()` accepts a FLANGE target and blocks until completion or failure.
-- `move_joint_blocking()` units are adapter-defined but match `joint_limits`.
-- `servo_to_pose()` is non-blocking; explicit `False` means no progress this cycle, while `True` or legacy `None` means accepted.
-- `grab_frames()` returns aligned `(rgb_uint8, depth_m_float32)` or `None`.
-- `close()` is idempotent.
+- `get_pose()`/`home_pose` return the vendor Pose — `(x,y,z,r)` for SCARA or `(x,y,z,rx,ry,rz)` for six-axis;
+- `move_to_pose_blocking()` takes a FLANGE target and must block until completion or failure; TIP↔FLANGE conversion belongs to the Api layer (`goto_xyzr`);
+- `move_joint_blocking()` units are the adapter's convention but must match `joint_limits`;
+- `servo_to_pose()` is non-blocking; explicit `False` means the controller did not advance this tick, `True` or legacy `None` means accepted;
+- base verbs use **metres** (detections are millimetres) and return `{ok, reason, ...}`;
+- `grab_frames()` returns aligned `(rgb_uint8, depth_m_float32)` or `None`;
+- `close()` must be idempotent.
 
-The current named `VisionDriver` Protocol covers eye-in-hand calibration. Eye-to-hand adapters such as SO-101 expose
-`tf_base_cam` and `calibration` as an adapter-specific structural surface and advertise the `vision.eye_to_hand` marker
-capability; there is not yet a separate named eye-to-hand Protocol.
+The named `VisionDriver` Protocol currently covers only eye-in-hand calibration. Eye-to-hand adapters such as SO-101 and Cruzr expose `tf_base_cam` and `calibration` through body-specific structured interfaces and declare the `vision.eye_to_hand` marker; there is no standalone named eye-to-hand Protocol yet.
 
-Multi-capability Drivers may define a composite Protocol to narrow `low_level`. `PiperFullDriver` combines
-`RobotDriver + JointDriver + CameraDriver + GripperDriver + VisionDriver`.
+A multi-capability driver may define a composite Protocol to tighten `low_level`'s type; `PiperFullDriver` is `CartesianDriver + JointDriver + CameraDriver + GripperDriver + VisionDriver`.
 
 ## 4. BaseRobotEnv contract
 
-Abstract methods:
+Abstract methods on `BaseRobotEnv`:
 
 | Method | Semantics |
 |---|---|
-| `connect()` | Open hardware; idempotent |
-| `disconnect()` | Release hardware; safe in every state |
-| `get_observation()` | Best-effort snapshot; transient sensor gaps do not fail the whole call |
-| `home()` | Return the body to its safe posture; abstract because `home` is the one unconditional action, so no Cartesian default may stand in for it |
+| `connect()` | Open the hardware connection; must be idempotent |
+| `disconnect()` | Release hardware; safe to call in any state |
+| `get_observation()` | Best-effort snapshot; transient sensor gaps must not fail the whole call |
+| `home()` | Return the body to its safe posture; `home` is the one unconditional action, so a Cartesian default is not allowed — it is abstract |
 
 `RobotObservation` fields:
 
 | Field | Type | Convention |
 |---|---|---|
-| `pose` | `dict | None` | SCARA commonly uses `x,y,z,r`; six-axis uses `x,y,z,rx,ry,rz` |
-| `joints` | `list[float] | None` | Units follow the robot convention |
+| `pose` | `dict | None` | SCARA commonly `x,y,z,r`; six-axis `x,y,z,rx,ry,rz` |
+| `joints` | `list[float] | None` | Units per robot |
 | `rgb` | `np.ndarray | None` | H×W×3 `uint8` |
-| `depth` | `np.ndarray | None` | H×W `float32` meters, aligned to RGB |
-| `extra` | `dict` | Lightweight gripper, force, or status fields |
+| `depth` | `np.ndarray | None` | H×W `float32` metres, aligned to RGB |
+| `extra` | `dict` | Lightweight gripper/force/status flags |
 
 Env properties:
 
 | Property | Default | Consumer |
 |---|---|---|
-| `low_level` | `None` | Env delegation and controlled visual access |
+| `low_level` | `None` | Env default verbs and controlled vision access |
 | `z_min_safe` | `None` | SafetyRail TIP Z floor |
-| `workspace_bounds` | `None` | SafetyRail, ordered `(xmin,ymin,xmax,ymax)` |
+| `workspace_bounds` | `None` | SafetyRail, `(xmin,ymin,xmax,ymax)` |
 | `joint_limits` | `None` | SafetyRail, key order matches joint index |
-| `home_pose` | `None` | `MotionMixin.get_home_pose()` |
-| `tool_offset_mm` | `0.0` | TIP-to-FLANGE geometry |
+| `home_pose` | `None` | Api `get_home_pose()` |
+| `tool_offset_mm` | `0.0` | TIP↔FLANGE geometry |
+| `joint_units` | `None` | `move_joint`/observed joint unit (`"deg"`/`"rad"`; unstated means unknown) |
+| `default_orientation_policy` | `None` | Default tilt `goto_xyzr` applies when omitted |
+| `base_step_limits` | `None` | SafetyRail, `(max|translation|m, max|turn|rad)` per base command |
+| `lift_limits` | `None` | SafetyRail, `set_lifter` soft limits |
+| `waist_step_limit_rad` | `None` | SafetyRail, `turn_waist` per-command cap |
+| `cameras` | `(None,)` | Perceivable cameras (best-first); `grab_calibrated_frame(camera)` |
+| `urdf_path`/`arm_chains`/`arm_joints` | `None` | Derive `planning.reachability`; joints each arm actuates |
 
-Inherited delegation:
+Default delegations:
 
 | Env verb | Driver target |
 |---|---|
 | `get_flange_pose()` | `driver.get_pose()` |
 | `move_to_flange(pose)` | `driver.move_to_pose_blocking(pose)` |
-| `move_joint(q)` | `driver.move_joint_blocking(q)` |
-| `set_end_effector(True/False)` | Capability-based `set_gripper()` or `set_suction()` |
-| `grab_rgb()` | `get_observation().rgb` by default |
+| `move_joint(targets)` | Named: straight to `move_joints_blocking`; indexed: read current config, rewrite named entries, then `move_joint_blocking(q)` |
+| `set_end_effector(True/False)` | `set_gripper()` or `set_suction()` by capability |
+| `grab_rgb()` | default `get_observation().rgb` |
 
-`reset()` and software `emergency_stop()` default to no-op. Physical E-stop remains a hardware safety function.
+`reset()` and software `emergency_stop()` default to no-ops. Physical E-stop always belongs to the hardware safety system.
 
-## 5. Api, Mixin, and override rules
+## 5. Api, `@implements`, and override rules
 
-Capability Mixins precede `BaseRobotApi` in the inheritance list. Built-in defaults cover ordinary motion, joints,
-grasp, image capture, and the visual grasp/place pipeline.
+The Api subclasses `BaseRobotApi` and binds each action with `@implements(SPEC)`. Built-in default behavior lives in `api/defaults`, covering common motion, joints, grasp, image, and visual procedures.
 
-| Situation | Action |
+| Situation | Handling |
 |---|---|
-| Behavior matches public semantics | Inherit the Mixin implementation |
-| TIP/FLANGE, orientation, or field names differ | Override the method body |
-| Keep the inherited tool description | Do not redecorate the override |
-| Supply a body-specific description | Redecorate and explicitly supply `tags` |
-| Hardware needs a new vocabulary capability | Complete the capability extension contract first |
+| Behaviour matches common semantics | `@implements(SPEC)` then `return defaults.<action>(self, ...)` one-line forward |
+| TIP/FLANGE, pose, or field-name difference | Override the method body |
+| Body-specific semantics needed | Still `@implements(SPEC)`; the contract comes from the spec, the implementation only says "how" |
+| A capability outside the vocabulary | Complete the capability-extension contract first, then add the action (`ActionSpec` in `api/actions.py` + `@implements` on the Api) |
 
-`@robot_tool` metadata includes name, description, input JSON Schema, capability, and tags. Tool construction walks the
-MRO, so an override may inherit decorator metadata.
+`@implements` attaches a `ToolMeta` (spec + `input_params`, the call schema derived from this body's signature); a signature that cannot accept a parameter the spec promises raises `ContractViolation` at import time. Bring-up, calibration and debug views are **not** actions: leave them undecorated and drive them from `scripts/`.
 
-`VisionMixin` owns this sequence:
+A visual adapter implements only `_project_pixel_to_base_raw(u, v, depth_m)`: eye-in-hand combines the live `T_base_flange @ T_flange_cam`, eye-to-hand uses a fixed `T_base_cam`. The RAW method must not apply correction. `locate_for_grasp`/`locate_for_place`/`analyze_scene` are already shared by `perception/scene3d` (forwarded by `api/defaults`); `search_target`/`approach_for_grasp`/`approach_for_place` are already shared by `motion/approach` — an adapter overrides only when it needs body-specific geometry.
 
-```text
-frames → detection → mask centroid/median depth → raw projection → XY/Z correction → grasp/place height → result
-```
+## 6. Config and Session builder
 
-A visual adapter implements `_project_pixel_to_base_raw(u, v, depth_m)`: eye-in-hand composes live
-`T_base_flange @ T_flange_cam`; eye-to-hand uses fixed `T_base_cam`. The raw method does not apply correction.
-`analyze_scene()` has no universal semantics and is implemented only when needed.
-
-## 6. Config and Session Builder
-
-Config supplies `from_dict(data)` and `from_yaml(path)`. Choose fields by capability:
+A Config provides at least `from_dict(data)` and `from_yaml(path)`. Common fields by capability:
 
 | Group | Common fields |
 |---|---|
-| Identity and connection | `name`, CAN/serial/network address, speed, timeout |
+| Basic & connection | `name`, CAN/serial/network address, speed, timeout |
 | Kinematics | Home pose, `tool_offset_mm`, orientation convention |
 | Safety | `z_min_safe_mm`, XY bounds, `joint_limits` |
-| End effector | Opening, effort, suction I/O |
-| Camera | Serial, resolution, FPS, intrinsics/calibration path |
-| Detection | URL, spawn, models, thresholds |
+| End effector | travel, force, suction I/O |
+| Camera | serial, resolution, FPS, intrinsics/calibration path |
+| Detection | URL, spawn, model, threshold |
 | Grasp/place geometry | `z_correction_mm`, `grasp_z_offset_mm`, `place_z_offset_mm` |
 
 `make_builder()` signature:
@@ -179,41 +182,39 @@ make_builder(
 )
 ```
 
-| Parameter | Purpose |
+| Parameter | Role |
 |---|---|
-| `cfg_cls` | Config class with `from_yaml` and `from_dict` |
-| `env_cls` | Env constructed with `cfg` |
-| `api_cls` | Api constructed with `env` and optional kwargs |
-| `api_kwargs_from_cfg` | Declarative `list[str]` mapping or compatible `cfg -> dict` callback |
-| `sidecar_builders` | Each receives cfg and returns a context manager, zero-argument factory, or `None` |
-| `decorate` | Final Session callback; normally unused |
+| `cfg_cls` | Config class with `from_yaml`/`from_dict` |
+| `env_cls` | Env class built from `cfg` |
+| `api_cls` | Api class built from `env` and optional kwargs |
+| `api_kwargs_from_cfg` | `list[str]` declarative mapping or compatible `cfg -> dict` callback |
+| `sidecar_builders` | Each receives cfg, returns a context manager, zero-arg factory, or `None` |
+| `decorate` | Final Session decoration; normally unused |
 
 Declarative field mapping:
 
 | Form | Result |
 |---|---|
-| `"z_correction_mm"` | Pass `cfg.z_correction_mm` under the same Api name |
-| `"detector.url:detector_service_url"` | Read a nested field and rename it |
+| `"z_correction_mm"` | `cfg.z_correction_mm` to the same-named Api param |
+| `"detector.url:detector_service_url"` | Nested field renamed and passed in |
 
-The returned Builder supports `build(cfg)`, `.from_yaml(path)`, and `.from_dict(data)`.
-`make_detector_sidecar(cfg_attr="detector")` reads detector configuration and starts GroundingDINO/SAM2 with the
-Session when `spawn` is true.
+The returned Builder supports `build(cfg)`, `.from_yaml(path)`, and `.from_dict(data)`. `make_detector_sidecar(cfg_attr="detector")` reads the detector sub-config and, when `spawn` is true, starts/stops the GroundingDINO/SAM2 service with the Session.
 
 ## 7. Shared perception and geometry modules
 
 | Module | Main interface | Purpose |
 |---|---|---|
 | `adapters/_common/builder.py` | `make_builder()`, `make_detector_sidecar()` | Session factory and detector sidecar |
-| `adapters/_common/safety.py` | `WorkspaceBounds`, `check_flange_z()` | TIP/FLANGE Z guard |
-| `adapters/_common/capability_spec.py` | capability specifications | Static adapter validation |
+| `adapters/_common/capability_spec.py` | `CAPABILITY_ACTIONS`, `CAPABILITY_DRIVER_MEMBERS` | capability→action/driver-member maps (validator & generator) |
+| `adapters/_common/safety.py` | `WorkspaceBounds`, `check_flange_z()` | TIP/FLANGE Z defence |
 | `perception/detector_client.py` | `init_detector()` | HTTP detector client |
-| `perception/detector_sidecar.py` | `detector_subprocess()` | Detector service lifecycle |
-| `perception/vision.py` | `detect_and_centroid()` | Detection, centroid, and median depth |
-| `perception/vision.py` | `build_grasp_result()` | Correction and grasp/place geometry |
-| `perception/vision.py` | `apply_xy_correction()` | Multi-point or legacy translation correction |
-| `perception/vision.py` | `dump_grasp_debug()` | Optional debug artifacts |
-| `perception/calibration.py` | `load_calibration()` | Versioned hand-eye calibration loading |
-| `utils/geometry.py` | pinhole and SE(3) helpers | Projection and transform composition |
+| `perception/detector_sidecar.py` | `detector_subprocess()` | Detector-service lifecycle |
+| `perception/scene3d.py` | `locate_for_grasp()`, `locate_for_place()`, `analyze_scene()` | detect→centroid/median-depth→raw projection→correction→geometry (3-D scene sensing) |
+| `perception/vision.py` | `detect_and_centroid()`, `apply_xy_correction()`, `build_grasp_result()` | shared detection/correction functions |
+| `perception/calibration.py` | `load_calibration()` | versioned hand-eye calibration loading |
+| `motion/approach.py` | `search_target()`, `approach_target_for_grasp()`, `approach_target_for_place()` | search → face the target → converge to a work pose (base approach) |
+| `motion/dual_arm.py` | `dual_arm_grasp()`, `dual_arm_place()` | two-arm coordinated grasp/place (with force confirmation) |
+| `contracts.py` | `GraspResult`, `ObjectGeometryResult`, `SPATIAL_RELATIONS`, … | action result types + spatial-relation set (owned by no layer) |
 
 ### `init_detector`
 
@@ -222,7 +223,7 @@ seg_fn = init_detector("http://127.0.0.1:8114")
 results = seg_fn(image_ndarray, text_prompt="blue box")
 ```
 
-Each result contains a boolean `mask`, `[x1,y1,x2,y2]`, score, and label. An unreachable service returns an empty result.
+Result items carry boolean `mask`, `[x1,y1,x2,y2]`, score, and label; an unreachable service returns empty results.
 
 ### `detect_and_centroid`
 
@@ -236,8 +237,7 @@ result = detect_and_centroid(
 )
 ```
 
-Success includes `u`, `v`, `depth_m`, best, mask shape, and image shape. Failure reasons include `no_detection`,
-`empty_mask`, and `no_valid_depth`.
+Successful results include `u`, `v`, `depth_m`, best, mask shape, and image shape; failure reasons include `no_detection`, `empty_mask`, `no_valid_depth`.
 
 ### `apply_xy_correction`
 
@@ -249,54 +249,51 @@ xyz_final, description = apply_xy_correction(
 )
 ```
 
-`xy_transform` takes priority over legacy translation. Normal adapters do not call this directly; `VisionMixin` owns it
-inside the shared projection path.
+`xy_transform` takes priority over a legacy translation. Regular adapters never call it directly; the shared flow applies it once.
 
 ## 8. Capability extension contract
 
-Extend the vocabulary only when no current string describes real hardware. One extension updates all of:
+Extend the vocabulary only when no existing string describes the hardware's real capability. One extension must update together:
 
-1. Add the string to `env/base.py:KNOWN_CAPABILITIES`.
-2. If it generates tools, add a Mixin with the exact capability in `api/mixins.py`.
-3. Add a public Env verb when delegation is universal; otherwise implement it in the adapter.
-4. Declare the Env capability and inherit the Api Mixin.
-5. Update `capability_spec.py`, validator coverage, and tool-generation tests.
-6. Add a Rail check for safety-relevant actions or document controller ownership.
+1. Add the string to `env/base.py:KNOWN_CAPABILITIES`;
+2. If it needs an action, add an `ActionSpec` to `api/actions.py` and an `@implements` on the Api (forward to `api/defaults` when the delegation is generic);
+3. Add an Env common verb when the delegation is uniform, else implement in the adapter;
+4. Env declares the capability, Api implements the action;
+5. Update `capability_spec.py`, the validator, and the tool-generation tests;
+6. Add the corresponding Rail check when the action carries motion risk, or state explicitly that the controller is responsible.
 
-Do not add arbitrary strings to bypass an unknown-capability error. A marker capability may have no Mixin, but it must
-have a defined consumer.
+Do not add strings casually to dodge an unknown-capability error. A marker capability may have no action, but it should have a clear consumer.
 
 ## 9. Validator and test entry points
 
-| Entry point | Purpose |
+| Entry | Purpose |
 |---|---|
-| `scripts/validate_adapter.py --module ...` | Static directory, signature, capability, and Driver-member checks |
-| `scripts/smoke_test_adapter.py --module ...` | Connect Mock Env, call generated tools, verify serializable results |
-| `tests/unit_tests/env/` | Env, capability, and safety-property examples |
-| `tests/unit_tests/api/` | Mixin, decorator, and capability derivation |
+| `scripts/validate_adapter.py --module ...` | Static check of directory, signatures, capability alignment, and Driver members |
+| `scripts/smoke_test_adapter.py --module ...` | Connect a Mock Env, invoke every generated tool, check serializable results |
+| `tests/unit_tests/env/` | Env, capability, and safety-property reference tests |
+| `tests/unit_tests/api/` | action vocabulary, `@implements`, and capability derivation |
 | `tests/unit_tests/agent/` | Session, Builder, Rails, and tool assembly |
-| `tests/mocks/` | Mock Driver, Env, Api, and scene patterns |
+| `tests/mocks/` | Mock Driver, Env, Api, and scenes |
 
-Common validation results:
+Common validation outcomes:
 
 | Symptom | Meaning |
 |---|---|
-| unknown capability | Env value is outside the vocabulary |
-| Api capability missing from Env | Capability intersection filters the tool |
-| Driver member missing | Declared capability and Driver Protocol disagree |
-| tool result not serializable | Tool returned ndarray, Pose, or another native object |
+| unknown capability | Env string not in the vocabulary |
+| Api capability missing from Env | tool filtered by the capability intersection |
+| Driver member missing | declared capability disagrees with a Driver Protocol |
+| tool result not serializable | tool returned an ndarray, Pose, or other native object |
 
-## 10. Piper implementation map
+## 10. Built-in adapter implementation locations
 
-| Concern | Piper file | Notes |
-|---|---|---|
-| Capability and Env | `adapters/piper/env.py` | Capabilities, lifecycle, observations, boundaries |
-| Vendor Driver | `adapters/piper/lowlevel.py` | CAN/SDK, motion, gripper, camera |
-| Geometry | `adapters/piper/geometry.py` | Pose, TIP/FLANGE, projection helpers |
-| Calibration | `adapters/piper/_calibration.py` | Hand-eye transform loading |
-| Api | `adapters/piper/api.py` | Tilted-tool geometry and raw projection |
-| Config | `adapters/piper/config.py` | PiperConfig, DetectorServerConfig, historical YAML compatibility |
-| Session | `adapters/piper/session.py` | `make_builder()`, mappings, detector sidecar |
+| Concern | Piper | SO-101 | Cruzr |
+|---|---|---|---|
+| Capabilities & Env | `adapters/piper/env.py` | `adapters/so101/env.py` | `adapters/cruzr/env.py` |
+| Vendor driver | `adapters/piper/lowlevel.py` | `adapters/so101/lowlevel.py` | `adapters/cruzr/lowlevel.py` |
+| Geometry | `adapters/piper/geometry.py` | `adapters/so101/geometry.py` | `adapters/cruzr/geometry.py` |
+| Calibration | `adapters/piper/_calibration.py` | (in-model calibration/registry) | `adapters/cruzr/_calibration.py` |
+| Api | `adapters/piper/api.py` | `adapters/so101/api.py` | `adapters/cruzr/api.py` |
+| Config | `adapters/piper/config.py` | `adapters/so101/config.py` | `adapters/cruzr/config.py` |
+| Session | `adapters/piper/session.py` | `adapters/so101/session.py` | `adapters/cruzr/session.py` |
 
-Piper's 30-degree tilted tool, historical nested YAML, and temporary Z correction are body-specific. Reuse them only
-when new hardware has the same constraints.
+Piper's 30° tilted tool, historical nested YAML, and temporary Z correction are body-specific; a new adapter should reuse them only when the hardware genuinely has the same constraint. Cruzr's dual-arm + lift reachability (`Reachability` override), head/waist dual cameras, and ROS 2 driver are also body-specific — the generic mechanisms (`scene3d`/`approach`/`dual_arm` shared implementations) must not be copied elsewhere.

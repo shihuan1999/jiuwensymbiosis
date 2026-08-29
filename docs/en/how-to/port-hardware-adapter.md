@@ -4,7 +4,7 @@
 
 If this is your first adapter, complete [Build Your First Robot Adapter](../tutorial/02-build-first-adapter.md) first.
 This guide does not repeat the complete six-file example. Use the
-[Robot Adapter Reference](../reference/adapter-reference.md) for exact Capability, Protocol, Env, Mixin, and
+[Robot Adapter Reference](../reference/adapter-reference.md) for exact Capability, Protocol, Env, `@implements`, and
 `make_builder()` contracts.
 
 ## Scope and completion criteria
@@ -35,7 +35,7 @@ capabilities and frames → Driver → Env/Api → vision → Session → safety
 ## 1. Confirm hardware capabilities and coordinate conventions
 
 Record the differences between the vendor manual, actual controller capabilities, and the mock adapter. Do not declare
-a hardware capability merely because an Api Mixin exists.
+a hardware capability merely because an Api `@implements` exists.
 
 | Decision | Confirm |
 |---|---|
@@ -58,16 +58,18 @@ class MyEnv(BaseRobotEnv):
     })
 ```
 
-Api composes the software surface through Mixins:
+Api binds the actions the body supports from the shared vocabulary with `@implements(SPEC)`:
 
 ```python
-class MyApi(
-    MotionMixin,
-    ParallelGripperMixin,
-    VisionMixin,
-    BaseRobotApi,
-):
-    pass
+class MyApi(BaseRobotApi):
+    @implements(GOTO_XYZR)
+    def goto_xyzr(self, x: float, y: float, z: float, r: float | None = None,
+                  *, orientation_policy: str = "top_down") -> None:
+        return defaults.goto_xyzr(self, x, y, z, r)
+
+    @implements(CLOSE_GRIPPER)
+    def close_gripper(self, force_n: float | None = None) -> dict:
+        return defaults.close_gripper(self, force_n)
 ```
 
 Tools are generated for `api.capabilities ∩ env.capabilities`. Inspect the result after assembly:
@@ -84,10 +86,10 @@ body-specific Api geometry and must not be hidden in model prompts.
 ## 2. Replace the Mock Driver with the vendor SDK
 
 `lowlevel.py` translates stable framework verbs into serial, CAN, socket, or vendor SDK operations. Agent prompts,
-`@robot_tool`, and Rail logic do not belong in the Driver.
+`@implements`, and Rail logic do not belong in the Driver.
 
 ```text
-LLM tool → Api Mixin/override → public Env verb → Driver → controller
+LLM tool → Api @implements/override → public Env verb → Driver → controller
 evidence and failures ←──────── through the same boundaries ←────────
 ```
 
@@ -209,9 +211,10 @@ def _project_pixel_to_base_raw(self, u: float, v: float, depth_m: float) -> np.n
 ```
 
 Eye-in-hand composes the live flange pose as `T_base_cam = T_base_flange(live) @ T_flange_cam`. The raw seam performs
-only the coordinate transform; it must not apply XY or Z correction. `VisionMixin` owns detection, centroid and depth,
-correction, and grasp/place heights exactly once. Inherit `get_image()`, `get_grasp_info_simple()`, and
-`pixel_to_base_xyz()`. Implement `analyze_scene()` only when the adapter needs body-specific semantics.
+only the coordinate transform; it must not apply XY or Z correction. `perception/scene3d` owns detection, centroid and
+depth, correction, and grasp/place heights exactly once. `get_image()`, `get_grasp_info_simple()`, and
+`pixel_to_base_xyz()` are forwarded by `api/defaults` to shared implementations. Override `analyze_scene()` only when the
+adapter needs body-specific semantics.
 
 ## 4. Integrate detection, calibration, and correction
 
@@ -229,7 +232,7 @@ then add small residual correction. See [Calibrate Hand-Eye Geometry](calibrate-
 [shared perception modules](../reference/adapter-reference.md#7-shared-perception-and-geometry-modules).
 
 Manage a local GroundingDINO/SAM2 server as a Session sidecar. For an external service, disable `detector.spawn` but
-preserve the same URL and failure semantics. An unreachable detector produces an empty result, which `VisionMixin`
+preserve the same URL and failure semantics. An unreachable detector produces an empty result, which `api/defaults`
 converts to `{"ok": false, "reason": "no_detection"}`.
 
 ## 5. Configure deployment YAML and Session
@@ -356,8 +359,8 @@ and acceptance results with the deployment configuration.
 
 | Symptom | Check first | Action |
 |---|---|---|
-| unknown capability | Spelling and `KNOWN_CAPABILITIES` | Use an existing value or update vocabulary, Mixin, Env, validator, and tests together |
-| Expected tool missing | Env capability and Api Mixin | Inspect `effective_capabilities` and validator A-08 |
+| unknown capability | Spelling and `KNOWN_CAPABILITIES` | Use an existing value or update vocabulary, action, Env, validator, and tests together |
+| Expected tool missing | Env capability and Api actions | Inspect `effective_capabilities` and the validator |
 | Repeated connect fails | `connect()` idempotence | Publish `low_level` only after success and fully clean failure paths |
 | `no_detection` | Service, models, frames, prompt, thresholds | Test the detector separately; do not duplicate the shared pipeline |
 | Projection has a fixed or directional error | Depth units, intrinsics, transform direction, mounting | Recalibrate and ensure the raw seam does not apply correction twice |

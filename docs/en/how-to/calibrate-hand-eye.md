@@ -23,6 +23,9 @@ Install calibration and Piper dependencies:
 pip install -e ".[calib,piper]"
 ```
 
+`[calib]` provides OpenCV and RealSense support; `[piper]` provides the Piper arm driver (if your arm is not a Piper,
+install the corresponding dependencies yourself).
+
 ### 1.2 Prepare the calibration board
 
 Prepare a flat, matte ChArUco board (recommended) or chessboard. To generate a printable ChArUco image:
@@ -33,9 +36,19 @@ python scripts/calibrate/calibrate_hand_eye.py --generate-board board.png \
   --square-size-mm 30 --marker-size-mm 22
 ```
 
-Print at 100% scale with page fitting disabled. Mount the print on a rigid board and measure the actual square and
-marker sizes with a ruler. Printed scaling error is a leading source of calibration error; use the measured dimensions
-in every later command.
+**Advice for a home-made board:**
+
+1. Print on A4 at **100% original scale**, with "fit to page / scaling" turned off.
+2. After printing, **measure the actual edge length of a large black square and of a small black square with a ruler**,
+   and pass those real millimetre values to `--square-size-mm` and `--marker-size-mm` respectively. **Print scaling is
+   the number-one source of error.**
+3. **Mount it flat on a rigid backing** (foam board / acrylic / aluminium) — no bending, no curling.
+4. Keep the surface **non-reflective** (matte paper is best).
+5. Remember your board parameters (square count, square size, marker size) — **generation and calibration must use the
+   same set**.
+
+For the large black squares, measuring the total length of several squares along one row and dividing by the count is
+more accurate than measuring a single square.
 
 ### 1.3 Configure the robot
 
@@ -45,8 +58,10 @@ Edit [scripts/calibrate/calibrate.yaml](../../../scripts/calibrate/calibrate.yam
 camera_serial: "your-camera-serial"
 ```
 
-You may temporarily use `CAMERA_SERIAL`. Do not use `configs/piper/piper.yaml` as the calibration input because that
-runtime configuration points to the calibration file being generated.
+Or temporarily use an environment variable: `export CAMERA_SERIAL=your-camera-serial`.
+
+> This configuration is purpose-built for calibration. **Do not** use `piper.yaml` — that one points at the calibration
+> file currently being generated.
 
 ## 2. Start calibration in three steps
 
@@ -114,6 +129,9 @@ python scripts/calibrate/calibrate_hand_eye.py \
   --verify-touch
 ```
 
+> When the configuration has `tool_offset_mm=0`, the program **warns loudly and asks you to confirm** that the end
+> really carries no tool — because it computes the hover height treating "flange = tip".
+
 If a gripper or tool is installed, provide the measured flange-to-tip distance:
 
 ```bash
@@ -139,8 +157,12 @@ RealSense normally supplies factory intrinsics. For another camera, add `--calib
 
 Too few valid views:
 
-At least three accepted views are required; 10–15 diverse views are recommended. ChArUco is more tolerant of partial
-blur and occlusion than a chessboard.
+At least three accepted views are required; 10–15 diverse views are recommended. Change pose more and take more shots.
+
+Use a chessboard instead of ChArUco:
+
+Replace `--board charuco --marker-size-mm ...` with `--board chessboard`; everything else is the same. ChArUco is more
+robust to occlusion and blur, so prefer it.
 
 No hardware is available:
 

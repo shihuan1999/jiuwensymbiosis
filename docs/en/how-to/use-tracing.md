@@ -2,46 +2,74 @@
 
 > Category: How-to. The [Chinese source](../../zh/how-to/use-tracing.md) is authoritative.
 
-Tracing records each Agent tool call, its parameters, result, duration, observation, Rail events, warnings, and optional
-camera frame. It is disabled by default and does not change tool or Env implementations.
+> LLM-driven robot manipulation is a multi-turn "perceive-plan-execute-observe-feedback" loop. This module provides a
+> **parallel rail**, `TraceRail`, which collects the complete information of every tool call through openjiuwen's
+> lifecycle hooks, persists it as a single JSON, and supports CLI replay — making one embodied-agent run recordable,
+> persistable, and reviewable.
+
+This page covers enabling, locating, and replaying traces end to end. For fields, data structures, and the JSON format
+see the [Tracing reference](../reference/tracing.md); for the implementation mechanism and design trade-offs see the
+[tracing internals](../../../design/tracing.md).
 
 ## 1. Design goals
 
-Tracing provides structured records, one-file-per-invoke persistence, HTML/text replay, zero changes to robot tools,
-default-off behavior, and bounded entry/frame retention.
+| Goal | Meaning |
+|------|------|
+| **Structured record** | Per turn: `tool_name` / `input_params` / output summary / `success`/`error` / `duration_s` / `observation` snapshot / Rail events / key logs |
+| **Persistence** | One JSON per invoke written to `<workspace>/traces/`, vision frames to `frames/{run_token}/` |
+| **Replayable** | `jiuwensymbiosis-replay <trace.json>` replays a text timeline, optionally showing frames |
+| **Zero intrusion** | Changes no `@implements`, no env, and no existing behavior of any other rail |
+| **Off by default** | `enable_tracing=False`; zero overhead when off, breaking no existing deployment |
+| **Bounded overhead** | `max_entries` / `max_frames` truncate; frame persistence is capped per frame budget |
+
+---
 
 ## 2. Quick start
 
 ### Enable Trace
 
-There are two equivalent configuration paths. YAML is recommended for reproducible deployments.
+There are two equivalent ways; **the configuration file is recommended** (declarative, no code change, version-controllable).
 
 #### Option 1: Configuration file (recommended)
 
-Add an `agent:` block to the task YAML:
+Add an `agent:` block to the task YAML. It sits beside `env:` (hardware), `model:` (model) and `api_servers:`
+(detection service) as the declarative entry point for agent behavior; every field is optional and defaults to off:
 
 ```yaml
 # configs/piper/piper.yaml
 agent:
-  enable_tracing: true
-  trace_save_frames: true
-  trace_console: true
-  trace_max_entries: 200
-  trace_max_frames: 50
-  # trace_dir: ./traces
-  # trace_capture_loggers: ["jiuwensymbiosis"]
-  # enable_diagnosis: true
+  enable_tracing: true        # master switch (default False)
+  trace_save_frames: true     # save JPEG frames to traces/frames/{run_token}/
+  trace_console: true         # print a live per-turn one-liner to stdout
+  trace_max_entries: 200      # max steps recorded (oldest dropped past this)
+  trace_max_frames: 50        # max frames saved per invoke
+  # log_level: INFO           # log level (see logging.md)
+  # log_dir: ./logs           # writes to ./logs by default; null means console only
+  # trace_dir: ./traces       # override the trace directory (default <workspace>/traces)
+  # trace_capture_loggers: ["jiuwensymbiosis"]  # whose WARNING+ TraceLogHandler captures
+  # enable_diagnosis: true    # online diagnosis: after a failed step, feed "current params + relevant history + system state" into the next LLM turn (requires enable_tracing)
+  # diagnosis_max_chars: 1500 # soft cap on the diagnosis message; over the cap history is dropped first, keeping the current step + system state
+  # diagnosis_history_steps: 3  # how many steps of causal chain to look back (same tool or same class of rail event)
+  # diagnosis_history_kinds: ["reject", "recover"]  # rail_events kinds treated as relevant
 ```
 
-`build_robot_agent()` creates the `TraceRail`, connects the built-in Rail event sinks, and installs the warning-log
-handler. Omitting the block keeps tracing off.
+`build_robot_agent` reads this block, assembles the `TraceRail`, injects the sink into three rails, and attaches
+`TraceLogHandler` — no extra wiring by hand. The `agent:` block is **entirely optional and purely additive**: leave it
+out and an existing YAML still runs on the defaults (everything off).
+
+> Field names must match `RobotAgentConfig` exactly (for instance `enable_tracing`, not `enable_trace`). A misspelling
+> raises `TypeError` at load time instead of being silently ignored — deliberately, to avoid the hidden "configured but
+> not in effect" trap.
+
+Command-line switches (such as `--mode`, `--no-skill`, `--max-iter`, `--workspace`) layer on top of the `agent:` block
+without conflict: YAML sets the baseline, the CLI makes a temporary adjustment.
 
 #### Option 2: Python code
 
-The equivalent Python configuration is:
+Pass the fields directly when constructing `RobotAgentConfig`; this is equivalent:
 
 ```python
-from jiuwensymbiosis.agent import RobotAgentConfig
+from jiuwensymbiosis.agent.config import RobotAgentConfig
 
 config = RobotAgentConfig(
     enable_tracing=True,
@@ -51,32 +79,42 @@ config = RobotAgentConfig(
 agent = build_robot_agent(session, config)
 ```
 
-Unknown Agent configuration keys raise `TypeError`; misspellings do not fail silently. CLI options can override the YAML
-for one run.
+`RobotAgentConfig.from_dict(mapping)` is the shared foundation under both paths: it feeds a dict (i.e. the YAML
+`agent:` block) into the dataclass, automatically strips `model`/`model_spec` (those belong to the `model:` block), and
+raises on unknown keys. The configuration-file path is simply the demo calling it internally.
 
 ### Where Trace files are stored
 
-Workspace resolution follows this order:
+The default directory resolution order (the same as workspace resolution):
 
-1. explicit `config.workspace`;
-2. `JIUWENSYMBIOSIS_WORKSPACE`;
-3. `~/.jiuwensymbiosis/settings.json`;
-4. `~/.jiuwensymbiosis/<session-name>_workspace/`.
+```
+explicit config.workspace
+  > $JIUWENSYMBIOSIS_WORKSPACE
+  > "workspace" in ~/.jiuwensymbiosis/settings.json
+  > ~/.jiuwensymbiosis/{session.name}_workspace/      ← final default
+```
 
-Traces normally appear under `<workspace>/traces/`:
+The most typical landing path is `~/.jiuwensymbiosis/<robot-name>_workspace/traces/`. In that directory:
 
 ```text
 traces/
-  <run-token>.json
+  {run_token}.json          ← one per invoke
   frames/
-    <run-token>/
+    {run_token}/            ← one subdirectory per invoke
       step_000.jpg
       step_001.jpg
       ...
 ```
 
-Each invoke gets its own run token, JSON file, and frame directory. `step_000.jpg` is the initial frame. A later step's
-before-frame is the previous step's after-frame, so tracing does not capture two images for every action.
+- **Trace JSON**: `{run_token}.json`, one per invoke.
+- **Frame images** (only with `trace_save_frames=True`): `traces/frames/{run_token}/step_NNN.jpg`, in a **separate
+  subdirectory per invoke**, so step numbers never overwrite each other across runs.
+
+`run_token` = `{safe_cid}_{timestamp}_{microseconds}_{pid}`, exactly matching that invoke's JSON filename — so the
+frames referenced by any historical trace stay valid forever.
+
+`step_000.jpg` is the initial frame. A later step's before-frame is the previous step's after-frame, so tracing does not
+capture two images for every action.
 
 Set `trace_dir` to override only the trace output directory. Set `trace_save_frames: false` when image evidence is not
 needed or storage is constrained.
@@ -93,23 +131,42 @@ events, warnings, and frames.
 
 ### Replay
 
-Generate a self-contained HTML replay:
-
 ```bash
-jiuwensymbiosis-replay path/to/trace.json
+jiuwensymbiosis-replay <trace.json>                  # default: generate HTML + print a clickable path (no browser auto-open)
+jiuwensymbiosis-replay <trace.json> --text           # fall back to a plain-text timeline (frames shown as paths only)
 ```
 
-The command writes `<run-token>.html` beside the JSON when possible and prints its path. Images are embedded as base64,
-so the HTML can be moved or shared without the original frame directory.
+Default behavior: write a **self-contained HTML** (`{run_token}.html`) in the **same directory** as the trace JSON, with
+each step's JPEG frame embedded as base64 and fused into one card together with that step's parameters / error / rail
+events / logs, then print the file path. The HTML depends on no external image file, so it can be moved or shared; when
+the directory is not writable it falls back to the system temp directory.
 
-For a terminal timeline:
+`--text` falls back to the original plain-text timeline, printing frames as paths only.
 
-```bash
-jiuwensymbiosis-replay path/to/trace.json --text
+Example text-timeline output:
+
+```text
+=== Execution Trace: conv-1_20260624_105551_693633_149333.json ===
+robot=test_robot  conversation=conv-1
+query: pick the red box
+
+[  1] ✅ goto_xyzr({"x": 150, "y": 0, "z": 80})
+       dur=0.80s
+       pose: {'x': 150, 'y': 0, 'z': 80}
+[  2] ❌ close_gripper({"force_n": 10})
+       dur=1.20s
+       error: ValueError: gripper timeout
+       rail: [ok] RecoveryRail/recover {'home_ok': True, 'released_ok': True}
+       log:  [WARNING] jiuwensymbiosis.rails.recovery: home() retried
+
+2 step(s) recorded.
 ```
 
-The text view shows step status, parameters, duration, errors, observation summaries, Rail events, warning logs, and
-frame paths.
+Characteristics:
+
+- HTML mode: frame and key events on one card, base64-embedded, a self-contained single file; the path is clickable.
+- Text mode: paths are clickable in terminals or IDEs that support file links; `rail_events` and `log_events` are shown
+  in separate groups; a missing field degrades to `"?"`.
 
 Common evidence:
 

@@ -14,9 +14,8 @@ tasks:
     agent_defaults:
       enable_skill: true
 
-  # 拾取香蕉:对标 examples/so101_pick_demo.py(fast + visual_pick 技能)。本体无关——
-  # 任意有"运动+夹爪+视觉"能力的本体都能执行;在 so101 上 fast 运行时,run_engine 会按其
-  # 运动档推导 ServoConfig,与直接跑 so101_pick_demo.py 行为一致。
+  # 拾取香蕉:fast + visual_pick 技能。本体无关——任意有"运动+夹爪+视觉"能力的本体
+  # 都能执行;在 so101 上 fast 运行时,run_engine 会按其运动档推导 ServoConfig。
   - key: pick_banana
     display_name: "拾取香蕉"
     description: "把香蕉放到黑色盒子上"

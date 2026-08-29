@@ -18,7 +18,7 @@ python -m pip install -e .
 ## 2. 运行 Piper Mock Agent
 
 ```bash
-python examples/piper_pick_demo.py \
+python examples/run_task.py \
   --config configs/piper/piper.yaml \
   --mock \
   --max-iter 1 \
@@ -28,6 +28,8 @@ python examples/piper_pick_demo.py \
 ```
 
 该命令使用 `MockArmEnv` 和离线 `MockModelClient`，会建立 `RobotSession`、构造 Agent、加载内置技能与工具并执行一次模型调用，不连接 CAN、相机、检测服务或模型端点。
+
+`examples/run_task.py` 是通用任务入口：`--config` 选机器人（YAML 顶层 `adapter:` 字段从注册表选中），`--query`（或 `--voice`）给任务。这里 `--mock` 仅对 Piper 提供内存干跑；其他机器人走各自的真机会话。
 
 ## 3. 确认结果
 

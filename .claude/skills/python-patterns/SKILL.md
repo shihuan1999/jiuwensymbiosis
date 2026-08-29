@@ -87,11 +87,12 @@ def run_detection(client: DetectorClient, frame) -> list:
     return client.detect(frame, prompt="box")
 ```
 
-`Protocol` is especially useful for the mixin architecture: capability
-mixins (`MotionMixin`, `VisionMixin`, `SuctionMixin`) delegate to
-`self.env.<verb>()`, and the env contract is structural — `BaseRobotEnv`
-subclasses satisfy it by implementing the right methods, not by inheriting
-a shared interface.
+`Protocol` is especially useful for the action-vocabulary architecture:
+a capability is a `Driver Protocol` slice, and actions reach the shared
+implementation through `@implements(SPEC)` forwarding to `api.defaults` or
+`perception.scene3d` / `motion/approach`. The env contract is structural —
+`BaseRobotEnv` subclasses satisfy it by implementing the right methods, not by
+inheriting a shared interface.
 
 ## Custom Exception Hierarchy
 

@@ -11,36 +11,74 @@ boundary; vendor SDK integration, calibration, and hardware acceptance belong to
 
 ### Layered framework architecture
 
-| Layer | What the framework provides | What an adapter provides |
-| --- | --- | --- |
-| Agent and Rails | Agent construction, lifecycle, safety, recovery, tracing | Configuration values |
-| Tools and Skills | LLM tool generation and reusable workflows | Capability selection |
-| API | Capability Mixins and shared default behavior | Body-specific geometry and raw vision projection |
-| Env | The single hardware contract | Connection, observation, and safety properties |
-| Hardware | Driver Protocols | CAN, serial, socket, camera, and actuator calls |
+```
+┌──────────────────────────────────────────────────┐
+│  Agent Layer      │  build_robot_agent()         │  one-call LLM agent construction
+│                   │  RobotSession                │  hardware lifecycle + subprocesses
+│                   │  RobotAgentConfig            │  model, mode, safety switches
+├──────────────────────────────────────────────────┤
+│  Safety Rails     │  SafetyRail                  │  pre-motion boundary interception
+│                   │  RecoveryRail                │  automatic homing on failure
+│                   │  VisualFeedbackRail          │  post-action visual verification
+├──────────────────────────────────────────────────┤
+│  Tool Layer       │  build_robot_tools(api)      │  each @implements → one LLM tool
+│                   │  RobotControlTool(api)       │  single entry, action/params dispatch
+│                   │  InProcessCodeTool           │  in-process Python execution
+├──────────────────────────────────────────────────┤
+│  Skill Layer      │  visual_pick/SKILL.md        │  pre-authored workflow documents
+│                   │  visual_place/SKILL.md       │  auto-loaded by SkillUseRail
+│                   │  transport/SKILL.md          │
+├──────────────────────────────────────────────────┤
+│  API Layer        │  ActionSpec vocabulary       │  action contract (name/capability/pre/effects)
+│  (Action          │  @implements(SPEC)           │  binds one contract + ToolMeta
+│   Contract)       │  api/defaults                │  generic implementations (free functions, not a base class)
+│                   │  BaseRobotApi                │  holds the env reference
+├──────────────────────────────────────────────────┤
+│  Env Layer        │  BaseRobotEnv                │  the (single) hardware contract surface
+│  (Hardware        │  connect/disconnect/observe  │  capability declaration (env.capabilities)
+│   Abstraction)    │  home/move_to_flange/...     │  motion / end-effector verbs (delegate to the driver by default)
+│                   │  home_pose/tool_offset_mm    │  robot constant properties
+│                   │  grab_rgb()                  │  single frame (goes through get_observation by default)
+│                   │  z_min_safe/workspace_bounds │  safety contract properties
+│                   │  joint_limits                │  joint soft limits (motion.joint only)
+│                   │  low_level: RobotDriver      │  controlled penetration point (calibration / vendor-specific)
+├──────────────────────────────────────────────────┤
+│  Hardware Layer   │  XxxDriver (lowlevel.py)     │  implements the Driver Protocols
+│  (Your Code)      │  serial / CAN / socket / ... │  the adapter author's main work
+└──────────────────────────────────────────────────┘
+```
 
-The Env is the only hardware contract used by Agent, Rails, and Tools. Motion and end-effector commands use public Env
-verbs such as `home()`, `move_to_flange()`, and `set_end_effector()`. Safety reads `z_min_safe`,
-`workspace_bounds`, and `joint_limits`. Vendor calibration remains available through the typed `env.low_level`
-penetration point.
+> Env is the **single contract surface** between Agent/Rails/Tools and the hardware:
+> - motion / end effector through Env verbs (`home`/`move_to_flange`/`move_joint`/`get_flange_pose`/`set_end_effector`)
+> - robot constants through Env properties (`home_pose`/`tool_offset_mm`)
+> - safety bounds through Env properties (`z_min_safe`/`workspace_bounds`/`joint_limits`)
+> - a single frame through an Env method (`grab_rgb()`, delegating to `get_observation().rgb` by default)
+> - calibration data through `env.low_level` (controlled penetration typed by `RobotDriver` + its sub-Protocols)
+>
+> Upper layers reach hardware through Env's public API and never `getattr` the private driver. `set_end_effector`
+> dispatches deterministically on declared capability (`grasp.parallel`/`grasp.suction`).
 
 ### Core concepts
 
-| Concept | Meaning |
-| --- | --- |
-| Capability | A known hardware feature such as `motion.cartesian` or `grasp.suction` |
-| Mixin | A class that declares one capability and supplies `@robot_tool` methods |
-| Driver | The vendor-facing implementation of the relevant Driver Protocols |
-| Env | The lifecycle, observation, motion, and safety wrapper around the driver |
-| Api | A composition of capability Mixins plus body-specific overrides |
-| Config | A dataclass that loads hardware and service settings |
-| Session | Env, Api, sidecars, and lifecycle assembled as one unit |
-
-Env capabilities are declared manually. Api capabilities are derived from its Mixin MRO. Tools are exposed only for
-the intersection `api.capabilities ∩ env.capabilities`; adding a Mixin without matching Env support does not expose an
-unsafe tool.
+| Concept | Definition | Who defines it |
+|------|------|--------|
+| **Capability** | A named string for a hardware capability, e.g. `"motion.cartesian"` | `env/base.py:KNOWN_CAPABILITIES` |
+| **ActionSpec** | One action's contract: name/description/capability gate/params/result shape/pre-conditions and effects/location freshness | `api/actions.py` |
+| **Env** | The hardware-driver wrapper, implementing `connect/disconnect/get_observation` | The adapter author |
+| **Api** | Subclasses `BaseRobotApi` and binds each action with `@implements(SPEC)`; forwards to `api/defaults` where there is no difference, writes a body where the geometry differs; a vision adapter implements the RAW projection seam | The adapter author |
+| **Config** | A dataclass of hardware parameters, with `from_yaml/from_dict` | The adapter author |
+| **Session** | Packages Env + Api + subprocesses as one lifecycle unit | generated by `make_builder()` |
+| **Sidecar** | A subprocess started/stopped with the Session (e.g. the vision detection server) | `_common/detector_sidecar.py` |
 
 ### Conventions
+
+- An Env's `capabilities` is a **manually declared** frozenset.
+- An Api's `capabilities` is **derived from the actions' specs** (each `@implements` contributes its `ActionSpec`'s
+  capability, plus any declared marker-capability class attribute).
+- Tools are gated on **`api.capabilities ∩ env.capabilities`**: a capability the Api has but the Env lacks means its
+  tool is **never exposed to the LLM at runtime** (`build_robot_tools` enforces the intersection, and
+  `validate_adapter` reports an ERROR). `session.describe()`'s `effective_capabilities` is exactly this intersection.
+  A marker capability the Env has but the Api lacks (such as `vision.camera`) does not affect the run.
 
 This tutorial uses a four-axis SCARA arm with suction, millimeters for cartesian positions, degrees for rotation, and an
 in-memory driver. Replace only the driver I/O after the adapter passes validation; keep the public Env and Api contracts
@@ -56,7 +94,7 @@ cp -r templates/xxx_adapter/ jiuwensymbiosis/adapters/my_robot/
 #  - config.py: define hardware connection settings
 #  - lowlevel.py: implement hardware I/O, or begin with a mock
 #  - env.py: declare capabilities and implement connect/disconnect/observe
-#  - api.py: compose Mixins and override body-specific geometry
+#  - api.py: bind each action with @implements(SPEC), forwarding to defaults or override geometry
 #  - session.py: normally remains declarative make_builder wiring
 
 # 3. Validate static structure and runtime behavior
@@ -80,7 +118,7 @@ with session:
 ## 2. Implement the Mock Driver
 
 Now implement the complete minimal adapter under `jiuwensymbiosis/adapters/my_scara/`. Most work is in the driver;
-the Api only adapts SCARA field names and inherits the remaining Mixin behavior.
+the Api only adapts SCARA field names and forwards the rest to `api.defaults`.
 
 Start with an in-memory driver. Replace the method bodies with serial or CAN calls after the framework integration works.
 
@@ -192,12 +230,17 @@ class ScaraEnv(BaseRobotEnv):
         return self.low_level.tool_offset_mm if self.low_level is not None else 0.0
 ```
 
-`BaseRobotEnv` supplies the common `get_flange_pose`, `move_to_flange`, `set_end_effector`, and `grab_rgb`
-delegations. The Env adds lifecycle, observation, configuration-backed safety properties — and `home`, which is
-abstract: every body states its own safe posture, so an arm delegates to the driver while a mobile body writes
-its own sequence.
+> `get_flange_pose`/`move_to_flange`/`set_end_effector`/`grab_rgb` are delegated to `low_level` by `BaseRobotEnv`
+> already, so ScaraEnv need not implement them. `home` is abstract — every body states its own safe posture, so an arm
+> delegates to the driver while a mobile body writes its own sequence. `home_pose`/`tool_offset_mm` are exposed as
+> properties.
 
 ## 5. Compose the Api
+
+Each method binds one entry of the shared action vocabulary with `@implements(SPEC)` — the action name, capability
+gate, params and effects all come from `api/actions.py`, not from this class. Anything with no body-specific difference
+(`goto_xyzr` / suction on-off) forwards to `api.defaults`; only a real difference gets a method body — here, exposing
+the driver's `rz` as the `r` field SCARA users expect:
 
 ```python
 from jiuwensymbiosis.api import defaults
@@ -268,6 +311,6 @@ python scripts/smoke_test_adapter.py --module jiuwensymbiosis.adapters.my_scara
 ```
 
 The static validator checks structure, capability alignment, and signatures. The smoke test connects a mock environment,
-calls every generated `@robot_tool`, and verifies serializable output. Before replacing the mock with hardware, read the
+calls every generated `@implements` action, and verifies serializable output. Before replacing the mock with hardware, read the
 [porting guide](../how-to/port-hardware-adapter.md) for workspace limits, recovery behavior, sidecars, testing, and
 hardware acceptance.

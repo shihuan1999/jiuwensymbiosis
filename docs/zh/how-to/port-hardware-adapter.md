@@ -2,7 +2,7 @@
 
 > 类别：How-to。本文说明如何把已经跑通的 Mock 适配器替换为可投产的真实硬件适配器。
 
-第一次接触适配器时，请先完成[构建第一个机器人适配器](../tutorial/02-build-first-adapter.md)。本文不重复完整六文件示例；Capability、Protocol、Env 属性、Mixin 和 `make_builder()` 的精确契约统一查阅[机器人适配器参考](../reference/adapter-reference.md)。
+第一次接触适配器时，请先完成[构建第一个机器人适配器](../tutorial/02-build-first-adapter.md)。本文不重复完整六文件示例；Capability、Protocol、Env 属性、`@implements` 和 `make_builder()` 的精确契约统一查阅[机器人适配器参考](../reference/adapter-reference.md)。
 
 ## 使用范围与完成标准
 
@@ -31,7 +31,7 @@
 
 ## 1. 确认硬件能力与坐标约定
 
-先把厂商手册、控制器实际能力和当前 Mock 适配器做成差异记录。不要因为 Api 有某个 Mixin 就声明硬件支持该能力。
+先把厂商手册、控制器实际能力和当前 Mock 适配器做成差异记录。不要因为 Api 有某个动作的 `@implements` 就声明硬件支持该能力。
 
 | 决策 | 必须确认的内容 |
 |---|---|
@@ -54,16 +54,18 @@ class MyEnv(BaseRobotEnv):
     })
 ```
 
-Api 通过 Mixin 组合公开软件能力：
+Api 用 `@implements(SPEC)` 绑定共享词表里本体支持的动作，公开软件能力：
 
 ```python
-class MyApi(
-    MotionMixin,
-    ParallelGripperMixin,
-    VisionMixin,
-    BaseRobotApi,
-):
-    pass
+class MyApi(BaseRobotApi):
+    @implements(GOTO_XYZR)
+    def goto_xyzr(self, x: float, y: float, z: float, r: float | None = None,
+                  *, orientation_policy: str = "top_down") -> None:
+        return defaults.goto_xyzr(self, x, y, z, r)
+
+    @implements(CLOSE_GRIPPER)
+    def close_gripper(self, force_n: float | None = None) -> dict:
+        return defaults.close_gripper(self, force_n)
 ```
 
 工具按 `api.capabilities ∩ env.capabilities` 生成。完成接线后必须检查：
@@ -77,10 +79,10 @@ with session:
 
 ## 2. 用厂商 SDK 替换 Mock Driver
 
-`lowlevel.py` 只负责把稳定的框架动词翻译为串口、CAN、Socket 或厂商 SDK 调用。Agent 提示词、`@robot_tool` 和 Rail 逻辑都不应进入驱动。
+`lowlevel.py` 只负责把稳定的框架动词翻译为串口、CAN、Socket 或厂商 SDK 调用。Agent 提示词、`@implements` 和 Rail 逻辑都不应进入驱动。
 
 ```text
-LLM 工具 → Api Mixin/覆写 → Env 公开动词 → Driver → 控制器
+LLM 工具 → Api @implements/覆写 → Env 公开动词 → Driver → 控制器
 观测与异常 ←────────────── 同一边界逐层返回 ←──────────
 ```
 
@@ -160,7 +162,7 @@ class MyEnv(BaseRobotEnv):
 
 ### Api 几何与视觉投影
 
-运动、关节、抓取和取图通常直接继承 Mixin。只覆写公共语义与机型不一致的部分。例如垂直工具的 TIP→FLANGE 转换：
+运动、关节、抓取和取图通常直接转发 `api.defaults`。只覆写公共语义与机型不一致的部分。例如垂直工具的 TIP→FLANGE 转换：
 
 ```python
 @implements(GOTO_XYZR)   # 描述、能力门、参数都来自词表里的那条 spec
@@ -191,7 +193,7 @@ def _project_pixel_to_base_raw(self, u: float, v: float, depth_m: float) -> np.n
     return apply_transform(tf_base_cam, p_cam)
 ```
 
-eye-in-hand 使用实时法兰位姿组合 `T_base_cam = T_base_flange(live) @ T_flange_cam`。该方法只能做原始坐标变换，不能应用 XY/Z 校正；`VisionMixin` 统一负责检测、质心与深度、校正和抓放高度，确保每项只执行一次。`get_image()`、`get_grasp_info_simple()` 和 `pixel_to_base_xyz()` 直接继承；仅在确有机型专属语义时实现 `analyze_scene()`。
+eye-in-hand 使用实时法兰位姿组合 `T_base_cam = T_base_flange(live) @ T_flange_cam`。该方法只能做原始坐标变换，不能应用 XY/Z 校正；`perception/scene3d` 统一负责检测、质心与深度、校正和抓放高度，确保每项只执行一次。`get_image()`、`get_grasp_info_simple()`、`pixel_to_base_xyz()` 已由 `api.defaults` 转发到共享实现；仅在确有机型专属语义时覆写 `analyze_scene()`。
 
 ## 4. 接入检测、标定与校正
 
@@ -206,7 +208,7 @@ eye-in-hand 使用实时法兰位姿组合 `T_base_cam = T_base_flange(live) @ T
 
 不要用大幅运行时偏移掩盖错误的深度单位、变换方向或相机松动。应先重新标定，再增加小范围校正。手眼标定操作见[手眼标定指南](calibrate-hand-eye.md)，共享检测和校正函数见[适配器参考](../reference/adapter-reference.md#7-共享感知与几何模块)。
 
-本地 GroundingDINO/SAM2 服务应作为 Session sidecar 管理；外部服务模式则关闭 `detector.spawn`，但保留相同 URL 和失败语义。检测不可达时，共享客户端返回空结果，`VisionMixin` 将其转换为 `{"ok": false, "reason": "no_detection"}`。
+本地 GroundingDINO/SAM2 服务应作为 Session sidecar 管理；外部服务模式则关闭 `detector.spawn`，但保留相同 URL 和失败语义。检测不可达时，共享客户端返回空结果，`api/defaults` 将其转换为 `{"ok": false, "reason": "no_detection"}`。
 
 ## 5. 配置部署 YAML 与 Session
 
@@ -326,8 +328,8 @@ python scripts/smoke_test_adapter.py --module jiuwensymbiosis.adapters.my_robot
 
 | 现象 | 优先检查 | 处理 |
 |---|---|---|
-| `unknown capabilities` | 拼写和 `KNOWN_CAPABILITIES` | 使用现有词汇；确需扩展时同步词表、Mixin、Env、验证器和测试 |
-| 预期工具未生成 | Env 能力与 Api Mixin | 查看 `effective_capabilities` 和验证器 A-08 |
+| `unknown capabilities` | 拼写和 `KNOWN_CAPABILITIES` | 使用现有词汇；确需扩展时同步词表、动作、Env、验证器和测试 |
+| 预期工具未生成 | Env 能力与 Api 动作 | 查看 `effective_capabilities` 和验证器 |
 | 重复连接失败 | `connect()` 幂等性 | Driver 成功连接后再发布 `low_level`，失败路径彻底清理 |
 | `no_detection` | 服务、模型、图像、提示词和阈值 | 先单独验证检测服务，不在适配器中复制共享流程 |
 | 投影存在固定或方向性偏差 | 深度单位、内参、变换方向、安装方式 | 先重新标定；确认 RAW 接缝未重复应用校正 |
