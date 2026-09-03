@@ -1,0 +1,30 @@
+#!/bin/sh
+# jiuwensymbiosis mock acceptance demo (README quick-start, no robot/LLM needed)
+unset PYTHONHOME PYTHONPATH
+export HOME="${HOME:-/data}"
+FLUSH="${OJW_FLUSH:-/data/harmonybrew/opt/openjiuwen/libexec/libriscvflush.so}"
+[ -f "$FLUSH" ] || FLUSH=/data/python3/lib/libriscvflush.so
+[ -f "$FLUSH" ] || FLUSH=/data/python312/lib/libriscvflush.so
+[ -f "$FLUSH" ] && export LD_PRELOAD="$FLUSH${LD_PRELOAD:+:$LD_PRELOAD}"
+export TMPDIR="${TMPDIR:-/data/tmp}"
+[ -f /etc/ssl/certs/cacert.pem ] && export SSL_CERT_FILE="${SSL_CERT_FILE:-/etc/ssl/certs/cacert.pem}"
+mkdir -p "$HOME/ojw-run" 2>/dev/null
+cd "$HOME/ojw-run" 2>/dev/null || cd "$HOME" 2>/dev/null || cd /data
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+[ -d "$HERE/libexec/jiuwensymbiosis" ] || HERE=/data/harmonybrew/opt/openjiuwen-symbiosis
+OJW_BASE="${OJW_BASE:-/data/harmonybrew/opt/openjiuwen/libexec/site-packages}"
+export PYTHONPATH="$HERE/libexec:$OJW_BASE"
+# ohos-312-patch: vendor subroots + 3.12 site-packages first
+for _d in "$HERE"/libexec/src/*/ "$HERE"/libexec/src/*/*/; do
+  [ -d "$_d" ] && export PYTHONPATH="${_d%/}:$PYTHONPATH"
+done
+[ -d /data/python312/lib/python3.12/site-packages ] && export PYTHONPATH="/data/python312/lib/python3.12/site-packages:$PYTHONPATH"
+PYTHON="${OJW_PYTHON:-/data/harmonybrew/opt/python/bin/python3.11}"
+[ -x "$PYTHON" ] || PYTHON="$(command -v python3.11)"
+mkdir -p "${TMPDIR:-/data/tmp}/jiwensymbiosis-demo"
+exec "$PYTHON" "$HERE/libexec/examples/run_task.py" \
+  --config "$HERE/libexec/configs/piper/piper.yaml" \
+  --mock --max-iter 1 --no-visual-feedback \
+  --workspace "${TMPDIR:-/data/tmp}/jiwensymbiosis-demo" \
+  --query "${JIW_QUERY:-Pick up the black box and place it on the white box.}" \
+  "$@"
